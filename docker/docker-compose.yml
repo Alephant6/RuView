@@ -57,14 +57,3 @@ services:
       - DEVICE_ID=${DEVICE_ID:-ruview}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
-
-  python-sensing:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.python
-    image: ruvnet/wifi-densepose:python
-    ports:
-      - "8765:8765"   # WebSocket
-      - "8080:8080"   # UI
-    environment:
-      - PYTHONUNBUFFERED=1
