@@ -3,7 +3,9 @@
 # Multi-stage build for minimal final image
 
 # Stage 1: Build
-FROM rust:1.85-bookworm AS builder
+# Rust 1.87+ required: hnsw_rs 0.3.4 uses `is_multiple_of` on unsigned ints,
+# which was stabilized in 1.87.0 (rust-lang/rust#128101).
+FROM rust:1.87-bookworm AS builder
 
 WORKDIR /build
 
