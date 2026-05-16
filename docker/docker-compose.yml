@@ -7,10 +7,11 @@ services:
       dockerfile: docker/Dockerfile.rust
     image: ruvnet/wifi-densepose:latest
     container_name: ruview-sensing-server
-    ports:
-      - "3000:3000"      # REST API + UI
-      - "3001:3001"      # WebSocket  (/ws/sensing, /ws/introspection)
-      - "5005:5005/udp"  # ESP32 CSI / fused-vitals (magic 0xC511000{2,4})
+    network_mode: host
+    # ports:
+    #   - "3000:3000"      # REST API + UI
+    #   - "3001:3001"      # WebSocket  (/ws/sensing, /ws/introspection)
+    #   - "5005:5005/udp"  # ESP32 CSI / fused-vitals (magic 0xC511000{2,4})
     environment:
       - RUST_LOG=info
       # CSI_SOURCE controls the data source for the sensing server.
@@ -18,7 +19,7 @@ services:
       #          esp32          — receive real CSI frames from an ESP32 on UDP port 5005
       #          wifi           — use host Wi-Fi RSSI/scan data (Windows netsh)
       #          simulated      — generate synthetic CSI data (no hardware required)
-      - CSI_SOURCE=${CSI_SOURCE:-auto}
+      - CSI_SOURCE=esp32
       # MODELS_DIR controls where the server scans for .rvf model files.
       # Mount a host directory and set this to make models visible:
       #   volumes: ["/path/to/models:/app/models"]
@@ -45,7 +46,7 @@ services:
       - sensing-server
     environment:
       # Inside the compose network we can reach the sensing-server by name.
-      - RUVIEW_WS=ws://sensing-server:3001/ws/sensing
+      - RUVIEW_WS=ws://192.168.1.195:3001/ws/sensing
       # Point at your Home Assistant MQTT broker (e.g. the Mosquitto add-on).
       - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
       - MQTT_PORT=${MQTT_PORT:-1883}

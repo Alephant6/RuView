@@ -1,3 +1,5 @@
+docker/data
+
 # Local Claude config (contains WiFi credentials and machine-specific paths)
 CLAUDE.local.md
 
