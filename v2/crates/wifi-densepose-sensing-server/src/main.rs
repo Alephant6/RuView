@@ -827,15 +827,22 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     //   [17]     noise_floor (i8)
     //   [18..19] reserved
     //   [20..]   I/Q data
+    //
+    // Earlier revisions of this parser had offsets shifted by 2 bytes (and the
+    // wrong width for n_subcarriers/freq_mhz/sequence), which made `rssi` read
+    // from the third byte of the sequence counter — producing apparent RSSI of
+    // 0 dBm (or occasional garbage like -24 dBm) instead of the real value.
+    // The comment block above was correct; the code below was not.
     let node_id = buf[4];
     let n_antennas = buf[5];
-    let n_subcarriers = buf[6];
-    let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
-    let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi_raw = buf[14] as i8;
+    let n_subcarriers = u16::from_le_bytes([buf[6], buf[7]]).min(u8::MAX as u16) as u8;
+    let freq_mhz = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+        .min(u16::MAX as u32) as u16;
+    let sequence = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let rssi_raw = buf[16] as i8;
     // Fix RSSI sign: ensure it's always negative (dBm convention).
     let rssi = if rssi_raw > 0 { rssi_raw.saturating_neg() } else { rssi_raw };
-    let noise_floor = buf[15] as i8;
+    let noise_floor = buf[17] as i8;
 
     let iq_start = 20;
     let n_pairs = n_antennas as usize * n_subcarriers as usize;
