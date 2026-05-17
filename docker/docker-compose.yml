@@ -25,6 +25,16 @@ services:
       #   volumes: ["/path/to/models:/app/models"]
       #   MODELS_DIR=/app/models
       - MODELS_DIR=${MODELS_DIR:-/app/models}
+      # Physical positions of the ESP32-S3 sensing nodes, in metres, ordered by
+      # node_id (1, 2, 3, ...). Format: "x,y,z;x,y,z;...". Origin and axis
+      # convention are arbitrary as long as you use the same frame for every
+      # node and (later) for any per-room zone definitions.
+      #
+      # Current deployment (measured 2026-05-17):
+      #   node 1: (9.20, 8.10, 0.63 m)
+      #   node 2: (6.45, 0.20, 0.70 m)
+      #   node 3: (0.00, 4.65, 1.15 m)
+      - SENSING_NODE_POSITIONS=${SENSING_NODE_POSITIONS:-9.2,8.1,0.63;6.45,0.2,0.7;0,4.65,1.15}
       # Enrolled-profile directory (one JSON file per household member).
       # When populated, single-person ticks are matched against these profiles
       # so PersonDetection.label carries the resolved name ("alice", "bob").
