@@ -3802,14 +3802,18 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    let node_positions = s.multistatic_fuser.node_positions().to_vec();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
-                        .map(|(&id, n)| NodeInfo {
-                            node_id: id,
-                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
-                            amplitude: vec![],
-                            subcarrier_count: 0,
+                        .map(|(&id, n)| {
+                            let p = multistatic_bridge::position_for_node_id(id, &node_positions);
+                            NodeInfo {
+                                node_id: id,
+                                rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                                position: [p[0] as f64, p[1] as f64, p[2] as f64],
+                                amplitude: vec![],
+                                subcarrier_count: 0,
+                            }
                         })
                         .collect();
 
@@ -4088,16 +4092,20 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     // Build nodes array with all active nodes.
+                    let node_positions = s.multistatic_fuser.node_positions().to_vec();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
-                        .map(|(&id, n)| NodeInfo {
-                            node_id: id,
-                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
-                            amplitude: n.frame_history.back()
-                                .map(|a| a.iter().take(56).cloned().collect())
-                                .unwrap_or_default(),
-                            subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                        .map(|(&id, n)| {
+                            let p = multistatic_bridge::position_for_node_id(id, &node_positions);
+                            NodeInfo {
+                                node_id: id,
+                                rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                                position: [p[0] as f64, p[1] as f64, p[2] as f64],
+                                amplitude: n.frame_history.back()
+                                    .map(|a| a.iter().take(56).cloned().collect())
+                                    .unwrap_or_default(),
+                                subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                            }
                         })
                         .collect();
 

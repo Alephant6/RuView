@@ -18,6 +18,9 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `DEVICE_NAME`          | `RuView Sensing`                        | Friendly name in HA                                |
 | `DEVICE_ID`            | `ruview`                                | Unique device id (also used in entity unique_ids)  |
 | `LOG_LEVEL`            | `INFO`                                  | `DEBUG` for full WS frame tracing                  |
+| `MAX_TRACKED_PERSONS`  | `2`                                     | Number of fixed per-person slots in HA Discovery   |
+| `Z_MIN`                | `-100.0`                                | Drop persons whose median keypoint z < Z_MIN (m)   |
+| `Z_MAX`                | `100.0`                                 | Drop persons whose median keypoint z > Z_MAX (m). Defaults effectively disable gating until sensing-server emits real floor-relative z. |
 
 ## Topics published
 
@@ -27,6 +30,8 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `<prefix>/state`                   | no       | Flat JSON consumed by all entity templates       |
 | `<prefix>/nodes/<id>`              | no       | Per-node RSSI / position                         |
 | `<prefix>/event`                   | no       | One-shot fall events (HA `event` entity)         |
+| `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, x/y/z, conf)    |
+| `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise |
 | `homeassistant/<comp>/<id>/.../config` | yes  | HA Discovery configs                             |
 
 ## Run standalone
