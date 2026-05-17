@@ -128,6 +128,70 @@ These are all dashboard JSON edits under `docker/grafana/dashboards/`.
 Bundle into one PR; Grafana picks up provisioning changes within 30 s
 without a restart, so iteration is fast.
 
+### 4. Build personal digital fingerprint from collected data
+
+Once InfluxDB has 5-7 days of household data, extract a multi-dimensional
+fingerprint per household member that's stable over time but discriminative
+between people. This is the "completed" version of step C: today's
+`EnrolledProfile` carries only HR/BR baselines (2 dimensions), the
+fingerprint expands that to ~10-15 dimensions that survive day-to-day drift.
+
+**Pre-reqs:**
+- TODO #1 done (so per-person labels are flowing into InfluxDB)
+- TODO #2 done with conclusion "step B viable" (per-track vitals available
+  so fingerprint isn't blurred across multiple people)
+- RSSI stable σ ≤ 2 dB on Node Health dashboard (otherwise features are
+  noise, not biology)
+
+**Fingerprint dimensions (priority-ordered):**
+
+Tier 1 — most stable + most discriminative:
+- `hr_rest_mean`, `hr_rest_std` (during `present_still` solo periods)
+- `br_rest_mean`, `br_rest_std`
+- `hr_motion_slope` — linear fit `HR = a + b·motion_energy`
+- `hr_recovery_seconds` — time for HR to return to baseline+5 bpm after
+  motion drops
+- `presence_hour_hist` — 24-element vector of presence probability per
+  hour of day (very personal: bedtime, wakeup, work-from-home pattern)
+- `motion_freq_peak_hz` — FFT main peak of `motion_energy` during
+  `present_moving`, proxy for walking cadence
+
+Tier 2 — useful adds:
+- Spatial heatmap centroid + spread on (x, y) when solo
+- Top-3 zone occupancy percentages
+- Median session duration
+- Per-node RSSI shadow: `mean(rssi | present) - mean(rssi | absent)`,
+  one number per node — your body's RF cross-section
+
+Tier 3 — needs step B and/or improved DSP:
+- HRV (RMSSD) from per-track HR
+- Breathing rhythm entropy
+- Gait signature from keypoint sequences (requires real 3D pose)
+
+**Approach:**
+
+1. Add `analysis/` directory at repo root with a Jupyter notebook
+   `fingerprint_explore.ipynb`:
+   - Pull last 7 days from InfluxDB via `influxdb_client` Python lib
+   - Compute every Tier 1 + 2 feature per labeled person
+   - Plot per-dimension distributions, do t-test alice vs bob
+   - PCA + clustering visualisation to confirm separability
+2. Pick the 8-15 features with highest separability (Mann-Whitney U or
+   t-test p < 0.01 between household members)
+3. Extend `EnrolledProfile` JSON schema with the new fields (all
+   `#[serde(default)]` for back-compat)
+4. Add a `fingerprint_builder` CLI that takes the date range +
+   profile name and computes/writes the extended fingerprint JSON
+5. Update `profile_loader::distance()` to use weighted Mahalanobis on
+   the extended vector (weight per dimension = 1/std from training data)
+
+**Acceptance:**
+
+- Fingerprint built from week 1 data correctly classifies day-8 readings
+  with > 90 % accuracy on a held-out test split.
+- Adding the fingerprint doesn't break single-person matching that
+  already works today (HR/BR baseline subset acts as fallback).
+
 
 ## Done
 
