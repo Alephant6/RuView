@@ -163,6 +163,7 @@ pub fn tracker_to_person_detections(tracker: &PoseTracker) -> Vec<PersonDetectio
                 keypoints,
                 bbox,
                 zone: "tracked".to_string(),
+                label: None,
             }
         })
         .collect()
@@ -310,6 +311,7 @@ mod tests {
                 height: 1.0,
             },
             zone: "test".to_string(),
+            label: None,
         }
     }
 

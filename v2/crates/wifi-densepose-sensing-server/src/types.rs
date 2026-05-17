@@ -184,6 +184,12 @@ pub struct PersonDetection {
     pub keypoints: Vec<PoseKeypoint>,
     pub bbox: BoundingBox,
     pub zone: String,
+    /// Enrolled-profile name resolved at runtime (e.g. "alice"). `None` when no
+    /// profile is loaded, when this person could not be uniquely matched, or
+    /// when there is more than one tracked person (per-track vitals would be
+    /// needed to disambiguate — see "step B" of the HA health-display plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

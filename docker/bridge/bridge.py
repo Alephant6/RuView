@@ -68,6 +68,25 @@ def person_state_topic(slot: int) -> str:
 def person_avail_topic(slot: int) -> str:
     return f"{MQTT_PREFIX}/person/{slot}/avail"
 
+
+def label_state_topic(label: str) -> str:
+    return f"{MQTT_PREFIX}/person/{label}"
+
+
+def label_avail_topic(label: str) -> str:
+    return f"{MQTT_PREFIX}/person/{label}/avail"
+
+
+def _safe_object_id(name: str) -> str:
+    """Sanitise a label to a Home Assistant unique_id-safe form."""
+    out = []
+    for c in name.strip().lower():
+        if c.isalnum() or c in ("_", "-"):
+            out.append(c)
+        else:
+            out.append("_")
+    return "".join(out) or "person"
+
 DEVICE_BLOCK = {
     "identifiers": [DEVICE_ID],
     "name": DEVICE_NAME,
@@ -130,19 +149,6 @@ def _passes_z_gate(person: dict[str, Any]) -> bool:
         # so we don't silently lose detections during the transition.
         return True
     return Z_MIN <= z <= Z_MAX
-
-
-def assign_slots(persons: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
-    """Map filtered persons to fixed slots 1..MAX_TRACKED_PERSONS.
-
-    Ordering is left-to-right by bbox center x — stable for two roughly
-    stationary household members. Persons rejected by `Z_MIN/Z_MAX` are
-    skipped. Returns `{slot: person_dict}`; missing slots are reported as
-    unoccupied by the publisher.
-    """
-    filtered = [p for p in (persons or []) if _passes_z_gate(p)]
-    filtered.sort(key=lambda p: _person_center(p)[0])
-    return {i + 1: p for i, p in enumerate(filtered[:MAX_TRACKED_PERSONS])}
 
 
 def discovery_messages() -> list[tuple[str, str]]:
@@ -349,6 +355,85 @@ def translate(update: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Per-node discovery + state (auto-registered the first time a node is seen)
 # ---------------------------------------------------------------------------
+class LabelRegistry:
+    """Auto-publishes discovery configs the first time a profile label appears.
+
+    A labeled track corresponds to an enrolled household member ("alice",
+    "bob"). The first time the sensing-server returns a labeled detection,
+    we register a named set of entities in HA Discovery, so the user sees
+    `sensor.alice_present` etc instead of just slot indices.
+    """
+
+    def __init__(self, client: mqtt.Client) -> None:
+        self._client = client
+        self._seen: set[str] = set()
+
+    def ensure_registered(self, label: str) -> None:
+        if label in self._seen:
+            return
+        self._seen.add(label)
+
+        object_prefix = _safe_object_id(label)
+        state_topic = label_state_topic(label)
+        avail_topic = label_avail_topic(label)
+        slot_avail = [
+            {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
+            {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
+        ]
+
+        def _entity(component: str, suffix: str, payload: dict) -> tuple[str, str]:
+            object_id = f"person_{object_prefix}_{suffix}"
+            topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
+            base = {
+                "device": DEVICE_BLOCK,
+                "availability": slot_avail,
+                "availability_mode": "all",
+                "unique_id": f"{DEVICE_ID}_{object_id}",
+            }
+            base.update(payload)
+            return topic, json.dumps(base)
+
+        entities = [
+            _entity("binary_sensor", "present", {
+                "name": f"{label.title()} Present",
+                "state_topic": state_topic,
+                "value_template": "{{ 'ON' if value_json.occupied else 'OFF' }}",
+                "device_class": "occupancy",
+            }),
+            _entity("sensor", "confidence", {
+                "name": f"{label.title()} Confidence",
+                "state_topic": state_topic,
+                "value_template": "{{ (value_json.confidence * 100) | round(1) }}",
+                "unit_of_measurement": "%",
+                "state_class": "measurement",
+                "icon": "mdi:percent",
+            }),
+            _entity("sensor", "x", {
+                "name": f"{label.title()} X",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.x | round(2) }}",
+                "icon": "mdi:axis-x-arrow",
+                "entity_category": "diagnostic",
+            }),
+            _entity("sensor", "y", {
+                "name": f"{label.title()} Y",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.y | round(2) }}",
+                "icon": "mdi:axis-y-arrow",
+                "entity_category": "diagnostic",
+            }),
+            _entity("sensor", "zone", {
+                "name": f"{label.title()} Zone",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.zone }}",
+                "icon": "mdi:map-marker",
+            }),
+        ]
+        for topic, payload in entities:
+            self._client.publish(topic, payload, retain=True)
+        LOG.info("registered profile label %r with HA discovery", label)
+
+
 class NodeRegistry:
     """Auto-publishes discovery configs the first time a node id appears."""
 
@@ -422,6 +507,7 @@ def make_mqtt() -> mqtt.Client:
 async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
     backoff = 1.0
     nodes = NodeRegistry(client)
+    labels = LabelRegistry(client)
 
     while not stop.is_set():
         try:
@@ -448,12 +534,56 @@ async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
                     for node in update.get("nodes") or []:
                         nodes.publish_node(node)
 
-                    # ── Per-person slot publishing ─────────────────────
-                    slots = assign_slots(update.get("persons") or [])
+                    # ── Per-person slot + labeled publishing ─────────────
+                    # Each detected person is routed to either:
+                    #   - a named entity set (when `label` is present), or
+                    #   - a fixed slot (person_1 / person_2 / ...) as fallback.
+                    # A labeled person never also occupies a numeric slot.
+                    raw_persons = update.get("persons") or []
+                    z_passing = [p for p in raw_persons if _passes_z_gate(p)]
+
+                    labeled = [p for p in z_passing if p.get("label")]
+                    unlabeled = [p for p in z_passing if not p.get("label")]
+
+                    # Track which labels we've published this tick so we can mark
+                    # previously-seen-but-now-absent labels as offline.
+                    published_labels: set[str] = set()
+                    for person in labeled:
+                        label = str(person.get("label"))
+                        labels.ensure_registered(label)
+                        cx, cy = _person_center(person)
+                        z = _person_z(person)
+                        client.publish(label_avail_topic(label), "online", retain=True)
+                        client.publish(label_state_topic(label), json.dumps({
+                            "occupied": True,
+                            "label": label,
+                            "track_id": int(person.get("id", 0)),
+                            "confidence": float(person.get("confidence", 0.0)),
+                            "x": cx,
+                            "y": cy,
+                            "z": 0.0 if z is None else z,
+                            "zone": str(person.get("zone", "")),
+                        }))
+                        published_labels.add(label)
+
+                    # Any previously-registered label not seen this tick goes offline.
+                    for label in labels._seen - published_labels:
+                        client.publish(label_avail_topic(label), "offline", retain=True)
+                        client.publish(label_state_topic(label), json.dumps({
+                            "occupied": False,
+                            "label": label,
+                        }))
+
+                    # Fixed slots — only used for unlabeled detections (multi-person
+                    # ticks today, or any tick before profiles are enrolled).
+                    unlabeled.sort(key=lambda p: _person_center(p)[0])
+                    slot_assignments = {
+                        i + 1: p for i, p in enumerate(unlabeled[:MAX_TRACKED_PERSONS])
+                    }
                     for slot in range(1, MAX_TRACKED_PERSONS + 1):
                         avail_topic = person_avail_topic(slot)
                         state_topic = person_state_topic(slot)
-                        person = slots.get(slot)
+                        person = slot_assignments.get(slot)
                         if person is None:
                             client.publish(avail_topic, "offline", retain=True)
                             client.publish(state_topic, json.dumps({"occupied": False}))

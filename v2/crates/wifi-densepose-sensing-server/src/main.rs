@@ -14,6 +14,7 @@ pub mod cli;
 pub mod csi;
 mod field_bridge;
 mod multistatic_bridge;
+mod profile_loader;
 pub mod pose;
 mod rvf_container;
 mod rvf_pipeline;
@@ -166,6 +167,12 @@ struct Args {
     /// Start field model calibration on boot (empty room required)
     #[arg(long)]
     calibrate: bool,
+
+    /// Directory holding enrolled-person profile JSON files (one per name).
+    /// When set, single-person ticks will be matched against these profiles
+    /// so that `PersonDetection.label` carries the resolved household name.
+    #[arg(long, value_name = "DIR", env = "SENSING_PROFILES_DIR")]
+    profiles_dir: Option<String>,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -290,6 +297,12 @@ struct PersonDetection {
     keypoints: Vec<PoseKeypoint>,
     bbox: BoundingBox,
     zone: String,
+    /// Enrolled-profile name resolved at runtime (e.g. "alice"). `None`
+    /// when no profile is loaded, when this person could not be uniquely
+    /// matched, or when multiple persons are tracked (per-track vitals
+    /// would be needed to disambiguate — see step B of the HA plan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -647,6 +660,10 @@ struct AppStateInner {
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// Enrolled-profile store for resolving track ids to household member names.
+    /// `None` when `--profiles-dir` / `SENSING_PROFILES_DIR` is unset, or when
+    /// the directory exists but contains no profiles.
+    profile_store: Option<profile_loader::ProfileStore>,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -1417,6 +1434,38 @@ fn adaptive_override(state: &AppStateInner, features: &FeatureInfo, classificati
 const VITAL_MEDIAN_WINDOW: usize = 21;
 /// EMA alpha for vital signs (~5s time constant at 10 FPS).
 const VITAL_EMA_ALPHA: f64 = 0.02;
+
+/// Resolve the household-member label for a freshly-tracked set of persons.
+///
+/// Today this only fires when **exactly one** track is present, because the
+/// upstream `VitalSigns` is a single global reading rather than a per-track
+/// signal — without disambiguation we have no way to know whose vitals
+/// belong to whom. Step B of the HA plan adds per-track DSP, after which
+/// this helper can fan out across every track.
+fn assign_profile_label(
+    persons: &mut [PersonDetection],
+    vitals: &VitalSigns,
+    store: &profile_loader::ProfileStore,
+) {
+    if persons.len() != 1 || store.is_empty() {
+        return;
+    }
+    let obs = profile_loader::MatchObservation {
+        hr_bpm: vitals.heart_rate_bpm.map(|v| v as f32),
+        br_bpm: vitals.breathing_rate_bpm.map(|v| v as f32),
+    };
+    if let Some((name, dist)) =
+        store.match_observation(&obs, profile_loader::DEFAULT_MATCH_THRESHOLD)
+    {
+        tracing::debug!(
+            "Profile match: track {} -> {} (d={:.3})",
+            persons[0].id,
+            name,
+            dist,
+        );
+        persons[0].label = Some(name);
+    }
+}
 /// Maximum BPM jump per frame before a value is rejected as an outlier.
 const HR_MAX_JUMP: f64 = 8.0;
 const BR_MAX_JUMP: f64 = 2.0;
@@ -1787,11 +1836,16 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
         );
         s.last_tracker_instant = last_tracker_instant;
         if !tracked.is_empty() {
+            if let (Some(store), Some(vs)) =
+                (s.profile_store.as_ref(), update.vital_signs.as_ref())
+            {
+                assign_profile_label(&mut tracked, vs, store);
+            }
             update.persons = Some(tracked);
         }
 
@@ -1925,11 +1979,16 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let raw_persons = derive_pose_from_sensing(&update);
     let mut last_tracker_instant = s.last_tracker_instant.take();
-    let tracked = tracker_bridge::tracker_update(
+    let mut tracked = tracker_bridge::tracker_update(
         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
     );
     s.last_tracker_instant = last_tracker_instant;
     if !tracked.is_empty() {
+        if let (Some(store), Some(vs)) =
+            (s.profile_store.as_ref(), update.vital_signs.as_ref())
+        {
+            assign_profile_label(&mut tracked, vs, store);
+        }
         update.persons = Some(tracked);
     }
 
@@ -2159,6 +2218,7 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             bbox: BoundingBox { x: 260.0, y: 150.0, width: 120.0, height: 220.0 },
                                             keypoints,
                                             zone: "zone_1".into(),
+                                            label: None,
                                         }]
                                     }).unwrap_or_else(|| {
                                         // Prefer tracked persons from broadcast if available
@@ -2677,6 +2737,7 @@ fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
+        label: None,
     }
 }
 
@@ -3890,11 +3951,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
                     );
                     s.last_tracker_instant = last_tracker_instant;
                     if !tracked.is_empty() {
+                        if let (Some(store), Some(vs)) =
+                            (s.profile_store.as_ref(), update.vital_signs.as_ref())
+                        {
+                            assign_profile_label(&mut tracked, vs, store);
+                        }
                         update.persons = Some(tracked);
                     }
 
@@ -4142,11 +4208,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
                     );
                     s.last_tracker_instant = last_tracker_instant;
                     if !tracked.is_empty() {
+                        if let (Some(store), Some(vs)) =
+                            (s.profile_store.as_ref(), update.vital_signs.as_ref())
+                        {
+                            assign_profile_label(&mut tracked, vs, store);
+                        }
                         update.persons = Some(tracked);
                     }
 
@@ -4280,11 +4351,16 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
         );
         s.last_tracker_instant = last_tracker_instant;
         if !tracked.is_empty() {
+            if let (Some(store), Some(vs)) =
+                (s.profile_store.as_ref(), update.vital_signs.as_ref())
+            {
+                assign_profile_label(&mut tracked, vs, store);
+            }
             update.persons = Some(tracked);
         }
 
@@ -4944,6 +5020,27 @@ async fn main() {
         } else {
             None
         },
+        profile_store: args.profiles_dir.as_deref().and_then(|dir| {
+            match profile_loader::ProfileStore::load(dir) {
+                Ok(store) if !store.is_empty() => {
+                    info!(
+                        "Loaded {} enrolled profile(s) from {} -> {:?}",
+                        store.len(),
+                        dir,
+                        store.names(),
+                    );
+                    Some(store)
+                }
+                Ok(_) => {
+                    info!("Profile directory {} is empty — no labels will be assigned", dir);
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load profiles from {}: {} — running without labels", dir, e);
+                    None
+                }
+            }
+        }),
     }));
 
     // Start background tasks based on source

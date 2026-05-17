@@ -25,6 +25,12 @@ services:
       #   volumes: ["/path/to/models:/app/models"]
       #   MODELS_DIR=/app/models
       - MODELS_DIR=${MODELS_DIR:-/app/models}
+      # Enrolled-profile directory (one JSON file per household member).
+      # When populated, single-person ticks are matched against these profiles
+      # so PersonDetection.label carries the resolved name ("alice", "bob").
+      # The bridge then publishes named HA entities (sensor.alice_present, ...).
+      # Leave empty to disable name resolution (fallback to person_1 / person_2).
+      - SENSING_PROFILES_DIR=${SENSING_PROFILES_DIR:-/app/data/profiles}
     volumes:
       - ./models:/app/models
       - ./data:/app/data

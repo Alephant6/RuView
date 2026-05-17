@@ -32,7 +32,39 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `<prefix>/event`                   | no       | One-shot fall events (HA `event` entity)         |
 | `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, x/y/z, conf)    |
 | `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise |
+| `<prefix>/person/<label>`          | no       | Per-name state (e.g. `ruview/person/alice`) when an enrolled profile matched |
+| `<prefix>/person/<label>/avail`    | yes      | `online` when that named person is detected      |
 | `homeassistant/<comp>/<id>/.../config` | yes  | HA Discovery configs                             |
+
+## Enrolled profiles (named entities)
+
+When `SENSING_PROFILES_DIR` is set on the sensing-server, the bridge automatically promotes single-person ticks from `person_1` / `person_2` to real names — `alice`, `bob`, etc.
+
+A profile is a small JSON file matching the schema below. Today (step A), it can be hand-crafted; a CLI helper is planned (step B). Drop the file under `data/profiles/<name>.json` (the path mounted via docker-compose) and restart the sensing-server.
+
+```json
+{
+  "name": "alice",
+  "hr_baseline_bpm": 72.0,
+  "hr_std_bpm": 3.0,
+  "br_baseline_bpm": 14.5,
+  "br_std_bpm": 1.2,
+  "sample_count": 60,
+  "enrolled_at": "2026-05-17T14:32:00Z",
+  "last_updated_at": "2026-05-17T14:32:00Z"
+}
+```
+
+**Enrollment workflow (manual today)**:
+
+1. Have the person alone in the apartment for ~3 minutes.
+2. Watch the sensing-server's `vital_signs` output (HA `sensor.heart_rate` / `sensor.breathing_rate`, or `mosquitto_sub -t 'ruview/state' -v`).
+3. Note the typical resting values and roughly their spread over 60 s.
+4. Write a JSON file like the one above, save as `data/profiles/<name>.json`.
+5. Restart sensing-server: `docker compose restart sensing-server`.
+6. The bridge will register `sensor.<name>_present`, `sensor.<name>_x` etc the first time that person is matched.
+
+**Matching today** runs only when **exactly one person** is in the sensing zone, because the upstream vitals are still a single global reading. Multi-person matching arrives with step B (ADR-100).
 
 ## Run standalone
 
