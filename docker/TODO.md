@@ -3,9 +3,38 @@
 Per-deployment punch list that the codebase can't track for you. Tick items
 off and update notes as you work through them.
 
+## Current state (2026-05-17 evening)
+
+**Opportunity window:** partner is solo in the apartment, expected to stay
+solo for a while. This is the right time to do a long, high-quality
+enrollment capture for the partner (5–10 min of `n_persons=1` data)
+instead of the rushed 90 s we tried earlier. User doesn't need to step
+out — partner is already alone.
+
+What today's measurements established (do not re-litigate):
+
+- HR pipeline is **real**, not FFT bin centre:
+  - User-dominated capture (both home): 57.3 ± 0.6 bpm, tight single peak
+  - Partner-solo capture (90 s): 93.7 ± 7.91 bpm; std inflated by motion
+    contamination, centre is plausible
+  - Two household members clearly separable on HR alone (~6 σ)
+- BR is **still bin-centre** (std = 0.0 across 36 samples at 19.4/18.4 bpm)
+  — SNR not enough for breathing yet
+- `conf` median 0.46–0.47 — borderline; field is `confidence`, not
+  `breathing_confidence` as item #1 below currently writes
+- RSSI improved: node 1 −60 dBm, node 2 −51 dBm, node 3 still −78 dBm —
+  consider relocating node 3 before next enrollment round
+- CSI rate bottleneck is **ESP32 firmware throttle, not RSSI / traffic**:
+  ping flood at ~150 pps lifted UDP from 884 → 1419 /30 s (+60 %) but
+  per-node CSI stuck near 16 Hz — far below the 30 Hz target in item #2.
+  More traffic won't move the needle much; firmware tuning required.
+- `present_still` was only 1.2 % of partner-solo samples — either partner
+  moved more than expected, or the `motion_level=still` threshold in
+  sensing-server is tight. Check before next capture.
+
 ## Open
 
-### 1. Enroll alice / bob profiles _(deferred to tomorrow)_
+### 1. Enroll alice / bob profiles _(partner-solo window open now, see "Current state" above)_
 
 Without these JSON files, single-person ticks fall back to numeric
 `person_1` / `person_2` slots in Home Assistant. The bridge will auto-promote
