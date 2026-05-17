@@ -13,7 +13,7 @@
       "id": 1,
       "title": "Presence (global)",
       "type": "state-timeline",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -42,7 +42,7 @@
       "id": 2,
       "title": "Person count",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "fieldConfig": {
         "defaults": {
@@ -64,7 +64,7 @@
       "id": 3,
       "title": "Per-slot / per-name occupancy",
       "type": "state-timeline",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "description": "One row per slot or labeled person. Shows when each was detected.",
       "fieldConfig": {
@@ -94,7 +94,7 @@
       "id": 4,
       "title": "Person X position",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "fieldConfig": {
         "defaults": {
@@ -113,7 +113,7 @@
       "id": 5,
       "title": "Person Y position",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "fieldConfig": {
         "defaults": {
@@ -132,7 +132,7 @@
       "id": 6,
       "title": "Fall events (last 24h)",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 8, "x": 0, "y": 22 },
       "fieldConfig": {
         "defaults": {
@@ -159,7 +159,7 @@
       "id": 7,
       "title": "Active sensing nodes",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 8, "x": 8, "y": 22 },
       "fieldConfig": {
         "defaults": {
@@ -189,7 +189,7 @@
       "id": 8,
       "title": "Source",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 8, "x": 16, "y": 22 },
       "description": "Active CSI source — should be 'esp32' for the household deployment.",
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/.*source.*/" }, "textMode": "value" },

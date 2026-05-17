@@ -16,7 +16,7 @@
       "id": 1,
       "title": "Node RSSI (dBm)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 9, "w": 16, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -54,7 +54,7 @@
       "id": 2,
       "title": "Current RSSI",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 9, "w": 8, "x": 16, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -88,7 +88,7 @@
       "id": 3,
       "title": "RSSI stability (30s stddev, dB)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
       "description": "σ ≤ 1.5 dB is excellent; ≥ 5 dB indicates interference or unstable power.",
       "fieldConfig": {
@@ -117,7 +117,7 @@
       "id": 4,
       "title": "Signal quality (global)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
       "description": "Aggregated signal_quality from sensing-server. < 0.4 → vital-signs detector is unreliable.",
       "fieldConfig": {
@@ -147,7 +147,7 @@
       "id": 5,
       "title": "MQTT messages per node (per 30s)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
       "description": "Proxy for bridge-side frame throughput. Note this is sensing-server tick rate (~10 Hz), not ESP32 raw UDP rate.",
       "fieldConfig": {

@@ -5,6 +5,7 @@ apiVersion: 1
 # defaults in docker-compose.yml).
 datasources:
   - name: InfluxDB
+    uid: ruview-influxdb
     type: influxdb
     access: proxy
     url: http://influxdb:8086

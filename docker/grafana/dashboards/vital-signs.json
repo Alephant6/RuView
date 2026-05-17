@@ -13,7 +13,7 @@
       "id": 1,
       "title": "Heart rate (bpm)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -35,7 +35,7 @@
       "id": 2,
       "title": "Breathing rate (bpm)",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
       "fieldConfig": {
         "defaults": {
@@ -57,7 +57,7 @@
       "id": 3,
       "title": "Current HR",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 4, "x": 0, "y": 9 },
       "fieldConfig": {
         "defaults": {
@@ -86,7 +86,7 @@
       "id": 4,
       "title": "Current BR",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 4, "x": 4, "y": 9 },
       "fieldConfig": {
         "defaults": {
@@ -115,7 +115,7 @@
       "id": 5,
       "title": "Unique BR values in last 5 min",
       "type": "stat",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 4, "x": 8, "y": 9 },
       "description": "Diagnostic: ≤ 5 unique values → FFT-bin pinning, SNR is too low (genuine BR varies continuously).",
       "fieldConfig": {
@@ -145,7 +145,7 @@
       "id": 6,
       "title": "Motion energy",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 12, "x": 12, "y": 9 },
       "fieldConfig": {
         "defaults": {
@@ -165,7 +165,7 @@
       "id": 7,
       "title": "Detection confidence",
       "type": "timeseries",
-      "datasource": { "type": "influxdb", "uid": "${datasource}" },
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
       "gridPos": { "h": 5, "w": 24, "x": 0, "y": 14 },
       "fieldConfig": {
         "defaults": {
