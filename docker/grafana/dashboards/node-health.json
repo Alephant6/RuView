@@ -23,6 +23,7 @@
           "unit": "dBm",
           "min": -100,
           "max": -30,
+          "displayName": "Node ${__field.labels.node_id}",
           "color": { "mode": "palette-classic" },
           "thresholds": {
             "mode": "absolute",
@@ -59,6 +60,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "dBm",
+          "displayName": "Node ${__field.labels.node_id}",
           "color": { "mode": "thresholds" },
           "thresholds": {
             "mode": "absolute",
@@ -95,6 +97,7 @@
         "defaults": {
           "unit": "dB",
           "min": 0,
+          "displayName": "Node ${__field.labels.node_id}",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -153,7 +156,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "min": 0
+          "min": 0,
+          "displayName": "Node ${__field.labels.node_id}"
         }
       },
       "targets": [
