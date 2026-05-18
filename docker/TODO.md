@@ -3,38 +3,45 @@
 Per-deployment punch list that the codebase can't track for you. Tick items
 off and update notes as you work through them.
 
-## Current state (2026-05-17 evening)
+## Current state (2026-05-17 evening / 2026-05-18 night)
 
-**Opportunity window:** partner is solo in the apartment, expected to stay
-solo for a while. This is the right time to do a long, high-quality
-enrollment capture for the partner (5–10 min of `n_persons=1` data)
-instead of the rushed 90 s we tried earlier. User doesn't need to step
-out — partner is already alone.
+Item #1 is **done** — partner enrolled as `ml`, see "Done" section below.
 
-What today's measurements established (do not re-litigate):
+Findings that still apply to the rest of the punch list:
 
-- HR pipeline is **real**, not FFT bin centre:
-  - User-dominated capture (both home): 57.3 ± 0.6 bpm, tight single peak
-  - Partner-solo capture (90 s): 93.7 ± 7.91 bpm; std inflated by motion
-    contamination, centre is plausible
-  - Two household members clearly separable on HR alone (~6 σ)
-- BR is **still bin-centre** (std = 0.0 across 36 samples at 19.4/18.4 bpm)
-  — SNR not enough for breathing yet
-- `conf` median 0.46–0.47 — borderline; field is `confidence`, not
-  `breathing_confidence` as item #1 below currently writes
-- RSSI improved: node 1 −60 dBm, node 2 −51 dBm, node 3 still −78 dBm —
-  consider relocating node 3 before next enrollment round
+- HR pipeline is **real**, not FFT bin centre. User and partner are
+  clearly separable on HR alone (user solo-dominated ~57 bpm, partner
+  5 h solo median 75.7 bpm with calm/active bimodality 60–95).
+- BR pipeline is **also real** at longer time scales (std ≈ 3 across the
+  5 h partner-solo window), even though a 90 s snapshot looks bin-centre
+  (std = 0). Lesson: don't judge BR from short captures.
+- `conf` median 0.46–0.50 across all captures — borderline but stable.
+  The field is `confidence`, not `breathing_confidence` as item #1's
+  original pre-req text claims (kept as-is below for diff continuity).
+- RSSI improved: node 1 −60 dBm, node 2 −51 dBm, **node 3 still −78 dBm**
+  — relocate node 3 before any further enrollment quality work.
 - CSI rate bottleneck is **ESP32 firmware throttle, not RSSI / traffic**:
   ping flood at ~150 pps lifted UDP from 884 → 1419 /30 s (+60 %) but
   per-node CSI stuck near 16 Hz — far below the 30 Hz target in item #2.
   More traffic won't move the needle much; firmware tuning required.
-- `present_still` was only 1.2 % of partner-solo samples — either partner
-  moved more than expected, or the `motion_level=still` threshold in
-  sensing-server is tight. Check before next capture.
+- `motion_energy` correlates weakly with actual physical activity —
+  during the 5 h capture, partner's high-HR "active phase" had *lower*
+  motion_energy than the calm phase. The metric is measuring environmental
+  RF fluctuation, not body movement. Don't use `motion_energy < 30` as a
+  "this person is resting" gate.
+- `present_still` was only 1.2 % of a partner-solo 90 s sample —
+  motion_level threshold in sensing-server is tight; longer windows
+  (5 h InfluxDB query) still found enough still samples for analysis.
+- **Track ID instability** (observed during enrollment verification):
+  `track_id` jumped between 4, 12, 40, 43, 44, 46 within 15 s under
+  two-person conditions. The tracker is continuously losing and
+  re-acquiring tracks, which will block per-track DSP in ADR-100 "step B".
+  Worth its own investigation; not blocking enrollment matching today
+  because matching uses global vitals + single-person gating.
 
 ## Open
 
-### 1. Enroll alice / bob profiles _(partner-solo window open now, see "Current state" above)_
+### 1. Enroll alice / bob profiles _(done 2026-05-18 — see "Done" section below)_
 
 Without these JSON files, single-person ticks fall back to numeric
 `person_1` / `person_2` slots in Home Assistant. The bridge will auto-promote
@@ -224,4 +231,22 @@ Tier 3 — needs step B and/or improved DSP:
 
 ## Done
 
-- _(none yet — fill in as items move from Open)_
+- **2026-05-18 — Item #1 (enrollment), partner only.** Built baseline from
+  a 135 min InfluxDB solo window (18:45–21:00 EDT 2026-05-17):
+  HR 75.7 ± 12, BR 15.7 ± 3, conf median 0.46. Wrote
+  `docker/data/profiles/ml.json`, restarted sensing-server, log confirms
+  `Loaded 1 enrolled profile(s) ... -> ["ml"]`. Verified by a 5-min user-away
+  window (10:04–10:09 EDT 2026-05-17 / 02:04–02:09 UTC): InfluxDB `person`
+  measurement gained a `label=ml` tag, MQTT topic `ruview/person/ml`
+  started publishing with `{"label": "ml"}`. User's own profile
+  intentionally **not** enrolled yet — the earlier 57.3 ± 0.6 baseline was
+  measured with both household members present, so the signal source
+  isn't fully attributable. Wait for next user-solo window for a clean
+  user baseline.
+
+  Open follow-ups:
+  - Confirm Home Assistant discovery topic `homeassistant/sensor/ml_*/config`
+    actually gets published (the lazy-publish-on-first-match path was
+    triggered, but a targeted grep timed out — worth a clean check).
+  - Wider baseline std (HR ± 12) is intentional for first-pass tolerance;
+    the matcher will adapt over time.
