@@ -1,0 +1,16 @@
+apiVersion: 1
+
+# Auto-load every JSON dashboard under /var/lib/grafana/dashboards on start.
+# Adding a new dashboard is just dropping a file into ./grafana/dashboards/
+# in the repo — no UI clicks required.
+providers:
+  - name: RuView
+    orgId: 1
+    folder: 'RuView'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

@@ -102,4 +102,10 @@ pub struct Args {
     /// Start field model calibration on boot (empty room required)
     #[arg(long)]
     pub calibrate: bool,
+
+    /// Directory holding enrolled-person profile JSON files (one per name).
+    /// When set, single-person ticks will be matched against these profiles
+    /// so that `PersonDetection.label` carries the resolved household name.
+    #[arg(long, value_name = "DIR", env = "SENSING_PROFILES_DIR")]
+    pub profiles_dir: Option<String>,
 }

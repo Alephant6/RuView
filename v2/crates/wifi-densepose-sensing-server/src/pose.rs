@@ -124,6 +124,7 @@ pub fn derive_single_person_pose(
         keypoints,
         bbox: BoundingBox { x: min_x, y: min_y, width: (max_x - min_x).max(80.0), height: (max_y - min_y).max(160.0) },
         zone: format!("zone_{}", person_idx + 1),
+        label: None,
     }
 }
 

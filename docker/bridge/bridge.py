@@ -40,6 +40,16 @@ DEVICE_NAME = os.getenv("DEVICE_NAME", "RuView Sensing")
 DEVICE_ID = os.getenv("DEVICE_ID", "ruview")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Per-person fixed-slot publishing. `MAX_TRACKED_PERSONS` slots are registered
+# in HA Discovery; each tick the bridge sorts detected persons by `bbox.x`
+# (leftmost → slot 1) and publishes a per-slot state topic. Spatial gating via
+# Z_MIN/Z_MAX is wired up but currently a no-op for ESP32-derived poses (which
+# emit body-lean z, not real floor height) — once the sensing-server exposes
+# multistatic-localized z, just tighten Z_MIN/Z_MAX to filter downstairs.
+MAX_TRACKED_PERSONS = int(os.getenv("MAX_TRACKED_PERSONS", "2"))
+Z_MIN = float(os.getenv("Z_MIN", "-100.0"))
+Z_MAX = float(os.getenv("Z_MAX", "100.0"))
+
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
@@ -49,6 +59,33 @@ LOG = logging.getLogger("ruview-bridge")
 AVAIL_TOPIC = f"{MQTT_PREFIX}/availability"
 STATE_TOPIC = f"{MQTT_PREFIX}/state"
 EVENT_TOPIC = f"{MQTT_PREFIX}/event"
+
+
+def person_state_topic(slot: int) -> str:
+    return f"{MQTT_PREFIX}/person/{slot}"
+
+
+def person_avail_topic(slot: int) -> str:
+    return f"{MQTT_PREFIX}/person/{slot}/avail"
+
+
+def label_state_topic(label: str) -> str:
+    return f"{MQTT_PREFIX}/person/{label}"
+
+
+def label_avail_topic(label: str) -> str:
+    return f"{MQTT_PREFIX}/person/{label}/avail"
+
+
+def _safe_object_id(name: str) -> str:
+    """Sanitise a label to a Home Assistant unique_id-safe form."""
+    out = []
+    for c in name.strip().lower():
+        if c.isalnum() or c in ("_", "-"):
+            out.append(c)
+        else:
+            out.append("_")
+    return "".join(out) or "person"
 
 DEVICE_BLOCK = {
     "identifiers": [DEVICE_ID],
@@ -72,6 +109,46 @@ def _discovery(component: str, object_id: str, payload: dict) -> tuple[str, str]
     }
     base.update(payload)
     return topic, json.dumps(base)
+
+
+def _person_z(person: dict[str, Any]) -> float | None:
+    """Median z of high-confidence keypoints, or None if unavailable.
+
+    For real multistatic-localized poses this is metres above the bridge
+    coordinate origin; for the current ESP32 pose synthesiser this is the
+    body-lean estimate (~0) so the value is informational only.
+    """
+    kps = person.get("keypoints") or []
+    zs = [
+        float(kp.get("z", 0.0))
+        for kp in kps
+        if float(kp.get("confidence", 0.0)) >= 0.3
+    ]
+    if not zs:
+        return None
+    zs.sort()
+    return zs[len(zs) // 2]
+
+
+def _person_center(person: dict[str, Any]) -> tuple[float, float]:
+    """(cx, cy) of the bounding box, or (0.0, 0.0) if unavailable."""
+    bbox = person.get("bbox") or {}
+    x = float(bbox.get("x", 0.0))
+    y = float(bbox.get("y", 0.0))
+    w = float(bbox.get("width", 0.0))
+    h = float(bbox.get("height", 0.0))
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _passes_z_gate(person: dict[str, Any]) -> bool:
+    """Return True when the person should be reported (False = drop)."""
+    z = _person_z(person)
+    if z is None:
+        # No z info available — don't drop, the sensing-server isn't producing
+        # 3-D positions yet. Once it does, an unknown-z person should still pass
+        # so we don't silently lose detections during the transition.
+        return True
+    return Z_MIN <= z <= Z_MAX
 
 
 def discovery_messages() -> list[tuple[str, str]]:
@@ -169,6 +246,77 @@ def discovery_messages() -> list[tuple[str, str]]:
         "value_template": "{{ value_json.event_type }}",
     }))
 
+    # ── Per-person fixed slots ─────────────────────────────────────────
+    # Each slot gets its own state + availability topic so HA entities
+    # cleanly drop to "unavailable" when nobody is in that slot, rather
+    # than displaying stale numbers.
+    #
+    # NOTE: per-slot heart rate / breathing rate is intentionally absent.
+    # `SensingUpdate.vital_signs` is currently a single global reading; until
+    # the sensing-server attaches per-track vitals to `PersonDetection`,
+    # publishing per-slot HR/BR would just produce broken entities.
+    for slot in range(1, MAX_TRACKED_PERSONS + 1):
+        state_topic = person_state_topic(slot)
+        avail_topic = person_avail_topic(slot)
+        slot_avail = [
+            {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
+            {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
+        ]
+
+        def _slot(component: str, object_id: str, payload: dict) -> tuple[str, str]:
+            """Build a per-slot discovery message with chained availability."""
+            topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
+            base = {
+                "device": DEVICE_BLOCK,
+                "availability": slot_avail,
+                "availability_mode": "all",
+                "unique_id": f"{DEVICE_ID}_{object_id}",
+            }
+            base.update(payload)
+            return topic, json.dumps(base)
+
+        msgs.append(_slot("binary_sensor", f"person_{slot}_present", {
+            "name": f"Person {slot} Present",
+            "state_topic": state_topic,
+            "value_template": "{{ 'ON' if value_json.occupied else 'OFF' }}",
+            "device_class": "occupancy",
+        }))
+        msgs.append(_slot("sensor", f"person_{slot}_confidence", {
+            "name": f"Person {slot} Confidence",
+            "state_topic": state_topic,
+            "value_template": "{{ (value_json.confidence * 100) | round(1) }}",
+            "unit_of_measurement": "%",
+            "state_class": "measurement",
+            "icon": "mdi:percent",
+        }))
+        msgs.append(_slot("sensor", f"person_{slot}_x", {
+            "name": f"Person {slot} X",
+            "state_topic": state_topic,
+            "value_template": "{{ value_json.x | round(2) }}",
+            "icon": "mdi:axis-x-arrow",
+            "entity_category": "diagnostic",
+        }))
+        msgs.append(_slot("sensor", f"person_{slot}_y", {
+            "name": f"Person {slot} Y",
+            "state_topic": state_topic,
+            "value_template": "{{ value_json.y | round(2) }}",
+            "icon": "mdi:axis-y-arrow",
+            "entity_category": "diagnostic",
+        }))
+        msgs.append(_slot("sensor", f"person_{slot}_z", {
+            "name": f"Person {slot} Z",
+            "state_topic": state_topic,
+            "value_template": "{{ value_json.z | round(2) }}",
+            "icon": "mdi:axis-z-arrow",
+            "entity_category": "diagnostic",
+        }))
+        msgs.append(_slot("sensor", f"person_{slot}_zone", {
+            "name": f"Person {slot} Zone",
+            "state_topic": state_topic,
+            "value_template": "{{ value_json.zone }}",
+            "icon": "mdi:map-marker",
+        }))
+
     return msgs
 
 
@@ -207,6 +355,85 @@ def translate(update: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Per-node discovery + state (auto-registered the first time a node is seen)
 # ---------------------------------------------------------------------------
+class LabelRegistry:
+    """Auto-publishes discovery configs the first time a profile label appears.
+
+    A labeled track corresponds to an enrolled household member ("alice",
+    "bob"). The first time the sensing-server returns a labeled detection,
+    we register a named set of entities in HA Discovery, so the user sees
+    `sensor.alice_present` etc instead of just slot indices.
+    """
+
+    def __init__(self, client: mqtt.Client) -> None:
+        self._client = client
+        self._seen: set[str] = set()
+
+    def ensure_registered(self, label: str) -> None:
+        if label in self._seen:
+            return
+        self._seen.add(label)
+
+        object_prefix = _safe_object_id(label)
+        state_topic = label_state_topic(label)
+        avail_topic = label_avail_topic(label)
+        slot_avail = [
+            {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
+            {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
+        ]
+
+        def _entity(component: str, suffix: str, payload: dict) -> tuple[str, str]:
+            object_id = f"person_{object_prefix}_{suffix}"
+            topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
+            base = {
+                "device": DEVICE_BLOCK,
+                "availability": slot_avail,
+                "availability_mode": "all",
+                "unique_id": f"{DEVICE_ID}_{object_id}",
+            }
+            base.update(payload)
+            return topic, json.dumps(base)
+
+        entities = [
+            _entity("binary_sensor", "present", {
+                "name": f"{label.title()} Present",
+                "state_topic": state_topic,
+                "value_template": "{{ 'ON' if value_json.occupied else 'OFF' }}",
+                "device_class": "occupancy",
+            }),
+            _entity("sensor", "confidence", {
+                "name": f"{label.title()} Confidence",
+                "state_topic": state_topic,
+                "value_template": "{{ (value_json.confidence * 100) | round(1) }}",
+                "unit_of_measurement": "%",
+                "state_class": "measurement",
+                "icon": "mdi:percent",
+            }),
+            _entity("sensor", "x", {
+                "name": f"{label.title()} X",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.x | round(2) }}",
+                "icon": "mdi:axis-x-arrow",
+                "entity_category": "diagnostic",
+            }),
+            _entity("sensor", "y", {
+                "name": f"{label.title()} Y",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.y | round(2) }}",
+                "icon": "mdi:axis-y-arrow",
+                "entity_category": "diagnostic",
+            }),
+            _entity("sensor", "zone", {
+                "name": f"{label.title()} Zone",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.zone }}",
+                "icon": "mdi:map-marker",
+            }),
+        ]
+        for topic, payload in entities:
+            self._client.publish(topic, payload, retain=True)
+        LOG.info("registered profile label %r with HA discovery", label)
+
+
 class NodeRegistry:
     """Auto-publishes discovery configs the first time a node id appears."""
 
@@ -280,6 +507,7 @@ def make_mqtt() -> mqtt.Client:
 async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
     backoff = 1.0
     nodes = NodeRegistry(client)
+    labels = LabelRegistry(client)
 
     while not stop.is_set():
         try:
@@ -305,6 +533,74 @@ async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
 
                     for node in update.get("nodes") or []:
                         nodes.publish_node(node)
+
+                    # ── Per-person slot + labeled publishing ─────────────
+                    # Each detected person is routed to either:
+                    #   - a named entity set (when `label` is present), or
+                    #   - a fixed slot (person_1 / person_2 / ...) as fallback.
+                    # A labeled person never also occupies a numeric slot.
+                    raw_persons = update.get("persons") or []
+                    z_passing = [p for p in raw_persons if _passes_z_gate(p)]
+
+                    labeled = [p for p in z_passing if p.get("label")]
+                    unlabeled = [p for p in z_passing if not p.get("label")]
+
+                    # Track which labels we've published this tick so we can mark
+                    # previously-seen-but-now-absent labels as offline.
+                    published_labels: set[str] = set()
+                    for person in labeled:
+                        label = str(person.get("label"))
+                        labels.ensure_registered(label)
+                        cx, cy = _person_center(person)
+                        z = _person_z(person)
+                        client.publish(label_avail_topic(label), "online", retain=True)
+                        client.publish(label_state_topic(label), json.dumps({
+                            "occupied": True,
+                            "label": label,
+                            "track_id": int(person.get("id", 0)),
+                            "confidence": float(person.get("confidence", 0.0)),
+                            "x": cx,
+                            "y": cy,
+                            "z": 0.0 if z is None else z,
+                            "zone": str(person.get("zone", "")),
+                        }))
+                        published_labels.add(label)
+
+                    # Any previously-registered label not seen this tick goes offline.
+                    for label in labels._seen - published_labels:
+                        client.publish(label_avail_topic(label), "offline", retain=True)
+                        client.publish(label_state_topic(label), json.dumps({
+                            "occupied": False,
+                            "label": label,
+                        }))
+
+                    # Fixed slots — only used for unlabeled detections (multi-person
+                    # ticks today, or any tick before profiles are enrolled).
+                    unlabeled.sort(key=lambda p: _person_center(p)[0])
+                    slot_assignments = {
+                        i + 1: p for i, p in enumerate(unlabeled[:MAX_TRACKED_PERSONS])
+                    }
+                    for slot in range(1, MAX_TRACKED_PERSONS + 1):
+                        avail_topic = person_avail_topic(slot)
+                        state_topic = person_state_topic(slot)
+                        person = slot_assignments.get(slot)
+                        if person is None:
+                            client.publish(avail_topic, "offline", retain=True)
+                            client.publish(state_topic, json.dumps({"occupied": False}))
+                            continue
+
+                        cx, cy = _person_center(person)
+                        z = _person_z(person)
+                        client.publish(avail_topic, "online", retain=True)
+                        client.publish(state_topic, json.dumps({
+                            "occupied": True,
+                            "track_id": int(person.get("id", 0)),
+                            "confidence": float(person.get("confidence", 0.0)),
+                            "x": cx,
+                            "y": cy,
+                            "z": 0.0 if z is None else z,
+                            "zone": str(person.get("zone", "")),
+                        }))
 
                     # Edge-trigger fall event: only fire once per tick where
                     # `fall_detected` flips from false->true.
@@ -335,6 +631,8 @@ async def main() -> None:
     LOG.info("  WS:    %s", WS_URL)
     LOG.info("  MQTT:  %s:%s as user=%r prefix=%r", MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PREFIX)
     LOG.info("  HA:    discovery prefix=%r device_id=%r", HA_PREFIX, DEVICE_ID)
+    LOG.info("  Slots: max_tracked_persons=%d z_gate=[%.2f, %.2f]",
+             MAX_TRACKED_PERSONS, Z_MIN, Z_MAX)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

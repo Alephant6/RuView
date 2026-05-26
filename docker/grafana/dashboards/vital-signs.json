@@ -1,0 +1,186 @@
+{
+  "uid": "ruview-vitals",
+  "title": "RuView — Vital Signs",
+  "description": "Heart rate and breathing rate over time, with confidence and motion-energy overlays for context.",
+  "tags": ["ruview", "vitals"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-3h", "to": "now" },
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Heart rate (bpm)",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bpm",
+          "min": 40,
+          "max": 130,
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"heart_rate_bpm\")\n  |> filter(fn: (r) => r._value > 30.0 and r._value < 200.0)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Breathing rate (bpm)",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bpm",
+          "min": 5,
+          "max": 35,
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"breathing_rate_bpm\")\n  |> filter(fn: (r) => r._value > 3.0 and r._value < 40.0)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Current HR",
+      "type": "stat",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bpm",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue",  "value": null },
+              { "color": "green", "value": 55 },
+              { "color": "yellow", "value": 95 },
+              { "color": "red",   "value": 120 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"heart_rate_bpm\")\n  |> filter(fn: (r) => r._value > 30.0)\n  |> mean()"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Current BR",
+      "type": "stat",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bpm",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue",  "value": null },
+              { "color": "green", "value": 10 },
+              { "color": "yellow", "value": 22 },
+              { "color": "red",   "value": 28 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: -2m)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"breathing_rate_bpm\")\n  |> filter(fn: (r) => r._value > 3.0)\n  |> mean()"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Unique BR values in last 5 min",
+      "type": "stat",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 9 },
+      "description": "Diagnostic: ≤ 5 unique values → FFT-bin pinning, SNR is too low (genuine BR varies continuously).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "orange", "value": 6 },
+              { "color": "yellow", "value": 10 },
+              { "color": "green",  "value": 15 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: -5m)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"breathing_rate_bpm\")\n  |> filter(fn: (r) => r._value > 3.0)\n  |> map(fn: (r) => ({ r with _value: float(v: int(v: r._value * 10.0)) / 10.0 }))\n  |> distinct(column: \"_value\")\n  |> count()"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Motion energy",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "purple" },
+          "custom": { "drawStyle": "line", "fillOpacity": 12, "lineWidth": 1, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"motion_energy\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Detection confidence",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "ruview-influxdb" },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 14 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 1, "showPoints": "never" }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"sensing\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"state\" and r._field == \"confidence\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+        }
+      ]
+    }
+  ]
+}

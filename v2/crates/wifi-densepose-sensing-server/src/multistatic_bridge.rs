@@ -66,11 +66,21 @@ pub fn node_frame_from_state(node_id: u8, ns: &NodeState) -> Option<MultiBandCsi
 ///
 /// A node is considered active if its `last_frame_time` is within
 /// [`STALE_THRESHOLD`] of `now`.
+///
+/// Frames are returned **sorted by ascending `node_id`** so that downstream
+/// consumers (notably `MultistaticFuser`, which indexes node positions by
+/// frame order) see a deterministic, stable mapping across ticks — without
+/// this sort, `HashMap` iteration order would randomise the position →
+/// node assignment.
 pub fn node_frames_from_states(node_states: &HashMap<u8, NodeState>) -> Vec<MultiBandCsiFrame> {
     let now = Instant::now();
     let mut frames = Vec::with_capacity(node_states.len());
 
-    for (&node_id, ns) in node_states {
+    let mut entries: Vec<(u8, &NodeState)> =
+        node_states.iter().map(|(&id, ns)| (id, ns)).collect();
+    entries.sort_by_key(|(id, _)| *id);
+
+    for (node_id, ns) in entries {
         // Skip stale nodes
         if let Some(ref t) = ns.last_frame_time {
             if now.duration_since(*t) > STALE_THRESHOLD {
@@ -86,6 +96,21 @@ pub fn node_frames_from_states(node_states: &HashMap<u8, NodeState>) -> Vec<Mult
     }
 
     frames
+}
+
+/// Look up a node's 3-D position from the configured position list.
+///
+/// Convention: the `N`-th triplet in `SENSING_NODE_POSITIONS` maps to
+/// node id `N` (1-indexed). Returns `[0.0, 0.0, 0.0]` if `id == 0`,
+/// the position is out of range, or no positions were configured.
+pub fn position_for_node_id(id: u8, positions: &[[f32; 3]]) -> [f32; 3] {
+    if id == 0 {
+        return [0.0, 0.0, 0.0];
+    }
+    positions
+        .get((id as usize) - 1)
+        .copied()
+        .unwrap_or([0.0, 0.0, 0.0])
 }
 
 /// Attempt multistatic fusion; fall back to max per-node person count on failure.
@@ -260,5 +285,38 @@ mod tests {
         let (fused, count) = fuse_or_fallback(&fuser, &states);
         assert!(fused.is_none());
         assert_eq!(count, Some(0));
+    }
+
+    #[test]
+    fn test_node_frames_sorted_by_id() {
+        // Insert in reverse-id order; collected frames must come out 1, 2, 3.
+        let mut states: HashMap<u8, NodeState> = HashMap::new();
+        for id in [3u8, 1, 2] {
+            let mut hist = VecDeque::new();
+            hist.push_back(vec![id as f64, id as f64 + 1.0]);
+            states.insert(id, make_node_state(hist, Some(Instant::now()), 0));
+        }
+        let frames = node_frames_from_states(&states);
+        let ids: Vec<u8> = frames.iter().map(|f| f.node_id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "frames must be ordered by ascending node_id");
+    }
+
+    #[test]
+    fn test_position_for_node_id_basic() {
+        let positions = vec![[1.0_f32, 0.0, 1.5], [3.0, 0.0, 2.2], [1.5, 2.6, 1.0]];
+        assert_eq!(position_for_node_id(1, &positions), [1.0, 0.0, 1.5]);
+        assert_eq!(position_for_node_id(2, &positions), [3.0, 0.0, 2.2]);
+        assert_eq!(position_for_node_id(3, &positions), [1.5, 2.6, 1.0]);
+    }
+
+    #[test]
+    fn test_position_for_node_id_out_of_range() {
+        let positions = vec![[1.0_f32, 0.0, 1.5]];
+        // Beyond the configured list — fall back to origin.
+        assert_eq!(position_for_node_id(2, &positions), [0.0, 0.0, 0.0]);
+        // Empty config — every lookup yields the origin.
+        assert_eq!(position_for_node_id(1, &[]), [0.0, 0.0, 0.0]);
+        // Sentinel id 0 (used by the WiFi/host-scan path) always yields origin.
+        assert_eq!(position_for_node_id(0, &positions), [0.0, 0.0, 0.0]);
     }
 }

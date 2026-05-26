@@ -21,11 +21,15 @@
 pub mod kalman;
 pub mod fingerprint;
 pub mod lifecycle;
+pub mod profile;
 pub mod tracker;
 
 pub use kalman::KalmanState;
 pub use fingerprint::CsiFingerprint;
 pub use lifecycle::{TrackState, TrackLifecycle, TrackerConfig};
+pub use profile::{
+    EnrolledProfile, MatchObservation, ProfileStore, DEFAULT_MATCH_THRESHOLD,
+};
 pub use tracker::{
     TrackId, TrackedSurvivor, SurvivorTracker,
     DetectionObservation, AssociationResult,
