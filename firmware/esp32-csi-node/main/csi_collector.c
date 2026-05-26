@@ -357,19 +357,29 @@ void csi_collector_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_cb));
 
-    /* MGMT-only promiscuous filter + active probe injection (RuView#396).
+    /* MGMT+DATA promiscuous filter (RuView#396 + #521 follow-up).
      *
-     * DATA frames cause 100-500+ WiFi HW interrupts/sec which crashes Core 0
-     * in wDev_ProcessFiq (SPI flash cache race in ESP-IDF WiFi blob).
-     * MGMT-only gives ~10 Hz (beacons). Probe request injection at 10 Hz
-     * adds ~10 Hz probe responses from APs → ~20 Hz total, matching the
-     * edge processing designed sample rate of 20 Hz. */
+     * Original design assumed MGMT-only + active probe injection at 10 Hz
+     * → ~20 Hz total CSI yield. The probe injection was never implemented
+     * (see rv_radio_ops_esp32.c:87 "once the controller PR lands"), and
+     * MGMT-only on real-world networks yields near-zero CSI because:
+     *   - The local AP beacons at 1 Mbps DSSS (no OFDM preamble → no CSI)
+     *   - Neighbor beacons only sometimes use OFDM (sporadic)
+     *   - Probe requests from STAs only fire during background scans (rare)
+     *   - Smart-home / IoT devices generate DATA frames almost exclusively
+     *     in steady state — invisible to a MGMT-only filter.
+     *
+     * Adding DATA captures the actual ambient WiFi traffic in the air.
+     * The historical Core 0 SPI cache race from #396 should be mitigated
+     * by #397 (SPI cache crash fix) plus the existing software early-drop
+     * gate at CSI_MIN_PROCESS_INTERVAL_US (50 Hz max processing rate). */
     wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT,
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_DATA,
     };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
 
-    ESP_LOGI(TAG, "Promiscuous mode enabled (MGMT-only, RuView#396)");
+    ESP_LOGI(TAG, "Promiscuous mode enabled (MGMT+DATA, 50 Hz software gate)");
 
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
