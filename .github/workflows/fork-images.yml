@@ -1,0 +1,146 @@
+name: Fork images → ghcr.io (WP0.1)
+
+# Builds the images the home NAS runs and pushes them to
+# ghcr.io/<owner>/ruview-<name>, so the NAS only pulls and never compiles
+# (docs: architecture plan WP0.1, "CI 构建镜像").
+#
+# Tags per image:
+#   sha-<7>  every build; pin IMAGE_TAG to this on the NAS, roll back by
+#            setting it to the previous SHA
+#   main     tip of main
+#   latest   tip of main
+#
+# NAS is x86_64, so only linux/amd64 is built.
+#
+# To add a service image (analytics, watchdog, csi-recorder, ...), add one
+# entry to the matrix below with its build context and Dockerfile.
+#
+# Runs only on the fork; upstream ruvnet/RuView publishes through
+# sensing-server-docker.yml instead.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'ui/**'
+      - 'v2/**'
+      - 'vendor/**'
+      - '.gitmodules'
+      - '.github/workflows/fork-images.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository != 'ruvnet/RuView'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: sensing-server
+            context: .
+            file: docker/Dockerfile.rust
+            submodules: recursive
+            free_disk: true
+          - name: mqtt-bridge
+            context: docker/bridge
+            file: docker/bridge/Dockerfile
+            submodules: false
+            free_disk: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Dockerfile.rust copies vendor/ruvector and vendor/rufield, and the
+          # v2 workspace has submodule members (ruview-swarm, ...).
+          submodules: ${{ matrix.submodules }}
+
+      # The Rust release build of the full workspace needs more than the
+      # ~14 GB a hosted runner has free by default.
+      - name: Free disk space
+        if: matrix.free_disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af >/dev/null
+          df -h /
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: img
+        # GHCR repository names must be lowercase.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ruview-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build + push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Smoke-test sensing-server
+        if: matrix.name == 'sensing-server'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          docker run -d --name sm -p 3000:3000 \
+            -e CSI_SOURCE=simulated \
+            -e RUVIEW_API_TOKEN=smoke-test-token-do-not-use \
+            "$IMAGE"
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3000/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3000/health
+          curl -fsS -H 'Authorization: Bearer smoke-test-token-do-not-use' \
+            http://127.0.0.1:3000/api/v1/info >/dev/null
+          docker logs sm 2>&1 | tail -20
+          docker stop sm
+
+      - name: Smoke-test mqtt-bridge
+        if: matrix.name == 'mqtt-bridge'
+        run: |
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "import ast; ast.parse(open('/app/bridge.py').read()); import paho.mqtt.client, websockets; print('bridge image OK')"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
