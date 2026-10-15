@@ -25,6 +25,9 @@ use crate::viewpoint::geometry::{GeometricDiversityIndex, NodeId};
 /// Unique identifier for a multistatic array deployment.
 pub type ArrayId = u64;
 
+/// Extracted viewpoint data used during fusion: (node id, embedding, azimuth, position).
+type ExtractedViewpoint = (NodeId, Vec<f32>, f32, (f32, f32));
+
 /// Per-viewpoint embedding with geometric metadata.
 ///
 /// Represents a single CSI observation processed through the per-viewpoint
@@ -139,14 +142,21 @@ impl std::fmt::Display for FusionError {
             FusionError::AllFiltered { rejected } => {
                 write!(f, "all {rejected} viewpoints filtered by SNR threshold")
             }
-            FusionError::CoherenceGateClosed { coherence, threshold } => {
+            FusionError::CoherenceGateClosed {
+                coherence,
+                threshold,
+            } => {
                 write!(
                     f,
                     "coherence gate closed: coherence={coherence:.3} < threshold={threshold:.3}"
                 )
             }
             FusionError::AttentionError(e) => write!(f, "attention error: {e}"),
-            FusionError::DimensionMismatch { expected, actual, node_id } => {
+            FusionError::DimensionMismatch {
+                expected,
+                actual,
+                node_id,
+            } => {
                 write!(
                     f,
                     "node {node_id} embedding dim {actual} != expected {expected}"
@@ -349,9 +359,13 @@ impl MultistaticArray {
         self.cycle_count += 1;
 
         // Extract all needed data from viewpoints upfront to avoid borrow conflicts.
+        // Embeddings are cloned exactly once (out of `self.viewpoints`, which we
+        // borrow immutably); metadata is Copy. The previous implementation cloned
+        // each embedding a SECOND time when building `embeddings` from `extracted`
+        // — eliminated here (ADR-156 §finding 4).
         let min_snr = self.config.min_snr_db;
         let total_viewpoints = self.viewpoints.len();
-        let extracted: Vec<(NodeId, Vec<f32>, f32, (f32, f32))> = self
+        let extracted: Vec<ExtractedViewpoint> = self
             .viewpoints
             .iter()
             .filter(|v| v.snr_db >= min_snr)
@@ -384,22 +398,23 @@ impl MultistaticArray {
             });
         }
 
-        // Prepare embeddings and geometries from extracted data.
-        let embeddings: Vec<Vec<f32>> = extracted.iter().map(|(_, e, _, _)| e.clone()).collect();
-        let geom: Vec<ViewpointGeometry> = extracted
-            .iter()
-            .map(|(_, _, az, pos)| ViewpointGeometry {
-                azimuth: *az,
-                position: *pos,
-            })
-            .collect();
+        // Move the cloned embeddings out of `extracted` (no second clone) while
+        // capturing geometry/ids by Copy. `extracted` is consumed here.
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(n_valid);
+        let mut geom: Vec<ViewpointGeometry> = Vec::with_capacity(n_valid);
+        let mut azimuths: Vec<f32> = Vec::with_capacity(n_valid);
+        let mut ids: Vec<NodeId> = Vec::with_capacity(n_valid);
+        for (id, emb, az, pos) in extracted {
+            geom.push(ViewpointGeometry { azimuth: az, position: pos });
+            azimuths.push(az);
+            ids.push(id);
+            embeddings.push(emb); // move, not clone
+        }
 
         // Run cross-viewpoint attention fusion.
         let fused_emb = self.attention.fuse(&embeddings, &geom)?;
 
         // Compute GDI.
-        let azimuths: Vec<f32> = extracted.iter().map(|(_, _, az, _)| *az).collect();
-        let ids: Vec<NodeId> = extracted.iter().map(|(id, _, _, _)| *id).collect();
         let gdi_opt = GeometricDiversityIndex::compute(&azimuths, &ids);
         let (gdi_val, n_eff) = match &gdi_opt {
             Some(g) => (g.value, g.n_effective),
@@ -429,7 +444,7 @@ impl MultistaticArray {
     pub fn fuse_ungated(&mut self) -> Result<FusedEmbedding, FusionError> {
         let min_snr = self.config.min_snr_db;
         let total_viewpoints = self.viewpoints.len();
-        let extracted: Vec<(NodeId, Vec<f32>, f32, (f32, f32))> = self
+        let extracted: Vec<ExtractedViewpoint> = self
             .viewpoints
             .iter()
             .filter(|v| v.snr_db >= min_snr)
@@ -446,19 +461,20 @@ impl MultistaticArray {
             });
         }
 
-        let embeddings: Vec<Vec<f32>> = extracted.iter().map(|(_, e, _, _)| e.clone()).collect();
-        let geom: Vec<ViewpointGeometry> = extracted
-            .iter()
-            .map(|(_, _, az, pos)| ViewpointGeometry {
-                azimuth: *az,
-                position: *pos,
-            })
-            .collect();
+        // Move embeddings out of `extracted` (no second clone — ADR-156 §finding 4).
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(n_valid);
+        let mut geom: Vec<ViewpointGeometry> = Vec::with_capacity(n_valid);
+        let mut azimuths: Vec<f32> = Vec::with_capacity(n_valid);
+        let mut ids: Vec<NodeId> = Vec::with_capacity(n_valid);
+        for (id, emb, az, pos) in extracted {
+            geom.push(ViewpointGeometry { azimuth: az, position: pos });
+            azimuths.push(az);
+            ids.push(id);
+            embeddings.push(emb);
+        }
 
         let fused_emb = self.attention.fuse(&embeddings, &geom)?;
 
-        let azimuths: Vec<f32> = extracted.iter().map(|(_, _, az, _)| *az).collect();
-        let ids: Vec<NodeId> = extracted.iter().map(|(id, _, _, _)| *id).collect();
         let gdi_opt = GeometricDiversityIndex::compute(&azimuths, &ids);
         let (gdi_val, n_eff) = match &gdi_opt {
             Some(g) => (g.value, g.n_effective),
@@ -514,12 +530,19 @@ impl MultistaticArray {
 mod tests {
     use super::*;
 
-    fn make_viewpoint(node_id: NodeId, angle_idx: usize, n: usize, dim: usize) -> ViewpointEmbedding {
+    fn make_viewpoint(
+        node_id: NodeId,
+        angle_idx: usize,
+        n: usize,
+        dim: usize,
+    ) -> ViewpointEmbedding {
         let angle = 2.0 * std::f32::consts::PI * angle_idx as f32 / n as f32;
         let r = 3.0;
         ViewpointEmbedding {
             node_id,
-            embedding: (0..dim).map(|d| ((node_id as usize * dim + d) as f32 * 0.01).sin()).collect(),
+            embedding: (0..dim)
+                .map(|d| ((node_id as usize * dim + d) as f32 * 0.01).sin())
+                .collect(),
             azimuth: angle,
             elevation: 0.0,
             baseline: r,
@@ -549,7 +572,9 @@ mod tests {
         let dim = 16;
         let mut array = setup_coherent_array(dim);
         for i in 0..4 {
-            array.submit_viewpoint(make_viewpoint(i, i as usize, 4, dim)).unwrap();
+            array
+                .submit_viewpoint(make_viewpoint(i, i as usize, 4, dim))
+                .unwrap();
         }
         let fused = array.fuse().unwrap();
         assert_eq!(fused.embedding.len(), dim);
@@ -577,10 +602,17 @@ mod tests {
         for i in 0..100 {
             array.push_phase_diff(i as f32 * 0.5);
         }
-        array.submit_viewpoint(make_viewpoint(0, 0, 4, dim)).unwrap();
-        array.submit_viewpoint(make_viewpoint(1, 1, 4, dim)).unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(0, 0, 4, dim))
+            .unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(1, 1, 4, dim))
+            .unwrap();
         let result = array.fuse();
-        assert!(matches!(result, Err(FusionError::CoherenceGateClosed { .. })));
+        assert!(matches!(
+            result,
+            Err(FusionError::CoherenceGateClosed { .. })
+        ));
     }
 
     #[test]
@@ -598,8 +630,12 @@ mod tests {
         for i in 0..100 {
             array.push_phase_diff(i as f32 * 0.5);
         }
-        array.submit_viewpoint(make_viewpoint(0, 0, 4, dim)).unwrap();
-        array.submit_viewpoint(make_viewpoint(1, 1, 4, dim)).unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(0, 0, 4, dim))
+            .unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(1, 1, 4, dim))
+            .unwrap();
         let fused = array.fuse_ungated().unwrap();
         assert_eq!(fused.embedding.len(), dim);
     }
@@ -652,8 +688,12 @@ mod tests {
     fn events_are_emitted_on_fusion() {
         let dim = 8;
         let mut array = setup_coherent_array(dim);
-        array.submit_viewpoint(make_viewpoint(0, 0, 4, dim)).unwrap();
-        array.submit_viewpoint(make_viewpoint(1, 1, 4, dim)).unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(0, 0, 4, dim))
+            .unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(1, 1, 4, dim))
+            .unwrap();
         array.clear_events();
         let _ = array.fuse();
         assert!(!array.events().is_empty(), "fusion should emit events");
@@ -663,8 +703,12 @@ mod tests {
     fn remove_viewpoint_works() {
         let dim = 8;
         let mut array = setup_coherent_array(dim);
-        array.submit_viewpoint(make_viewpoint(10, 0, 4, dim)).unwrap();
-        array.submit_viewpoint(make_viewpoint(20, 1, 4, dim)).unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(10, 0, 4, dim))
+            .unwrap();
+        array
+            .submit_viewpoint(make_viewpoint(20, 1, 4, dim))
+            .unwrap();
         assert_eq!(array.n_viewpoints(), 2);
         array.remove_viewpoint(10);
         assert_eq!(array.n_viewpoints(), 1);
@@ -675,11 +719,19 @@ mod tests {
         let dim = 16;
         let mut array = setup_coherent_array(dim);
         for i in 0..4 {
-            array.submit_viewpoint(make_viewpoint(i, i as usize, 4, dim)).unwrap();
+            array
+                .submit_viewpoint(make_viewpoint(i, i as usize, 4, dim))
+                .unwrap();
         }
         let fused = array.fuse().unwrap();
-        assert!(fused.gdi > 0.0, "GDI should be positive for spread viewpoints");
-        assert!(fused.n_effective > 1.0, "effective viewpoints should be > 1");
+        assert!(
+            fused.gdi > 0.0,
+            "GDI should be positive for spread viewpoints"
+        );
+        assert!(
+            fused.n_effective > 1.0,
+            "effective viewpoints should be > 1"
+        );
     }
 
     #[test]
@@ -687,7 +739,9 @@ mod tests {
         let dim = 8;
         let mut array = setup_coherent_array(dim);
         for i in 0..6 {
-            array.submit_viewpoint(make_viewpoint(i, i as usize, 6, dim)).unwrap();
+            array
+                .submit_viewpoint(make_viewpoint(i, i as usize, 6, dim))
+                .unwrap();
         }
         let gdi = array.compute_gdi().unwrap();
         assert!(gdi.value > 0.0);

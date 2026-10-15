@@ -40,9 +40,9 @@ pub struct Skeleton {
 
 #[derive(Clone, Debug)]
 pub struct VitalSigns {
-    pub breathing_rate: f32,  // breaths per minute
-    pub heart_rate: f32,      // beats per minute
-    pub motion_score: f32,    // 0.0 = still, 1.0 = strong motion
+    pub breathing_rate: f32, // breaths per minute
+    pub heart_rate: f32,     // beats per minute
+    pub motion_score: f32,   // 0.0 = still, 1.0 = strong motion
 }
 
 pub struct CsiPipelineState {
@@ -83,7 +83,11 @@ impl Default for CsiPipelineState {
         Self {
             node_frames: std::collections::HashMap::new(),
             skeleton: None,
-            vitals: VitalSigns { breathing_rate: 0.0, heart_rate: 0.0, motion_score: 0.0 },
+            vitals: VitalSigns {
+                breathing_rate: 0.0,
+                heart_rate: 0.0,
+                motion_score: 0.0,
+            },
             occupancy: vec![0.0; 8 * 8 * 4],
             occupancy_dims: (8, 8, 4),
             total_frames: 0,
@@ -112,7 +116,11 @@ fn detect_pose_model_metadata() -> Option<PoseModelMetadata> {
         let expanded = p.replace('~', &std::env::var("HOME").unwrap_or_default());
         if let Ok(data) = std::fs::read_to_string(&expanded) {
             if let Ok(model) = serde_json::from_str::<serde_json::Value>(&data) {
-                if model.get("weightsBase64").and_then(|v| v.as_str()).is_some() {
+                if model
+                    .get("weightsBase64")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                {
                     eprintln!(
                         "  pose: amplitude-energy heuristic enabled (metadata from {expanded}, {} params — weights NOT loaded)",
                         model.get("totalParams").and_then(|v| v.as_u64()).unwrap_or(0)
@@ -140,30 +148,39 @@ impl CsiPipelineState {
         // path, not only in tests.
         if self.total_frames % 500 == 0 {
             eprintln!(
-                "  CSI node={} ch={} ant={} sub={} rssi={} nf={} ts_us={} iq_bytes={}",
+                "  CSI node={} freq_mhz={} ant={} sub={} rssi={} nf={} seq={} iq_bytes={}",
                 frame.node_id,
-                frame.channel,
+                frame.freq_mhz,
                 frame.n_antennas,
                 frame.n_subcarriers,
                 frame.rssi,
                 frame.noise_floor,
-                frame.timestamp_us,
+                frame.sequence,
                 frame.iq_data.len(),
             );
         }
 
         // Store frame in per-node history
         {
-            let history = self.node_frames.entry(node_id).or_insert_with(|| VecDeque::with_capacity(100));
+            let history = self
+                .node_frames
+                .entry(node_id)
+                .or_insert_with(|| VecDeque::with_capacity(100));
             history.push_back(frame.clone());
-            if history.len() > 100 { history.pop_front(); }
+            if history.len() > 100 {
+                history.pop_front();
+            }
         }
 
         // 1. Motion detection (amplitude variance over last 20 frames)
         self.detect_motion(node_id);
 
         // 2. Vital signs (phase analysis over last 100 frames)
-        let has_enough = self.node_frames.get(&node_id).map(|h| h.len() >= 30).unwrap_or(false);
+        let has_enough = self
+            .node_frames
+            .get(&node_id)
+            .map(|h| h.len() >= 30)
+            .unwrap_or(false);
         if has_enough {
             self.estimate_vitals(node_id);
         }
@@ -185,15 +202,19 @@ impl CsiPipelineState {
     fn detect_motion(&mut self, node_id: u8) {
         if let Some(history) = self.node_frames.get(&node_id) {
             let recent: Vec<&CsiFrame> = history.iter().rev().take(20).collect();
-            if recent.len() < 5 { return; }
+            if recent.len() < 5 {
+                return;
+            }
 
             // Compute mean amplitude across subcarriers for each frame
-            let mean_amps: Vec<f32> = recent.iter()
+            let mean_amps: Vec<f32> = recent
+                .iter()
                 .map(|f| f.amplitudes.iter().sum::<f32>() / f.amplitudes.len().max(1) as f32)
                 .collect();
 
             let mean = mean_amps.iter().sum::<f32>() / mean_amps.len() as f32;
-            let variance = mean_amps.iter().map(|a| (a - mean).powi(2)).sum::<f32>() / mean_amps.len() as f32;
+            let variance =
+                mean_amps.iter().map(|a| (a - mean).powi(2)).sum::<f32>() / mean_amps.len() as f32;
 
             // High variance = motion
             self.vitals.motion_score = (variance / 100.0).min(1.0);
@@ -204,22 +225,28 @@ impl CsiPipelineState {
     fn estimate_vitals(&mut self, node_id: u8) {
         if let Some(history) = self.node_frames.get(&node_id) {
             let frames: Vec<&CsiFrame> = history.iter().rev().take(100).collect();
-            if frames.len() < 30 { return; }
+            if frames.len() < 30 {
+                return;
+            }
 
             // Extract phase from a stable subcarrier (pick one with low variance)
             let n_sub = frames[0].phases.len().min(35);
-            if n_sub == 0 { return; }
+            if n_sub == 0 {
+                return;
+            }
 
             // Use subcarrier 15 (mid-band, typically stable)
             let sub_idx = n_sub / 2;
-            let phase_series: Vec<f32> = frames.iter().rev()
+            let phase_series: Vec<f32> = frames
+                .iter()
+                .rev()
                 .map(|f| f.phases.get(sub_idx).copied().unwrap_or(0.0))
                 .collect();
 
             // Simple peak counting for breathing rate (0.15-0.5 Hz = 9-30 BPM)
             let mut peaks = 0;
             for i in 1..phase_series.len() - 1 {
-                if phase_series[i] > phase_series[i-1] && phase_series[i] > phase_series[i+1] {
+                if phase_series[i] > phase_series[i - 1] && phase_series[i] > phase_series[i + 1] {
                     peaks += 1;
                 }
             }
@@ -245,14 +272,18 @@ impl CsiPipelineState {
     /// keypoint index. Callers that need real pose must use the (yet to be
     /// wired) WiFlow model directly.
     fn heuristic_pose_from_amplitude(&mut self) {
-        if self.pose_model_present.is_none() { return; }
+        if self.pose_model_present.is_none() {
+            return;
+        }
 
         // Collect 20 frames from the primary node
         let primary_node = self.node_frames.keys().next().copied();
         if let Some(node_id) = primary_node {
             if let Some(history) = self.node_frames.get(&node_id) {
                 let frames: Vec<&CsiFrame> = history.iter().rev().take(20).collect();
-                if frames.len() < 20 { return; }
+                if frames.len() < 20 {
+                    return;
+                }
 
                 // Build input: 35 subcarriers × 20 time steps. This is a
                 // deliberately simple summary used to compute amplitude
@@ -266,7 +297,8 @@ impl CsiPipelineState {
                 }
 
                 let mean_amp = input.iter().sum::<f32>() / input.len() as f32;
-                let amp_var = input.iter().map(|a| (a - mean_amp).powi(2)).sum::<f32>() / input.len() as f32;
+                let amp_var =
+                    input.iter().map(|a| (a - mean_amp).powi(2)).sum::<f32>() / input.len() as f32;
 
                 // If motion detected, emit a placeholder skeleton derived from
                 // signal characteristics. NOT a real pose.
@@ -274,7 +306,8 @@ impl CsiPipelineState {
                     let mut keypoints = vec![[0.5f32; 2]; 17];
                     for (i, kp) in keypoints.iter_mut().enumerate() {
                         let sub_range = (i * n_sub / 17)..((i + 1) * n_sub / 17).min(n_sub);
-                        let energy: f32 = sub_range.clone()
+                        let energy: f32 = sub_range
+                            .clone()
                             .filter_map(|s| frames.last().and_then(|f| f.amplitudes.get(s)))
                             .sum();
                         let norm_energy = energy / (sub_range.len().max(1) as f32 * 128.0);
@@ -334,9 +367,11 @@ impl CsiPipelineState {
 
         // RSSI statistics
         let rssi_mean = rssi_values.iter().sum::<f32>() / rssi_values.len() as f32;
-        let rssi_var = rssi_values.iter()
+        let rssi_var = rssi_values
+            .iter()
             .map(|r| (r - rssi_mean).powi(2))
-            .sum::<f32>() / rssi_values.len() as f32;
+            .sum::<f32>()
+            / rssi_values.len() as f32;
         let rssi_std = rssi_var.sqrt();
 
         let fingerprint = CsiFingerprint {
@@ -397,10 +432,8 @@ impl CsiPipelineState {
         let mut best: Option<(String, f32)> = None;
         for fp in &self.fingerprints {
             let sim = cosine_similarity(&current, &fp.mean_amplitudes);
-            if sim > 0.7 {
-                if best.as_ref().map_or(true, |(_, s)| sim > *s) {
-                    best = Some((fp.name.clone(), sim));
-                }
+            if sim > 0.7 && best.as_ref().is_none_or(|(_, s)| sim > *s) {
+                best = Some((fp.name.clone(), sim));
             }
         }
         best
@@ -451,12 +484,14 @@ impl CsiPipelineState {
         // Normalize
         let max = new_occ.iter().cloned().fold(0.0f64, f64::max);
         if max > 0.0 {
-            for d in &mut new_occ { *d /= max; }
+            for d in &mut new_occ {
+                *d /= max;
+            }
         }
 
         // Exponential moving average with previous occupancy
-        for i in 0..total {
-            self.occupancy[i] = self.occupancy[i] * 0.7 + new_occ[i] * 0.3;
+        for (occ, &new) in self.occupancy.iter_mut().zip(new_occ.iter()).take(total) {
+            *occ = *occ * 0.7 + new * 0.3;
         }
     }
 }
@@ -519,10 +554,14 @@ pub fn start_pipeline(bind_addr: &str) -> Arc<Mutex<CsiPipelineState>> {
                 return;
             }
         };
-        socket.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
         eprintln!("  CSI pipeline: listening on {addr}");
 
-        let mut buf = [0u8; 2048];
+        // ADR-018 frames are at most 20 + 2048 bytes (firmware CSI_MAX_FRAME_SIZE);
+        // a 2048-byte buffer would truncate the largest ones.
+        let mut buf = [0u8; 4096];
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, _)) => {
@@ -654,10 +693,88 @@ mod tests {
         assert_eq!(s.fingerprints[0].name, "lab");
         // Identify against its own fingerprint should succeed.
         let found = s.identify_location();
-        assert!(found.is_some(), "should identify the just-recorded location");
+        assert!(
+            found.is_some(),
+            "should identify the just-recorded location"
+        );
         if let Some((name, conf)) = found {
             assert_eq!(name, "lab");
             assert!(conf > 0.7, "self-similarity should exceed match threshold");
         }
+    }
+
+    // ── NaN-state-poisoning guard (the proven recurring bug class) ──────────
+    //
+    // The calibration/vitals crates were both bitten by a single non-finite
+    // sample latching into persistent state and freezing all outputs forever.
+    // Here the auto-accumulating persistent state is `occupancy` (an EMA:
+    // `*occ = *occ*0.7 + new*0.3`) and `vitals` (motion/breathing/heart).
+    //
+    // The UDP parser can only ever emit finite amplitudes/phases (sqrt and
+    // atan2 of i8 values), so the realistic ingress is already safe. This test
+    // is stronger: it injects an adversarial hand-built `CsiFrame` carrying
+    // NaN/inf amplitudes and phases (possible because the fields are public),
+    // and pins that the persistent state self-heals to finite values rather
+    // than latching NaN and silently freezing — i.e. the bug class is absent.
+    #[test]
+    fn nonfinite_frame_does_not_poison_persistent_state() {
+        let mut s = CsiPipelineState::default();
+        // Warm up with valid frames so vitals/occupancy are populated.
+        seed_state_with_frames(&mut s, 60);
+
+        // A valid baseline must be finite to start.
+        assert!(s.occupancy.iter().all(|d| d.is_finite()));
+        assert!(s.vitals.breathing_rate.is_finite());
+        assert!(s.vitals.motion_score.is_finite());
+
+        // Inject a stream of poisoned frames: NaN/inf amplitudes + phases on a
+        // valid header (node_id 1, finite rssi). Mimics a corrupt sensor.
+        for i in 0..40 {
+            let nan_frame = CsiFrame {
+                node_id: 1,
+                n_antennas: 1,
+                n_subcarriers: 32,
+                freq_mhz: 2437,
+                rssi: -50,
+                noise_floor: -90,
+                sequence: 10_000 + i,
+                iq_data: vec![0i8; 64],
+                amplitudes: vec![f32::NAN; 32],
+                phases: vec![f32::INFINITY; 32],
+            };
+            s.process_frame(nan_frame);
+        }
+
+        // Persistent auto-accumulating state must remain finite — a single
+        // poisoned frame (or 40) must not permanently corrupt outputs.
+        assert!(
+            s.occupancy.iter().all(|d| d.is_finite()),
+            "occupancy EMA must not latch NaN/inf"
+        );
+        assert!(
+            s.vitals.breathing_rate.is_finite(),
+            "breathing_rate must stay finite, got {}",
+            s.vitals.breathing_rate
+        );
+        assert!(
+            s.vitals.heart_rate.is_finite(),
+            "heart_rate must stay finite, got {}",
+            s.vitals.heart_rate
+        );
+        assert!(
+            s.vitals.motion_score.is_finite(),
+            "motion_score must stay finite, got {}",
+            s.vitals.motion_score
+        );
+
+        // And the pipeline must recover: feeding valid frames again yields a
+        // finite, in-range breathing estimate (not a frozen NaN).
+        seed_state_with_frames(&mut s, 60);
+        assert!(s.vitals.breathing_rate.is_finite());
+        assert!(
+            (0.0..=40.0).contains(&s.vitals.breathing_rate),
+            "breathing must be in clamp range after recovery, got {}",
+            s.vitals.breathing_rate
+        );
     }
 }

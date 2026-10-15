@@ -18,19 +18,20 @@
 //! println!("Active survivors: {}", tracker.active_count());
 //! ```
 
-pub mod kalman;
 pub mod fingerprint;
+pub mod kalman;
 pub mod lifecycle;
+#[cfg(feature = "serde")]
 pub mod profile;
 pub mod tracker;
 
-pub use kalman::KalmanState;
 pub use fingerprint::CsiFingerprint;
-pub use lifecycle::{TrackState, TrackLifecycle, TrackerConfig};
+pub use kalman::KalmanState;
+pub use lifecycle::{TrackLifecycle, TrackState, TrackerConfig};
+#[cfg(feature = "serde")]
 pub use profile::{
     EnrolledProfile, MatchObservation, ProfileStore, DEFAULT_MATCH_THRESHOLD,
 };
 pub use tracker::{
-    TrackId, TrackedSurvivor, SurvivorTracker,
-    DetectionObservation, AssociationResult,
+    AssociationResult, DetectionObservation, SurvivorTracker, TrackId, TrackedSurvivor,
 };

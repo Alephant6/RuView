@@ -50,17 +50,28 @@ pub use csi_processor::{
     CsiProcessorConfigBuilder, CsiProcessorError,
 };
 pub use features::{
-    AmplitudeFeatures, CsiFeatures, CorrelationFeatures, DopplerFeatures, FeatureExtractor,
+    AmplitudeFeatures, CorrelationFeatures, CsiFeatures, DopplerFeatures, FeatureExtractor,
     FeatureExtractorConfig, PhaseFeatures, PowerSpectralDensity,
-};
-pub use motion::{
-    HumanDetectionResult, MotionAnalysis, MotionDetector, MotionDetectorConfig, MotionScore,
 };
 pub use hardware_norm::{
     AmplitudeStats, CanonicalCsiFrame, HardwareNormError, HardwareNormalizer, HardwareType,
 };
+pub use motion::{
+    HumanDetectionResult, MotionAnalysis, MotionDetector, MotionDetectorConfig, MotionScore,
+};
 pub use phase_sanitizer::{
     PhaseSanitizationError, PhaseSanitizer, PhaseSanitizerConfig, UnwrappingMethod,
+};
+
+// ADR-134: CIR top-level re-exports
+pub use ruvsense::cir;
+pub use ruvsense::cir::{Cir, CirConfig, CirError, CirEstimator};
+
+// ADR-135: Baseline calibration top-level re-exports
+pub use ruvsense::calibration;
+pub use ruvsense::calibration::{
+    BaselineCalibration, CalibrationConfig, CalibrationDeviationScore, CalibrationError,
+    CalibrationRecorder, PhyTier, SubcarrierBaseline,
 };
 
 /// Library version
@@ -112,6 +123,6 @@ mod tests {
 
     #[test]
     fn test_version() {
-        assert!(!VERSION.is_empty());
+        assert!(VERSION.contains('.'), "VERSION should be a semver string");
     }
 }

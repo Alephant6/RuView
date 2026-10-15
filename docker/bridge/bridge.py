@@ -30,6 +30,9 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 # Config
 # ---------------------------------------------------------------------------
 WS_URL = os.getenv("RUVIEW_WS", "ws://sensing-server:3001/ws/sensing")
+# Upstream sensing-server gates /ws/sensing behind the same bearer token as
+# /api/v1/* when RUVIEW_API_TOKEN is set (ADR-272). Empty = no header.
+WS_TOKEN = os.getenv("RUVIEW_API_TOKEN", "")
 MQTT_HOST = os.getenv("MQTT_HOST", "homeassistant.local")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER", "")
@@ -504,6 +507,17 @@ def make_mqtt() -> mqtt.Client:
 # ---------------------------------------------------------------------------
 # WebSocket consumer with reconnect
 # ---------------------------------------------------------------------------
+def ws_connect():
+    """Open the sensing WebSocket, sending the bearer token when configured."""
+    kwargs: dict[str, Any] = {"ping_interval": 20, "ping_timeout": 20}
+    if WS_TOKEN:
+        headers = {"Authorization": f"Bearer {WS_TOKEN}"}
+        # websockets >= 14 renamed extra_headers to additional_headers.
+        major = int(websockets.__version__.split(".")[0])
+        kwargs["additional_headers" if major >= 14 else "extra_headers"] = headers
+    return websockets.connect(WS_URL, **kwargs)
+
+
 async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
     backoff = 1.0
     nodes = NodeRegistry(client)
@@ -512,7 +526,7 @@ async def consume(stop: asyncio.Event, client: mqtt.Client) -> None:
     while not stop.is_set():
         try:
             LOG.info("connecting to %s", WS_URL)
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            async with ws_connect() as ws:
                 LOG.info("WS connected")
                 backoff = 1.0
                 last_fall_tick = -1

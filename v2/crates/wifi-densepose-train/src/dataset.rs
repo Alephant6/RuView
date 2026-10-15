@@ -40,6 +40,10 @@
 //! assert_eq!(sample.amplitude.shape(), &[100, 3, 3, 56]);
 //! ```
 
+/// Widar3.0 ingest — Intel 5300 `.dat` "bfee" parser and [`CsiDataset`]
+/// adapter with split-protocol metadata (ADR-291 §1).
+pub mod widar;
+
 use ndarray::{Array1, Array2, Array4};
 use ruvector_temporal_tensor::segment as tt_segment;
 use ruvector_temporal_tensor::{TemporalTensorCompressor, TierPolicy};
@@ -165,14 +169,14 @@ impl<'a> DataLoader<'a> {
     /// - `shuffle`    – if `true`, samples are shuffled deterministically using
     ///   `seed` at the start of each iteration.
     /// - `seed`       – fixed seed for the shuffle RNG.
-    pub fn new(
-        dataset: &'a dyn CsiDataset,
-        batch_size: usize,
-        shuffle: bool,
-        seed: u64,
-    ) -> Self {
+    pub fn new(dataset: &'a dyn CsiDataset, batch_size: usize, shuffle: bool, seed: u64) -> Self {
         assert!(batch_size > 0, "batch_size must be > 0");
-        DataLoader { dataset, batch_size, shuffle, seed }
+        DataLoader {
+            dataset,
+            batch_size,
+            shuffle,
+            seed,
+        }
     }
 
     /// Number of complete (or partial) batches yielded per epoch.
@@ -181,7 +185,7 @@ impl<'a> DataLoader<'a> {
         if n == 0 {
             return 0;
         }
-        (n + self.batch_size - 1) / self.batch_size
+        n.div_ceil(self.batch_size)
     }
 
     /// Return an iterator that yields `Vec<CsiSample>` batches.
@@ -232,7 +236,11 @@ impl<'a> Iterator for DataLoaderIter<'a> {
                 }
             }
         }
-        if batch.is_empty() { None } else { Some(batch) }
+        if batch.is_empty() {
+            None
+        } else {
+            Some(batch)
+        }
     }
 }
 
@@ -364,8 +372,10 @@ impl MmFiDataset {
             action_dirs.sort();
 
             for action_path in &action_dirs {
-                let action_name =
-                    action_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let action_name = action_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
                 let action_id = parse_id_suffix(action_name).unwrap_or(0);
 
                 let amp_path = action_path.join("wifi_csi.npy");
@@ -373,10 +383,7 @@ impl MmFiDataset {
                 let kp_path = action_path.join("gt_keypoints.npy");
 
                 if !amp_path.exists() || !kp_path.exists() {
-                    debug!(
-                        "Skipping {}: missing required files",
-                        action_path.display()
-                    );
+                    debug!("Skipping {}: missing required files", action_path.display());
                     continue;
                 }
 
@@ -448,11 +455,9 @@ impl CsiDataset for MmFiDataset {
 
     fn get(&self, idx: usize) -> Result<CsiSample, DatasetError> {
         let total = self.len();
-        let (entry_idx, frame_offset) =
-            self.locate(idx).ok_or(DatasetError::IndexOutOfBounds {
-                idx,
-                len: total,
-            })?;
+        let (entry_idx, frame_offset) = self
+            .locate(idx)
+            .ok_or(DatasetError::IndexOutOfBounds { idx, len: total })?;
 
         let entry = &self.entries[entry_idx];
         let t_start = frame_offset;
@@ -464,9 +469,7 @@ impl CsiDataset for MmFiDataset {
         if t_end > t {
             return Err(DatasetError::invalid_format(
                 &entry.amp_path,
-                format!(
-                    "window [{t_start}, {t_end}) exceeds clip length {t}"
-                ),
+                format!("window [{t_start}, {t_end}) exceeds clip length {t}"),
             ));
         }
         let amp_window = amp_full
@@ -498,9 +501,7 @@ impl CsiDataset for MmFiDataset {
 
         // Load keypoints [T, 17, 3] — take the first frame of the window
         let kp_full = load_npy_kp(&entry.kp_path, self.num_keypoints)?;
-        let kp_frame = kp_full
-            .slice(ndarray::s![t_start, .., ..])
-            .to_owned();
+        let kp_frame = kp_full.slice(ndarray::s![t_start, .., ..]).to_owned();
 
         // Split into (x,y) and visibility
         let keypoints = kp_frame.slice(ndarray::s![.., 0..2]).to_owned();
@@ -519,6 +520,233 @@ impl CsiDataset for MmFiDataset {
 
     fn name(&self) -> &str {
         "MmFiDataset"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leak-free train/test split (ADR-155 §Tier-1.2)
+// ---------------------------------------------------------------------------
+//
+// Why this exists: MM-Fi windows are extracted with stride 1
+// (`MmFiEntry::num_windows` = `num_frames − window_frames + 1`), so adjacent
+// windows overlap by `window_frames − 1` frames. A naive index-level random
+// split therefore puts near-identical windows on both sides of the boundary —
+// up to ~99% information leakage — and any PCK it reports is meaningless. The
+// leak-free discipline (mirrored from `occupancy_bench::EvalSplit`) is to split
+// at the **subject** level: a subject's clips (and thus all of its windows) go
+// entirely to train or entirely to test. Disjoint subjects ⇒ no shared window,
+// and no temporally-adjacent window can straddle the boundary.
+
+/// A borrowed, read-only view over a contiguous-by-subject subset of a parent
+/// [`MmFiDataset`]'s windows. Implements [`CsiDataset`] so it can be passed
+/// straight to the trainer. Produced only by
+/// [`MmFiDataset::subject_disjoint_split`], which guarantees the two returned
+/// views are subject- and window-disjoint.
+pub struct MmFiSplitView<'a> {
+    parent: &'a MmFiDataset,
+    /// Global parent window indices owned by this view (sorted, unique).
+    global_indices: Vec<usize>,
+    /// Subject ids present in this view (for leak validation / reporting).
+    subjects: std::collections::BTreeSet<u32>,
+    name: &'static str,
+}
+
+impl<'a> MmFiSplitView<'a> {
+    /// Subject ids covered by this view.
+    pub fn subjects(&self) -> &std::collections::BTreeSet<u32> {
+        &self.subjects
+    }
+
+    /// Global parent window indices owned by this view.
+    pub fn global_indices(&self) -> &[usize] {
+        &self.global_indices
+    }
+}
+
+impl<'a> CsiDataset for MmFiSplitView<'a> {
+    fn len(&self) -> usize {
+        self.global_indices.len()
+    }
+
+    fn get(&self, idx: usize) -> Result<CsiSample, DatasetError> {
+        let g = *self
+            .global_indices
+            .get(idx)
+            .ok_or(DatasetError::IndexOutOfBounds {
+                idx,
+                len: self.global_indices.len(),
+            })?;
+        self.parent.get(g)
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+impl MmFiDataset {
+    /// All subject ids present in the scanned dataset (sorted, unique).
+    pub fn subjects(&self) -> Vec<u32> {
+        let set: std::collections::BTreeSet<u32> =
+            self.entries.iter().map(|e| e.subject_id).collect();
+        set.into_iter().collect()
+    }
+
+    /// Split into **subject-disjoint** train / test views (ADR-155 §Tier-1.2).
+    ///
+    /// Subjects are assigned wholesale to one side: roughly
+    /// `test_subject_fraction` of the distinct subjects (at least one, and at
+    /// least one left for train) go to the test view, the rest to train. Because
+    /// every window of a subject travels with that subject, the two views share
+    /// **no subject and no window** — the split is leak-free by construction.
+    ///
+    /// Assignment is deterministic for a given `seed` (seeded Fisher-Yates over
+    /// the sorted subject list), so runs are reproducible.
+    ///
+    /// # Errors
+    /// [`DatasetError::InvalidSplit`] when there are fewer than 2 subjects, when
+    /// `test_subject_fraction` is not in `(0, 1)`, or when either side would be
+    /// empty.
+    pub fn subject_disjoint_split(
+        &self,
+        test_subject_fraction: f64,
+        seed: u64,
+    ) -> Result<(MmFiSplitView<'_>, MmFiSplitView<'_>), DatasetError> {
+        if !(test_subject_fraction > 0.0 && test_subject_fraction < 1.0) {
+            return Err(DatasetError::InvalidSplit(format!(
+                "test_subject_fraction must be in (0,1), got {test_subject_fraction}"
+            )));
+        }
+        let mut subjects = self.subjects();
+        if subjects.len() < 2 {
+            return Err(DatasetError::InvalidSplit(format!(
+                "need >= 2 distinct subjects for a subject-disjoint split, got {}",
+                subjects.len()
+            )));
+        }
+
+        // Deterministic shuffle of the sorted subject list.
+        xorshift_shuffle_u32(&mut subjects, seed);
+        let n_test = ((subjects.len() as f64 * test_subject_fraction).round() as usize)
+            .clamp(1, subjects.len() - 1);
+        let test_subjects: std::collections::BTreeSet<u32> =
+            subjects[..n_test].iter().copied().collect();
+        let train_subjects: std::collections::BTreeSet<u32> =
+            subjects[n_test..].iter().copied().collect();
+
+        // Partition global window indices by the owning entry's subject.
+        let mut train_idx = Vec::new();
+        let mut test_idx = Vec::new();
+        for (entry_i, entry) in self.entries.iter().enumerate() {
+            let start = self.cumulative[entry_i];
+            let end = self.cumulative[entry_i + 1];
+            if test_subjects.contains(&entry.subject_id) {
+                test_idx.extend(start..end);
+            } else {
+                train_idx.extend(start..end);
+            }
+        }
+
+        if train_idx.is_empty() || test_idx.is_empty() {
+            return Err(DatasetError::InvalidSplit(
+                "split produced an empty partition (a subject set has no windows)".into(),
+            ));
+        }
+
+        let train = MmFiSplitView {
+            parent: self,
+            global_indices: train_idx,
+            subjects: train_subjects,
+            name: "MmFiDataset[train]",
+        };
+        let test = MmFiSplitView {
+            parent: self,
+            global_indices: test_idx,
+            subjects: test_subjects,
+            name: "MmFiDataset[test]",
+        };
+
+        // Self-check: never hand out a leaky split.
+        assert_split_leak_free(&train, &test)?;
+        Ok((train, test))
+    }
+}
+
+/// Verify a train/test split is leak-free: subject-disjoint **and**
+/// window-disjoint, with both sides non-empty (ADR-155 §Tier-1.2).
+///
+/// Returns [`DatasetError::InvalidSplit`] describing the first violation found.
+pub fn assert_split_leak_free(
+    train: &MmFiSplitView<'_>,
+    test: &MmFiSplitView<'_>,
+) -> Result<(), DatasetError> {
+    if train.global_indices.is_empty() || test.global_indices.is_empty() {
+        return Err(DatasetError::InvalidSplit("a partition is empty".into()));
+    }
+    // Subject disjointness.
+    if let Some(shared) = train.subjects.intersection(&test.subjects).next() {
+        return Err(DatasetError::InvalidSplit(format!(
+            "subject {shared} appears in both train and test (subject leakage)"
+        )));
+    }
+    // Window disjointness (guards against any index bug in the partitioner).
+    let train_set: std::collections::BTreeSet<usize> =
+        train.global_indices.iter().copied().collect();
+    if let Some(shared) = test.global_indices.iter().find(|i| train_set.contains(i)) {
+        return Err(DatasetError::InvalidSplit(format!(
+            "window {shared} appears in both train and test (window leakage)"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl MmFiDataset {
+    /// Build a metadata-only `MmFiDataset` for split tests: fabricated entries
+    /// with given `(subject_id, action_id, num_frames)` and a window size. No
+    /// files are touched — only the split / leak-check logic (which reads
+    /// `subject_id` + window counts, never `get()`) is exercised.
+    fn from_entries_for_test(clips: &[(u32, u32, usize)], window_frames: usize) -> Self {
+        let entries: Vec<MmFiEntry> = clips
+            .iter()
+            .map(|&(subject_id, action_id, num_frames)| MmFiEntry {
+                subject_id,
+                action_id,
+                amp_path: PathBuf::from("/nonexistent/wifi_csi.npy"),
+                phase_path: PathBuf::from("/nonexistent/wifi_csi_phase.npy"),
+                kp_path: PathBuf::from("/nonexistent/gt_keypoints.npy"),
+                num_frames,
+                window_frames,
+            })
+            .collect();
+        let mut cumulative = vec![0usize; entries.len() + 1];
+        for (i, e) in entries.iter().enumerate() {
+            cumulative[i + 1] = cumulative[i] + e.num_windows();
+        }
+        MmFiDataset {
+            entries,
+            cumulative,
+            window_frames,
+            target_subcarriers: 56,
+            num_keypoints: 17,
+            root: PathBuf::from("/nonexistent"),
+        }
+    }
+}
+
+/// Deterministic Fisher-Yates shuffle of a `u32` slice (seeded Xorshift64).
+fn xorshift_shuffle_u32(items: &mut [u32], seed: u64) {
+    let n = items.len();
+    if n <= 1 {
+        return;
+    }
+    let mut state = if seed == 0 { 0x853c49e6748fea9b } else { seed };
+    for i in (1..n).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        items.swap(i, j);
     }
 }
 
@@ -716,26 +944,21 @@ impl CompressedCsiBuffer {
 /// Load a 4-D float32 NPY array from disk.
 fn load_npy_f32(path: &Path) -> Result<Array4<f32>, DatasetError> {
     use ndarray_npy::ReadNpyExt;
-    let file = std::fs::File::open(path)
-        .map_err(|e| DatasetError::io_error(path, e))?;
-    let arr: ndarray::ArrayD<f32> = ndarray::ArrayD::read_npy(file)
-        .map_err(|e| DatasetError::npy_read(path, e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| DatasetError::io_error(path, e))?;
+    let arr: ndarray::ArrayD<f32> =
+        ndarray::ArrayD::read_npy(file).map_err(|e| DatasetError::npy_read(path, e.to_string()))?;
     let shape = arr.shape().to_vec();
     arr.into_dimensionality::<ndarray::Ix4>().map_err(|_e| {
-        DatasetError::invalid_format(
-            path,
-            format!("Expected 4-D array, got shape {:?}", shape),
-        )
+        DatasetError::invalid_format(path, format!("Expected 4-D array, got shape {:?}", shape))
     })
 }
 
 /// Load a 3-D float32 NPY array (keypoints: `[T, J, 3]`).
 fn load_npy_kp(path: &Path, _num_keypoints: usize) -> Result<ndarray::Array3<f32>, DatasetError> {
     use ndarray_npy::ReadNpyExt;
-    let file = std::fs::File::open(path)
-        .map_err(|e| DatasetError::io_error(path, e))?;
-    let arr: ndarray::ArrayD<f32> = ndarray::ArrayD::read_npy(file)
-        .map_err(|e| DatasetError::npy_read(path, e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| DatasetError::io_error(path, e))?;
+    let arr: ndarray::ArrayD<f32> =
+        ndarray::ArrayD::read_npy(file).map_err(|e| DatasetError::npy_read(path, e.to_string()))?;
     let shape = arr.shape().to_vec();
     arr.into_dimensionality::<ndarray::Ix3>().map_err(|_e| {
         DatasetError::invalid_format(
@@ -749,36 +972,40 @@ fn load_npy_kp(path: &Path, _num_keypoints: usize) -> Result<ndarray::Array3<f32
 /// loading the entire file into memory.
 fn peek_npy_first_dim(path: &Path) -> Result<usize, DatasetError> {
     use std::io::{BufReader, Read};
-    let f = std::fs::File::open(path)
-        .map_err(|e| DatasetError::io_error(path, e))?;
+    let f = std::fs::File::open(path).map_err(|e| DatasetError::io_error(path, e))?;
     let mut reader = BufReader::new(f);
 
     let mut magic = [0u8; 6];
-    reader.read_exact(&mut magic)
+    reader
+        .read_exact(&mut magic)
         .map_err(|e| DatasetError::io_error(path, e))?;
     if &magic != b"\x93NUMPY" {
         return Err(DatasetError::invalid_format(path, "Not a valid NPY file"));
     }
 
     let mut version = [0u8; 2];
-    reader.read_exact(&mut version)
+    reader
+        .read_exact(&mut version)
         .map_err(|e| DatasetError::io_error(path, e))?;
 
     // Header length field: 2 bytes in v1, 4 bytes in v2
     let header_len: usize = if version[0] == 1 {
         let mut buf = [0u8; 2];
-        reader.read_exact(&mut buf)
+        reader
+            .read_exact(&mut buf)
             .map_err(|e| DatasetError::io_error(path, e))?;
         u16::from_le_bytes(buf) as usize
     } else {
         let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf)
+        reader
+            .read_exact(&mut buf)
             .map_err(|e| DatasetError::io_error(path, e))?;
         u32::from_le_bytes(buf) as usize
     };
 
     let mut header = vec![0u8; header_len];
-    reader.read_exact(&mut header)
+    reader
+        .read_exact(&mut header)
         .map_err(|e| DatasetError::io_error(path, e))?;
     let header_str = String::from_utf8_lossy(&header);
 
@@ -797,7 +1024,10 @@ fn peek_npy_first_dim(path: &Path) -> Result<usize, DatasetError> {
         }
     }
 
-    Err(DatasetError::invalid_format(path, "Cannot parse shape from NPY header"))
+    Err(DatasetError::invalid_format(
+        path,
+        "Cannot parse shape from NPY header",
+    ))
 }
 
 /// Parse the numeric suffix of a directory name like `S01` → `1` or `A12` → `12`.
@@ -881,14 +1111,17 @@ pub struct SyntheticCsiDataset {
 impl SyntheticCsiDataset {
     /// Create a new synthetic dataset with `num_samples` entries.
     pub fn new(num_samples: usize, config: SyntheticConfig) -> Self {
-        SyntheticCsiDataset { num_samples, config }
+        SyntheticCsiDataset {
+            num_samples,
+            config,
+        }
     }
 
     /// Compute the deterministic amplitude value for the given indices.
     #[inline]
     fn amp_value(&self, idx: usize, t: usize, _tx: usize, _rx: usize, k: usize) -> f32 {
-        let phase = 2.0 * std::f32::consts::PI
-            * (idx as f32 * 0.01 + t as f32 * 0.1 + k as f32 * 0.05);
+        let phase =
+            2.0 * std::f32::consts::PI * (idx as f32 * 0.01 + t as f32 * 0.1 + k as f32 * 0.05);
         0.5 + 0.3 * phase.sin()
     }
 
@@ -896,16 +1129,13 @@ impl SyntheticCsiDataset {
     #[inline]
     fn phase_value(&self, _idx: usize, _t: usize, tx: usize, rx: usize, k: usize) -> f32 {
         let n_sc = self.config.num_subcarriers as f32;
-        (2.0 * std::f32::consts::PI * k as f32 / n_sc)
-            * (tx as f32 + 1.0)
-            * (rx as f32 + 1.0)
+        (2.0 * std::f32::consts::PI * k as f32 / n_sc) * (tx as f32 + 1.0) * (rx as f32 + 1.0)
     }
 
     /// Compute the deterministic keypoint (x, y) for joint `j` at sample `idx`.
     #[inline]
     fn keypoint_xy(&self, idx: usize, j: usize) -> (f32, f32) {
-        let x = 0.5
-            + 0.1 * (2.0 * std::f32::consts::PI * idx as f32 * 0.007 + j as f32).sin();
+        let x = 0.5 + 0.1 * (2.0 * std::f32::consts::PI * idx as f32 * 0.007 + j as f32).sin();
         let y = 0.3 + j as f32 * 0.04;
         (x, y)
     }
@@ -925,8 +1155,12 @@ impl CsiDataset for SyntheticCsiDataset {
         }
 
         let cfg = &self.config;
-        let (t, n_tx, n_rx, n_sc) =
-            (cfg.window_frames, cfg.num_antennas_tx, cfg.num_antennas_rx, cfg.num_subcarriers);
+        let (t, n_tx, n_rx, n_sc) = (
+            cfg.window_frames,
+            cfg.num_antennas_tx,
+            cfg.num_antennas_rx,
+            cfg.num_subcarriers,
+        );
 
         let amplitude = Array4::from_shape_fn((t, n_tx, n_rx, n_sc), |(frame, tx, rx, k)| {
             self.amp_value(idx, frame, tx, rx, k)
@@ -982,11 +1216,21 @@ mod tests {
 
         assert_eq!(
             s.amplitude.shape(),
-            &[cfg.window_frames, cfg.num_antennas_tx, cfg.num_antennas_rx, cfg.num_subcarriers]
+            &[
+                cfg.window_frames,
+                cfg.num_antennas_tx,
+                cfg.num_antennas_rx,
+                cfg.num_subcarriers
+            ]
         );
         assert_eq!(
             s.phase.shape(),
-            &[cfg.window_frames, cfg.num_antennas_tx, cfg.num_antennas_rx, cfg.num_subcarriers]
+            &[
+                cfg.window_frames,
+                cfg.num_antennas_tx,
+                cfg.num_antennas_rx,
+                cfg.num_subcarriers
+            ]
         );
         assert_eq!(s.keypoints.shape(), &[cfg.num_keypoints, 2]);
         assert_eq!(s.keypoint_visibility.shape(), &[cfg.num_keypoints]);
@@ -1004,6 +1248,91 @@ mod tests {
             epsilon = 1e-7
         );
         assert_abs_diff_eq!(s0a.keypoints[[5, 0]], s0b.keypoints[[5, 0]], epsilon = 1e-7);
+    }
+
+    // ----- Leak-free subject-disjoint split (ADR-155 §Tier-1.2) -----------
+
+    fn split_fixture() -> MmFiDataset {
+        // 6 subjects × 2 clips each, 50 frames per clip, window 10 ⇒ 41
+        // overlapping windows per clip. A leaky index-split would put adjacent
+        // (near-identical) windows on both sides; the subject split cannot.
+        let mut clips = Vec::new();
+        for s in 1..=6u32 {
+            for a in 1..=2u32 {
+                clips.push((s, a, 50usize));
+            }
+        }
+        MmFiDataset::from_entries_for_test(&clips, 10)
+    }
+
+    #[test]
+    fn subject_split_is_subject_and_window_disjoint() {
+        let ds = split_fixture();
+        let (train, test) = ds.subject_disjoint_split(0.34, 42).unwrap();
+
+        // No subject is shared.
+        assert!(train.subjects().is_disjoint(test.subjects()));
+        // assert_split_leak_free agrees (subject + window disjoint, non-empty).
+        assert_split_leak_free(&train, &test).expect("split must be leak-free");
+
+        // No global window index is shared.
+        let train_set: std::collections::BTreeSet<usize> =
+            train.global_indices().iter().copied().collect();
+        for g in test.global_indices() {
+            assert!(!train_set.contains(g), "window {g} leaked across the split");
+        }
+
+        // Every window is accounted for exactly once (partition, not sample).
+        assert_eq!(train.len() + test.len(), ds.len());
+        assert!(train.len() > 0 && test.len() > 0);
+    }
+
+    #[test]
+    fn subject_split_is_deterministic_for_seed() {
+        let ds = split_fixture();
+        let (tr1, te1) = ds.subject_disjoint_split(0.34, 7).unwrap();
+        let (tr2, te2) = ds.subject_disjoint_split(0.34, 7).unwrap();
+        assert_eq!(tr1.subjects(), tr2.subjects());
+        assert_eq!(te1.subjects(), te2.subjects());
+    }
+
+    #[test]
+    fn subject_split_rejects_single_subject() {
+        // Only one subject ⇒ a subject-disjoint split is impossible.
+        let ds = MmFiDataset::from_entries_for_test(&[(1, 1, 50), (1, 2, 50)], 10);
+        assert!(matches!(
+            ds.subject_disjoint_split(0.3, 1),
+            Err(DatasetError::InvalidSplit(_))
+        ));
+    }
+
+    #[test]
+    fn subject_split_rejects_bad_fraction() {
+        let ds = split_fixture();
+        assert!(ds.subject_disjoint_split(0.0, 1).is_err());
+        assert!(ds.subject_disjoint_split(1.0, 1).is_err());
+    }
+
+    #[test]
+    fn assert_leak_free_detects_injected_subject_leak() {
+        // Build two views that deliberately share subject 3 and prove the
+        // validator catches it (a guard against future partitioner bugs).
+        let ds = split_fixture();
+        let (train, _test) = ds.subject_disjoint_split(0.34, 42).unwrap();
+        // Fabricate a "test" view overlapping train's subjects.
+        let mut shared_subjects = std::collections::BTreeSet::new();
+        let leaked = *train.subjects().iter().next().unwrap();
+        shared_subjects.insert(leaked);
+        let bad_test = MmFiSplitView {
+            parent: &ds,
+            global_indices: train.global_indices().to_vec(),
+            subjects: shared_subjects,
+            name: "bad",
+        };
+        assert!(matches!(
+            assert_split_leak_free(&train, &bad_test),
+            Err(DatasetError::InvalidSplit(_))
+        ));
     }
 
     #[test]
@@ -1033,7 +1362,10 @@ mod tests {
         for idx in 0..4 {
             let s = ds.get(idx).unwrap();
             for &v in s.amplitude.iter() {
-                assert!(v >= 0.19 && v <= 0.81, "amplitude {v} out of [0.2, 0.8]");
+                assert!(
+                    (0.19..=0.81).contains(&v),
+                    "amplitude {v} out of [0.2, 0.8]"
+                );
             }
         }
     }
@@ -1056,7 +1388,10 @@ mod tests {
         let cfg = SyntheticConfig::default();
         let ds = SyntheticCsiDataset::new(3, cfg);
         let s = ds.get(0).unwrap();
-        assert!(s.keypoint_visibility.iter().all(|&v| (v - 2.0).abs() < 1e-6));
+        assert!(s
+            .keypoint_visibility
+            .iter()
+            .all(|&v| (v - 2.0).abs() < 1e-6));
     }
 
     // ----- DataLoader -------------------------------------------------------
@@ -1107,7 +1442,10 @@ mod tests {
         let dl2 = DataLoader::new(&ds, 20, true, 2);
         let ids1: Vec<u64> = dl1.iter().flatten().map(|s| s.frame_id).collect();
         let ids2: Vec<u64> = dl2.iter().flatten().map(|s| s.frame_id).collect();
-        assert_ne!(ids1, ids2, "different seeds should produce different orders");
+        assert_ne!(
+            ids1, ids2,
+            "different seeds should produce different orders"
+        );
     }
 
     #[test]
@@ -1158,12 +1496,15 @@ mod tests {
         let buf = CompressedCsiBuffer::from_array4(&arr, 0);
         assert_eq!(buf.len(), 10);
         assert!(!buf.is_empty());
-        assert!(buf.compression_ratio > 1.0, "Should compress better than f32");
+        assert!(
+            buf.compression_ratio > 1.0,
+            "Should compress better than f32"
+        );
 
         // Decode single frame
         let frame = buf.get_frame(0);
         assert!(frame.is_some());
-        assert_eq!(frame.unwrap().len(), 1 * 3 * 16);
+        assert_eq!(frame.unwrap().len(), 3 * 16);
 
         // Full decode
         let decoded = buf.to_array4(1, 3, 16);

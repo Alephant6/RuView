@@ -206,7 +206,12 @@ impl DensePoseHead {
     }
 
     /// Get expected input shape for a given batch size
-    pub fn expected_input_shape(&self, batch_size: usize, height: usize, width: usize) -> TensorShape {
+    pub fn expected_input_shape(
+        &self,
+        batch_size: usize,
+        height: usize,
+        width: usize,
+    ) -> TensorShape {
         TensorShape::new(vec![batch_size, self.config.input_channels, height, width])
     }
 
@@ -249,12 +254,13 @@ impl DensePoseHead {
 
     /// Native forward pass using loaded weights
     fn forward_native(&self, input: &Tensor) -> NnResult<DensePoseOutput> {
-        let weights = self.weights.as_ref().ok_or_else(|| {
-            NnError::inference("No weights loaded for native inference")
-        })?;
+        let weights = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| NnError::inference("No weights loaded for native inference"))?;
 
         let input_arr = input.as_array4()?;
-        let (batch, _channels, height, width) = input_arr.dim();
+        let (_batch, _channels, _height, _width) = input_arr.dim();
 
         // Apply shared convolutions
         let mut current = input_arr.clone();
@@ -297,7 +303,12 @@ impl DensePoseHead {
         let out_width = width * 2;
 
         // Create mock segmentation output
-        let seg_shape = [batch, self.config.segmentation_channels(), out_height, out_width];
+        let seg_shape = [
+            batch,
+            self.config.segmentation_channels(),
+            out_height,
+            out_width,
+        ];
         let segmentation = Tensor::zeros_4d(seg_shape);
 
         // Create mock UV output
@@ -312,7 +323,11 @@ impl DensePoseHead {
     }
 
     /// Apply a convolution layer
-    fn apply_conv_layer(&self, input: &Array4<f32>, weights: &ConvLayerWeights) -> NnResult<Array4<f32>> {
+    fn apply_conv_layer(
+        &self,
+        input: &Array4<f32>,
+        weights: &ConvLayerWeights,
+    ) -> NnResult<Array4<f32>> {
         let (batch, in_channels, in_height, in_width) = input.dim();
         let (out_channels, _, kernel_h, kernel_w) = weights.weight.dim();
 
@@ -323,7 +338,16 @@ impl DensePoseHead {
 
         let mut output = Array4::zeros((batch, out_channels, out_height, out_width));
 
-        // Simple convolution implementation (not optimized)
+        // Naive direct convolution (one MAC per tap). ADR-155 M2 §4: a
+        // range-clamped variant (hoisting the per-tap in-bounds branch out of the
+        // inner loops) was prototyped and proven bit-identical, but a committed
+        // criterion bench (`benches/native_conv_bench.rs`) showed the perf result
+        // is INCONCLUSIVE on this host: a ~35% win on padding-heavy small-channel
+        // maps but a small (~3%) *regression* on channel-heavy maps, all inside a
+        // ±20% run-to-run noise floor. Per the §0 PROOF discipline we do not ship
+        // a perf change whose benefit isn't robustly positive, nor fabricate a
+        // number — the naive loop is kept and the rewrite is honestly deferred
+        // (see ADR-155 §8). Behaviour pinned by `native_conv_matches_reference`.
         for b in 0..batch {
             for oc in 0..out_channels {
                 for oh in 0..out_height {
@@ -334,8 +358,10 @@ impl DensePoseHead {
                                 for kw in 0..kernel_w {
                                     let ih = oh + kh;
                                     let iw = ow + kw;
-                                    if ih >= pad_h && ih < in_height + pad_h
-                                        && iw >= pad_w && iw < in_width + pad_w
+                                    if ih >= pad_h
+                                        && ih < in_height + pad_h
+                                        && iw >= pad_w
+                                        && iw < in_width + pad_w
                                     {
                                         let input_val = input[[b, ic, ih - pad_h, iw - pad_w]];
                                         sum += input_val * weights.weight[[oc, ic, kh, kw]];
@@ -422,17 +448,31 @@ impl DensePoseHead {
         // Return a tensor with constant confidence for now
         let shape = uv.shape();
         let arr = Array4::from_elem(
-            (shape.dim(0).unwrap_or(1), 1, shape.dim(2).unwrap_or(1), shape.dim(3).unwrap_or(1)),
+            (
+                shape.dim(0).unwrap_or(1),
+                1,
+                shape.dim(2).unwrap_or(1),
+                shape.dim(3).unwrap_or(1),
+            ),
             confidence_val,
         );
         Ok(Tensor::Float4D(arr))
     }
 
     /// Get feature statistics for debugging
-    pub fn get_output_stats(&self, output: &DensePoseOutput) -> NnResult<HashMap<String, TensorStats>> {
+    pub fn get_output_stats(
+        &self,
+        output: &DensePoseOutput,
+    ) -> NnResult<HashMap<String, TensorStats>> {
         let mut stats = HashMap::new();
-        stats.insert("segmentation".to_string(), TensorStats::from_tensor(&output.segmentation)?);
-        stats.insert("uv_coordinates".to_string(), TensorStats::from_tensor(&output.uv_coordinates)?);
+        stats.insert(
+            "segmentation".to_string(),
+            TensorStats::from_tensor(&output.segmentation)?,
+        );
+        stats.insert(
+            "uv_coordinates".to_string(),
+            TensorStats::from_tensor(&output.uv_coordinates)?,
+        );
         Ok(stats)
     }
 }
@@ -534,6 +574,61 @@ impl BodyPart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Array4;
+
+    /// ADR-155 M2 §4: characterize the native conv against **hand-computed**
+    /// values so the §8 native-conv perf rewrite (or any future change) has a
+    /// behaviour anchor — a 1×1 conv is just a per-pixel scalar multiply, and a
+    /// same-padded 3×3 corner has a known truncated-window sum. Pins CURRENT
+    /// behaviour (no behaviour change in this milestone — the rewrite was
+    /// reverted as perf-inconclusive; see `benches/native_conv_bench.rs`).
+    #[test]
+    fn native_conv_matches_reference() {
+        // --- Case 1: a 1×1 conv (no padding) is exactly `out = w·in + b`. ---
+        let w11 = ConvLayerWeights {
+            weight: Array4::from_shape_fn((1, 1, 1, 1), |_| 2.0_f32),
+            bias: Some(ndarray::Array1::from_elem(1, 0.5_f32)),
+            bn_gamma: None,
+            bn_beta: None,
+            bn_mean: None,
+            bn_var: None,
+        };
+        let input = Array4::from_shape_fn((1, 1, 2, 2), |(_, _, y, x)| (y * 2 + x) as f32);
+        let mut cfg = DensePoseConfig::new(1, 1, 2);
+        cfg.kernel_size = 1;
+        cfg.padding = 0;
+        cfg.hidden_channels = vec![1];
+        let head = DensePoseHead::new(cfg).unwrap();
+        let out = head.apply_conv_layer(&input, &w11).unwrap();
+        assert_eq!(out.dim(), (1, 1, 2, 2));
+        // out[y,x] = 2·in[y,x] + 0.5 ⇒ {0.5, 2.5, 4.5, 6.5}.
+        for (got, want) in out.iter().zip([0.5_f32, 2.5, 4.5, 6.5].iter()) {
+            assert!((got - want).abs() < 1e-6, "1x1 conv: got {got}, want {want}");
+        }
+
+        // --- Case 2: a same-padded 3×3 all-ones kernel sums the in-bounds
+        // window. Input is all 1.0 on a 3×3 map ⇒ the centre output = 9 (full
+        // window), each corner = 4 (2×2 truncated window). ---
+        let w33 = ConvLayerWeights {
+            weight: Array4::from_elem((1, 1, 3, 3), 1.0_f32),
+            bias: None,
+            bn_gamma: None,
+            bn_beta: None,
+            bn_mean: None,
+            bn_var: None,
+        };
+        let ones = Array4::from_elem((1, 1, 3, 3), 1.0_f32);
+        let mut cfg2 = DensePoseConfig::new(1, 1, 2);
+        cfg2.kernel_size = 3;
+        cfg2.padding = 1;
+        cfg2.hidden_channels = vec![1];
+        let head2 = DensePoseHead::new(cfg2).unwrap();
+        let out2 = head2.apply_conv_layer(&ones, &w33).unwrap();
+        assert_eq!(out2.dim(), (1, 1, 3, 3));
+        assert!((out2[[0, 0, 1, 1]] - 9.0).abs() < 1e-6, "centre full window = 9");
+        assert!((out2[[0, 0, 0, 0]] - 4.0).abs() < 1e-6, "corner 2x2 window = 4");
+        assert!((out2[[0, 0, 0, 1]] - 6.0).abs() < 1e-6, "edge 2x3 window = 6");
+    }
 
     #[test]
     fn test_config_validation() {
@@ -562,7 +657,10 @@ mod tests {
         let input = Tensor::zeros_4d([1, 256, 64, 64]);
         let result = head.forward(&input);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No model weights loaded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No model weights loaded"));
     }
 
     #[test]

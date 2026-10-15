@@ -13,7 +13,10 @@ services:
     environment:
       - RUST_LOG=info
       # CSI_SOURCE controls the data source for the sensing server.
-      # Options: auto (default) — probe for ESP32 UDP then fall back to simulation
+      # Options: auto (default) — probe for ESP32 UDP then host WiFi; **fail
+      #                           hard with exit 78 if neither is detected**.
+      #                           Synthetic data is no longer a silent fallback
+      #                           (issue #937 fix) — operators must opt in.
       #          esp32          — receive real CSI frames from an ESP32 on UDP port 5005
       #          wifi           — use host Wi-Fi RSSI/scan data (Windows netsh)
       #          simulated      — generate synthetic CSI data (no hardware required)
@@ -23,8 +26,9 @@ services:
       #   volumes: ["/path/to/models:/app/models"]
       #   MODELS_DIR=/app/models
       - MODELS_DIR=${MODELS_DIR:-/app/models}
-      # Physical positions of the ESP32-S3 sensing nodes, in metres, ordered by
-      # node_id (1, 2, 3, ...). Format: "x,y,z;x,y,z;...". Origin and axis
+      # Physical positions of the ESP32-S3 sensing nodes, in metres. Format:
+      # "node_id:x,y,z;..." (upstream keys unprefixed entries by list index
+      # from 0, so keep the explicit node_id: prefix). Origin and axis
       # convention are arbitrary as long as you use the same frame for every
       # node and (later) for any per-room zone definitions.
       #
@@ -32,13 +36,26 @@ services:
       #   node 1: (9.20, 8.10, 0.63 m)
       #   node 2: (6.45, 0.20, 0.70 m)
       #   node 3: (0.00, 4.65, 1.15 m)
-      - SENSING_NODE_POSITIONS=${SENSING_NODE_POSITIONS:-9.2,8.1,0.63;6.45,0.2,0.7;0,4.65,1.15}
+      - SENSING_NODE_POSITIONS=${SENSING_NODE_POSITIONS:-1:9.2,8.1,0.63;2:6.45,0.2,0.7;3:0,4.65,1.15}
       # Enrolled-profile directory (one JSON file per household member).
       # When populated, single-person ticks are matched against these profiles
       # so PersonDetection.label carries the resolved name ("alice", "bob").
       # The bridge then publishes named HA entities (sensor.alice_present, ...).
       # Leave empty to disable name resolution (fallback to person_1 / person_2).
       - SENSING_PROFILES_DIR=${SENSING_PROFILES_DIR:-/app/data/profiles}
+      # Upstream auth (issue #864): the entrypoint refuses to start (exit 64)
+      # unless RUVIEW_API_TOKEN is set, RUVIEW_ALLOW_UNAUTHENTICATED=1, or
+      # RUVIEW_BIND_ADDR is loopback. Set one of them in docker/.env.
+      - RUVIEW_API_TOKEN
+      - RUVIEW_ALLOW_UNAUTHENTICATED
+      - RUVIEW_BIND_ADDR
+      # Upstream UDP source guard (ADR-296): UDP binds 127.0.0.1 unless one of
+      # these is set, so ESP32 frames from the LAN need e.g.
+      # RUVIEW_UDP_ALLOW=192.168.1.0/24 (preferred) or RUVIEW_UDP_INSECURE_LAN=true.
+      - RUVIEW_UDP_ALLOW
+      - RUVIEW_UDP_INSECURE_LAN
+      - RUVIEW_UDP_BIND
+      - SENSING_ALLOWED_HOSTS
     volumes:
       - ./models:/app/models
       - ./data:/app/data
@@ -61,6 +78,8 @@ services:
     environment:
       # Inside the compose network we can reach the sensing-server by name.
       - RUVIEW_WS=ws://192.168.1.195:3001/ws/sensing
+      # Same token as sensing-server; sent as a bearer header on the WS upgrade.
+      - RUVIEW_API_TOKEN
       # Point at your Home Assistant MQTT broker (e.g. the Mosquitto add-on).
       - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
       - MQTT_PORT=${MQTT_PORT:-1883}

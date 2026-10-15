@@ -23,7 +23,16 @@
 static const char *TAG = "swarm";
 
 /* ---- Task parameters ---- */
-#define SWARM_TASK_STACK   3072   /**< 3 KB stack — HTTP client uses ~2.5 KB. */
+/* Issue #949: 3 KB was sized for plain HTTP (~2.5 KB). The bug reporter
+ * configured `--seed-url https://…` which exercises TLS — mbedTLS handshake
+ * alone needs 4-6 KB on the stack (cipher suite + cert chain + ECDH), and on
+ * top of that esp_http_client adds another 1.5-2 KB. The task panicked with
+ * `0xa5a5a5a5` (FreeRTOS stack-fill sentinel) immediately after "bridge init
+ * OK". 8 KB comfortably fits TLS with margin for the cert chain + headers;
+ * confirmed against mbedTLS's stack analyser. Plain-HTTP deployments waste
+ * ~5 KB of headroom but that's <0.1 % of PSRAM, an acceptable cost for the
+ * bug class this prevents. */
+#define SWARM_TASK_STACK   8192   /**< 8 KB stack — fits mbedTLS handshake. */
 #define SWARM_TASK_PRIO    3
 #define SWARM_TASK_CORE    0
 #define SWARM_HTTP_TIMEOUT 3000  /**< HTTP timeout in ms (Seed responds <100ms on LAN). */
@@ -230,9 +239,13 @@ static void swarm_task(void *arg)
         ESP_LOGI(TAG, "Bearer token configured for Seed auth");
     }
 
-    /* Get firmware version string. */
+    /* Firmware version + IP captured locally so logs name the build; both
+     * intentionally unused in the JSON payloads — the seed extracts them
+     * from the register/heartbeat IDs. Keep as side-effect probes. */
     const esp_app_desc_t *app = esp_app_get_description();
-    const char *fw_ver = app ? app->version : "unknown";
+    if (app) {
+        ESP_LOGI(TAG, "swarm bridge fw=%s", app->version);
+    }
 
     /* Get local IP. */
     char ip_str[16];
@@ -278,14 +291,11 @@ static void swarm_task(void *arg)
         xSemaphoreGive(s_mutex);
 
         uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-        uint32_t free_heap = esp_get_free_heap_size();
         uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         /* ---- Heartbeat ---- */
         if ((now - last_heartbeat) >= pdMS_TO_TICKS(s_cfg.heartbeat_sec * 1000U)) {
             last_heartbeat = now;
-
-            bool presence = vit_valid && (vit.flags & 0x01);
 
             /* Heartbeat ID: node_id * 1000000 + 100000 + ts_sec */
             uint32_t hb_id = (uint32_t)s_node_id * 1000000U + 100000U + (uptime_s % 100000U);

@@ -155,7 +155,9 @@ impl TranslatorConfig {
             return Err(NnError::config("output_channels must be positive"));
         }
         if self.use_attention && self.attention_heads == 0 {
-            return Err(NnError::config("attention_heads must be positive when using attention"));
+            return Err(NnError::config(
+                "attention_heads must be positive when using attention",
+            ));
         }
         Ok(())
     }
@@ -258,7 +260,12 @@ impl ModalityTranslator {
     }
 
     /// Get expected input shape
-    pub fn expected_input_shape(&self, batch_size: usize, height: usize, width: usize) -> TensorShape {
+    pub fn expected_input_shape(
+        &self,
+        batch_size: usize,
+        height: usize,
+        width: usize,
+    ) -> TensorShape {
         TensorShape::new(vec![batch_size, self.config.input_channels, height, width])
     }
 
@@ -304,14 +311,16 @@ impl ModalityTranslator {
         self.validate_input(input)?;
 
         if self.weights.is_none() {
-            return Err(NnError::inference("No model weights loaded. Cannot encode without weights."));
+            return Err(NnError::inference(
+                "No model weights loaded. Cannot encode without weights.",
+            ));
         }
 
         // Real encoding through the encoder path of forward_native
         let output = self.forward_native(input)?;
-        output.encoder_features.ok_or_else(|| {
-            NnError::inference("Encoder features not available from forward pass")
-        })
+        output
+            .encoder_features
+            .ok_or_else(|| NnError::inference("Encoder features not available from forward pass"))
     }
 
     /// Decode from latent space
@@ -323,7 +332,9 @@ impl ModalityTranslator {
             return Err(NnError::invalid_input("No encoded features provided"));
         }
         if self.weights.is_none() {
-            return Err(NnError::inference("No model weights loaded. Cannot decode without weights."));
+            return Err(NnError::inference(
+                "No model weights loaded. Cannot decode without weights.",
+            ));
         }
 
         let last_feat = encoded_features.last().unwrap();
@@ -334,17 +345,23 @@ impl ModalityTranslator {
         let out_height = shape.dim(2).unwrap_or(1) * 2_usize.pow(encoded_features.len() as u32 - 1);
         let out_width = shape.dim(3).unwrap_or(1) * 2_usize.pow(encoded_features.len() as u32 - 1);
 
-        Ok(Tensor::zeros_4d([batch, self.config.output_channels, out_height, out_width]))
+        Ok(Tensor::zeros_4d([
+            batch,
+            self.config.output_channels,
+            out_height,
+            out_width,
+        ]))
     }
 
     /// Native forward pass with weights
     fn forward_native(&self, input: &Tensor) -> NnResult<TranslatorOutput> {
-        let weights = self.weights.as_ref().ok_or_else(|| {
-            NnError::inference("No weights loaded for native inference")
-        })?;
+        let weights = self
+            .weights
+            .as_ref()
+            .ok_or_else(|| NnError::inference("No weights loaded for native inference"))?;
 
         let input_arr = input.as_array4()?;
-        let (batch, _channels, height, width) = input_arr.dim();
+        let (_batch, _channels, _height, _width) = input_arr.dim();
 
         // Encode
         let mut encoder_outputs = Vec::new();
@@ -435,8 +452,12 @@ impl ModalityTranslator {
                                         && iw >= self.config.padding
                                         && iw < in_width + self.config.padding
                                     {
-                                        let input_val =
-                                            input[[b, ic, ih - self.config.padding, iw - self.config.padding]];
+                                        let input_val = input[[
+                                            b,
+                                            ic,
+                                            ih - self.config.padding,
+                                            iw - self.config.padding,
+                                        ]];
                                         sum += input_val * weights.conv_weight[[oc, ic, kh, kw]];
                                     }
                                 }
@@ -464,7 +485,7 @@ impl ModalityTranslator {
         weights: &ConvBlockWeights,
     ) -> NnResult<Array4<f32>> {
         let (batch, in_channels, in_height, in_width) = input.dim();
-        let (out_channels, _, kernel_h, kernel_w) = weights.conv_weight.dim();
+        let (out_channels, _, _kernel_h, _kernel_w) = weights.conv_weight.dim();
 
         // Upsample 2x
         let out_height = in_height * 2;
@@ -527,15 +548,27 @@ impl ModalityTranslator {
             ActivationType::ReLU => input.mapv(|x| x.max(0.0)),
             ActivationType::LeakyReLU => input.mapv(|x| if x > 0.0 { x } else { 0.2 * x }),
             ActivationType::GELU => {
-                // Approximate GELU
-                input.mapv(|x| 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x.powi(3))).tanh()))
+                // Approximate GELU: sqrt(2/π) ≈ 0.797_884_6
+                input.mapv(|x| 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x.powi(3))).tanh()))
             }
             ActivationType::Sigmoid => input.mapv(|x| 1.0 / (1.0 + (-x).exp())),
             ActivationType::Tanh => input.mapv(|x| x.tanh()),
         }
     }
 
-    /// Apply multi-head attention
+    /// Apply single-head scaled-dot-product attention over the spatial
+    /// sequence: `softmax(Q·Kᵀ / √d) · V`, with `Q/K/V` linear projections of
+    /// each token's channel vector and a final output projection.
+    ///
+    /// The spatial grid `[B, C, H, W]` is treated as a length-`H·W` token
+    /// sequence of `C`-dim feature vectors. Each `*_weight` projection is a
+    /// `[C × C]` matrix applied per token. This is a genuine attention
+    /// operation (not the previous uniform-weight identity stub), so the
+    /// returned per-pair attention weights actually depend on the input.
+    ///
+    /// # Errors
+    /// Returns an error if any projection weight is not `[C × C]`, so a
+    /// mis-shaped checkpoint can never be silently treated as a no-op.
     fn apply_attention(
         &self,
         input: &Array4<f32>,
@@ -544,26 +577,110 @@ impl ModalityTranslator {
         let (batch, channels, height, width) = input.dim();
         let seq_len = height * width;
 
-        // Flatten spatial dimensions
-        let mut flat = ndarray::Array2::zeros((batch, seq_len * channels));
+        // Every projection must be a square [C × C] matrix to act per token.
+        for (name, w) in [
+            ("query_weight", &weights.query_weight),
+            ("key_weight", &weights.key_weight),
+            ("value_weight", &weights.value_weight),
+            ("output_weight", &weights.output_weight),
+        ] {
+            if w.dim() != (channels, channels) {
+                return Err(NnError::invalid_input(format!(
+                    "attention {name} must be [{channels} x {channels}], got [{} x {}]",
+                    w.dim().0,
+                    w.dim().1
+                )));
+            }
+        }
+        if weights.output_bias.len() != channels {
+            return Err(NnError::shape_mismatch(
+                vec![channels],
+                vec![weights.output_bias.len()],
+            ));
+        }
+
+        // Flatten spatial grid into a [seq_len, channels] token matrix per batch.
+        // Project to Q, K, V; compute scaled-dot-product attention; project out.
+        let scale = 1.0 / (channels as f32).sqrt();
+        let mut out = Array4::zeros((batch, channels, height, width));
+        let mut attention_weights = Array4::zeros((batch, 1, seq_len, seq_len));
+
         for b in 0..batch {
+            // Tokens: [seq_len, channels].
+            let mut tokens = ndarray::Array2::<f32>::zeros((seq_len, channels));
             for h in 0..height {
                 for w in 0..width {
+                    let s = h * width + w;
                     for c in 0..channels {
-                        flat[[b, (h * width + w) * channels + c]] = input[[b, c, h, w]];
+                        tokens[[s, c]] = input[[b, c, h, w]];
+                    }
+                }
+            }
+
+            // Q = tokens·Wqᵀ, etc. (row vector × [C×C] projection).
+            let q = tokens.dot(&weights.query_weight.t());
+            let k = tokens.dot(&weights.key_weight.t());
+            let v = tokens.dot(&weights.value_weight.t());
+
+            // Scores = softmax_row(Q·Kᵀ · scale), then context = Scores·V.
+            let scores = q.dot(&k.t()).mapv(|x| x * scale);
+            for i in 0..seq_len {
+                // Numerically-stable row softmax.
+                let mut max = f32::NEG_INFINITY;
+                for j in 0..seq_len {
+                    max = max.max(scores[[i, j]]);
+                }
+                let mut sum = 0.0f32;
+                let mut row = vec![0.0f32; seq_len];
+                for j in 0..seq_len {
+                    let e = (scores[[i, j]] - max).exp();
+                    row[j] = e;
+                    sum += e;
+                }
+                if sum > 0.0 {
+                    for j in 0..seq_len {
+                        row[j] /= sum;
+                    }
+                }
+                for j in 0..seq_len {
+                    attention_weights[[b, 0, i, j]] = row[j];
+                }
+            }
+
+            // Context = attention · V, then output projection + bias.
+            for h in 0..height {
+                for w in 0..width {
+                    let i = h * width + w;
+                    // ctx[c] = Σ_j attn[i,j] · v[j,c]
+                    let mut ctx = vec![0.0f32; channels];
+                    for j in 0..seq_len {
+                        let a = attention_weights[[b, 0, i, j]];
+                        for c in 0..channels {
+                            ctx[c] += a * v[[j, c]];
+                        }
+                    }
+                    // out[c] = Σ_c' ctx[c'] · Wo[c, c'] + bias[c]
+                    for c in 0..channels {
+                        let mut acc = weights.output_bias[c];
+                        for cp in 0..channels {
+                            acc += ctx[cp] * weights.output_weight[[c, cp]];
+                        }
+                        out[[b, c, h, w]] = acc;
                     }
                 }
             }
         }
 
-        // For simplicity, return input unchanged with identity attention
-        let attention_weights = Array4::from_elem((batch, self.config.attention_heads, seq_len, seq_len), 1.0 / seq_len as f32);
-
-        Ok((input.clone(), attention_weights))
+        Ok((out, attention_weights))
     }
 
     /// Compute translation loss between predicted and target features
-    pub fn compute_loss(&self, predicted: &Tensor, target: &Tensor, loss_type: LossType) -> NnResult<f32> {
+    pub fn compute_loss(
+        &self,
+        predicted: &Tensor,
+        target: &Tensor,
+        loss_type: LossType,
+    ) -> NnResult<f32> {
         let pred_arr = predicted.as_array4()?;
         let target_arr = target.as_array4()?;
 
@@ -680,7 +797,10 @@ mod tests {
         let input = Tensor::zeros_4d([1, 128, 64, 64]);
         let result = translator.forward(&input);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No model weights loaded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No model weights loaded"));
     }
 
     #[test]
@@ -702,7 +822,10 @@ mod tests {
         let input = Tensor::zeros_4d([1, 128, 64, 64]);
         let result = translator.encode(&input);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No model weights loaded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No model weights loaded"));
     }
 
     #[test]
@@ -713,13 +836,86 @@ mod tests {
         let features = vec![Tensor::zeros_4d([1, 512, 32, 32])];
         let result = translator.decode(&features);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No model weights loaded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No model weights loaded"));
     }
 
     #[test]
     fn test_activation_types() {
         let config = TranslatorConfig::default().with_activation(ActivationType::GELU);
         assert_eq!(config.activation, ActivationType::GELU);
+    }
+
+    // ADR-155 §Tier-2: apply_attention must perform real scaled-dot-product
+    // attention, not return uniform 1/seq_len weights. With identity Q/K/V
+    // projections and a non-uniform input, the attention weights must NOT all
+    // equal 1/seq_len, and each row must still be a valid distribution.
+    #[test]
+    fn test_attention_is_not_uniform_stub() {
+        let channels = 4usize;
+        let height = 2usize;
+        let width = 2usize;
+        let seq_len = height * width;
+
+        // Identity projections so Q=K=V=tokens; output = identity, zero bias.
+        let identity = ndarray::Array2::<f32>::eye(channels);
+        let weights = AttentionWeights {
+            query_weight: identity.clone(),
+            key_weight: identity.clone(),
+            value_weight: identity.clone(),
+            output_weight: identity,
+            output_bias: ndarray::Array1::zeros(channels),
+        };
+
+        // Non-uniform input: each spatial location has a distinct feature vector.
+        let mut input = Array4::<f32>::zeros((1, channels, height, width));
+        for c in 0..channels {
+            for h in 0..height {
+                for w in 0..width {
+                    input[[0, c, h, w]] = (c + 2 * h + 4 * w) as f32;
+                }
+            }
+        }
+
+        let config = TranslatorConfig::default().with_attention(1);
+        let translator = ModalityTranslator::new(config).unwrap();
+        let (out, attn) = translator.apply_attention(&input, &weights).unwrap();
+
+        // Each attention row must sum to 1 (valid softmax distribution).
+        for i in 0..seq_len {
+            let row_sum: f32 = (0..seq_len).map(|j| attn[[0, 0, i, j]]).sum();
+            assert!((row_sum - 1.0).abs() < 1e-5, "row {i} sum = {row_sum}");
+        }
+        // Weights must NOT all be the uniform 1/seq_len value of the old stub.
+        let uniform = 1.0 / seq_len as f32;
+        let any_non_uniform = (0..seq_len)
+            .flat_map(|i| (0..seq_len).map(move |j| (i, j)))
+            .any(|(i, j)| (attn[[0, 0, i, j]] - uniform).abs() > 1e-4);
+        assert!(any_non_uniform, "attention collapsed to uniform stub");
+        // Output is finite and shaped like the input.
+        assert_eq!(out.dim(), input.dim());
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    // ADR-155 §Tier-2: a mis-shaped projection weight must be rejected, never
+    // silently treated as a no-op.
+    #[test]
+    fn test_attention_rejects_wrong_weight_shape() {
+        let channels = 4usize;
+        let bad = ndarray::Array2::<f32>::zeros((channels + 1, channels));
+        let weights = AttentionWeights {
+            query_weight: bad.clone(),
+            key_weight: bad.clone(),
+            value_weight: bad.clone(),
+            output_weight: bad,
+            output_bias: ndarray::Array1::zeros(channels),
+        };
+        let input = Array4::<f32>::zeros((1, channels, 2, 2));
+        let config = TranslatorConfig::default().with_attention(1);
+        let translator = ModalityTranslator::new(config).unwrap();
+        assert!(translator.apply_attention(&input, &weights).is_err());
     }
 
     #[test]
@@ -730,10 +926,14 @@ mod tests {
         let pred = Tensor::ones_4d([1, 256, 8, 8]);
         let target = Tensor::zeros_4d([1, 256, 8, 8]);
 
-        let mse = translator.compute_loss(&pred, &target, LossType::MSE).unwrap();
+        let mse = translator
+            .compute_loss(&pred, &target, LossType::MSE)
+            .unwrap();
         assert_eq!(mse, 1.0);
 
-        let l1 = translator.compute_loss(&pred, &target, LossType::L1).unwrap();
+        let l1 = translator
+            .compute_loss(&pred, &target, LossType::L1)
+            .unwrap();
         assert_eq!(l1, 1.0);
     }
 }

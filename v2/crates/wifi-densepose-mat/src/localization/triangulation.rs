@@ -24,7 +24,7 @@ impl Default for TriangulationConfig {
         Self {
             min_sensors: 3,
             max_uncertainty: 5.0,
-            path_loss_exponent: 3.0,  // Indoor with obstacles
+            path_loss_exponent: 3.0, // Indoor with obstacles
             reference_distance: 1.0,
             reference_rssi: -30.0,
             weighted: true,
@@ -34,6 +34,7 @@ impl Default for TriangulationConfig {
 
 /// Result of a distance estimation
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DistanceEstimate {
     /// Sensor ID
     pub sensor_id: String,
@@ -59,11 +60,16 @@ impl Triangulator {
         Self::new(TriangulationConfig::default())
     }
 
+    /// Access the triangulation configuration.
+    pub fn config(&self) -> &TriangulationConfig {
+        &self.config
+    }
+
     /// Estimate position from RSSI measurements
     pub fn estimate_position(
         &self,
         sensors: &[SensorPosition],
-        rssi_values: &[(String, f64)],  // (sensor_id, rssi)
+        rssi_values: &[(String, f64)], // (sensor_id, rssi)
     ) -> Option<Coordinates3D> {
         // Get distance estimates from RSSI
         let distances: Vec<(SensorPosition, f64)> = rssi_values
@@ -90,7 +96,7 @@ impl Triangulator {
     pub fn estimate_from_toa(
         &self,
         sensors: &[SensorPosition],
-        toa_values: &[(String, f64)],  // (sensor_id, time_of_arrival_ns)
+        toa_values: &[(String, f64)], // (sensor_id, time_of_arrival_ns)
     ) -> Option<Coordinates3D> {
         const SPEED_OF_LIGHT: f64 = 299_792_458.0; // m/s
 
@@ -121,8 +127,8 @@ impl Triangulator {
         // Solving for d:
         // d = d_0 * 10^((RSSI_0 - RSSI) / (10 * n))
 
-        let exponent = (self.config.reference_rssi - rssi)
-            / (10.0 * self.config.path_loss_exponent);
+        let exponent =
+            (self.config.reference_rssi - rssi) / (10.0 * self.config.path_loss_exponent);
 
         self.config.reference_distance * 10.0_f64.powf(exponent)
     }
@@ -177,13 +183,14 @@ impl Triangulator {
     }
 
     /// Solve linear system using least squares
+    #[allow(clippy::needless_range_loop)]
     fn solve_least_squares(&self, a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
         let n = a.len();
         if n < 2 || a[0].len() != 2 {
             return None;
         }
 
-        // Calculate A^T * A
+        // Calculate A^T * A (dual-index matrix multiplication — range loop required)
         let mut ata = vec![vec![0.0; 2]; 2];
         for i in 0..2 {
             for j in 0..2 {
@@ -193,8 +200,8 @@ impl Triangulator {
             }
         }
 
-        // Calculate A^T * b
-        let mut atb = vec![0.0; 2];
+        // Calculate A^T * b (dual-index — range loop required)
+        let mut atb = [0.0; 2];
         for i in 0..2 {
             for k in 0..n {
                 atb[i] += a[k][i] * b[k];
@@ -232,8 +239,13 @@ impl Triangulator {
 
         let rmse = (sum_sq_error / distances.len() as f64).sqrt();
 
-        // GDOP (Geometric Dilution of Precision) approximation
-        let gdop = self.estimate_gdop(position, distances);
+        // Real, dimensionless GDOP (Geometric Dilution of Precision). Falls back
+        // to a unit factor for a degenerate (collinear) geometry where (HᵀH) is
+        // singular — that geometry already produces a large residual RMSE.
+        let gdop = self
+            .compute_gdop(position, distances)
+            .unwrap_or(1.0)
+            .max(1.0);
 
         LocationUncertainty {
             horizontal_error: rmse * gdop,
@@ -242,45 +254,59 @@ impl Triangulator {
         }
     }
 
-    /// Estimate Geometric Dilution of Precision
-    fn estimate_gdop(&self, position: &[f64], distances: &[(SensorPosition, f64)]) -> f64 {
-        // Simplified GDOP based on sensor geometry
-        let mut sum_angle = 0.0;
-        let n = distances.len();
+    /// Compute the real Geometric Dilution of Precision (GDOP).
+    ///
+    /// GDOP is the dimensionless factor by which measurement (range) noise is
+    /// amplified into position error by the sensor geometry. For range-based 2D
+    /// positioning the measurement Jacobian `H` has one row per sensor equal to
+    /// the unit bearing vector from the target to that sensor,
+    /// `[ (xₛ-xₜ)/d , (yₛ-yₜ)/d ]`. The position covariance (per unit measurement
+    /// variance) is `(HᵀH)⁻¹`, and
+    ///
+    /// ```text
+    /// GDOP = sqrt( trace( (HᵀH)⁻¹ ) )
+    /// ```
+    ///
+    /// This is the same quantity ADR-156 §2.3 corrected elsewhere — a genuine
+    /// dimensionless dilution, not the previous ad-hoc average-angle factor that
+    /// was merely *labelled* GDOP. Returns `None` when `HᵀH` is singular
+    /// (collinear / coincident geometry), which the caller treats as no
+    /// dilution information (factor 1.0).
+    fn compute_gdop(&self, position: &[f64], distances: &[(SensorPosition, f64)]) -> Option<f64> {
+        let (tx, ty) = (position[0], position[1]);
 
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx1 = distances[i].0.x - position[0];
-                let dy1 = distances[i].0.y - position[1];
-                let dx2 = distances[j].0.x - position[0];
-                let dy2 = distances[j].0.y - position[1];
-
-                let dot = dx1 * dx2 + dy1 * dy2;
-                let mag1 = (dx1 * dx1 + dy1 * dy1).sqrt();
-                let mag2 = (dx2 * dx2 + dy2 * dy2).sqrt();
-
-                if mag1 > 0.0 && mag2 > 0.0 {
-                    let cos_angle = (dot / (mag1 * mag2)).clamp(-1.0, 1.0);
-                    let angle = cos_angle.acos();
-                    sum_angle += angle;
-                }
+        // Accumulate HᵀH (2×2, symmetric) from unit bearing vectors.
+        let (mut hxx, mut hxy, mut hyy) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut rows = 0usize;
+        for (sensor, _dist) in distances {
+            let dx = sensor.x - tx;
+            let dy = sensor.y - ty;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= f64::EPSILON {
+                continue; // target coincident with sensor: undefined bearing
             }
+            let ux = dx / d;
+            let uy = dy / d;
+            hxx += ux * ux;
+            hxy += ux * uy;
+            hyy += uy * uy;
+            rows += 1;
         }
 
-        // Average angle between sensor pairs
-        let num_pairs = (n * (n - 1)) as f64 / 2.0;
-        let avg_angle = if num_pairs > 0.0 {
-            sum_angle / num_pairs
-        } else {
-            std::f64::consts::PI / 4.0
-        };
+        if rows < 2 {
+            return None;
+        }
 
-        // GDOP is better when sensors are spread out (angle closer to 90 degrees)
-        // GDOP gets worse as sensors are collinear
-        let optimal_angle = std::f64::consts::PI / 2.0;
-        let angle_factor = (avg_angle / optimal_angle - 1.0).abs() + 1.0;
-
-        angle_factor.max(1.0)
+        // Invert the 2×2 HᵀH. trace((HᵀH)⁻¹) = (hxx + hyy) / det.
+        let det = hxx * hyy - hxy * hxy;
+        if det.abs() < 1e-12 {
+            return None; // singular: collinear geometry
+        }
+        let trace_inv = (hxx + hyy) / det;
+        if trace_inv <= 0.0 {
+            return None;
+        }
+        Some(trace_inv.sqrt())
     }
 }
 
@@ -298,6 +324,7 @@ mod tests {
                 z: 1.5,
                 sensor_type: SensorType::Transceiver,
                 is_operational: true,
+                last_rssi: None,
             },
             SensorPosition {
                 id: "s2".to_string(),
@@ -306,6 +333,7 @@ mod tests {
                 z: 1.5,
                 sensor_type: SensorType::Transceiver,
                 is_operational: true,
+                last_rssi: None,
             },
             SensorPosition {
                 id: "s3".to_string(),
@@ -314,6 +342,7 @@ mod tests {
                 z: 1.5,
                 sensor_type: SensorType::Transceiver,
                 is_operational: true,
+                last_rssi: None,
             },
         ]
     }
@@ -339,9 +368,18 @@ mod tests {
         // Target at (5, 4) - calculate distances
         let target: (f64, f64) = (5.0, 4.0);
         let distances: Vec<(&str, f64)> = vec![
-            ("s1", ((target.0 - 0.0_f64).powi(2) + (target.1 - 0.0_f64).powi(2)).sqrt()),
-            ("s2", ((target.0 - 10.0_f64).powi(2) + (target.1 - 0.0_f64).powi(2)).sqrt()),
-            ("s3", ((target.0 - 5.0_f64).powi(2) + (target.1 - 10.0_f64).powi(2)).sqrt()),
+            (
+                "s1",
+                ((target.0 - 0.0_f64).powi(2) + (target.1 - 0.0_f64).powi(2)).sqrt(),
+            ),
+            (
+                "s2",
+                ((target.0 - 10.0_f64).powi(2) + (target.1 - 0.0_f64).powi(2)).sqrt(),
+            ),
+            (
+                "s3",
+                ((target.0 - 5.0_f64).powi(2) + (target.1 - 10.0_f64).powi(2)).sqrt(),
+            ),
         ];
 
         let dist_vec: Vec<(SensorPosition, f64)> = distances
@@ -366,13 +404,87 @@ mod tests {
         let sensors = create_test_sensors();
 
         // Only 2 distance measurements
-        let rssi_values = vec![
-            ("s1".to_string(), -40.0),
-            ("s2".to_string(), -45.0),
-        ];
+        let rssi_values = vec![("s1".to_string(), -40.0), ("s2".to_string(), -45.0)];
 
         let result = triangulator.estimate_position(&sensors, &rssi_values);
         assert!(result.is_none());
+    }
+
+    fn sensor_at(id: &str, x: f64, y: f64) -> SensorPosition {
+        SensorPosition {
+            id: id.to_string(),
+            x,
+            y,
+            z: 1.5,
+            sensor_type: SensorType::Transceiver,
+            is_operational: true,
+            last_rssi: None,
+        }
+    }
+
+    /// Real GDOP: dimensionless, geometry-dependent, and matches the closed-form
+    /// sqrt(trace((HᵀH)⁻¹)). A well-spread (near-orthogonal) array must give a
+    /// LOWER GDOP than a near-collinear one. (The old ad-hoc angle factor was not
+    /// a true dilution and is replaced.)
+    #[test]
+    fn test_gdop_is_real_dilution() {
+        let t = Triangulator::with_defaults();
+        let target = [5.0_f64, 5.0_f64];
+
+        // Well-distributed: an equilateral-ish triangle around the target.
+        let good = vec![
+            (sensor_at("a", 5.0, 15.0), 10.0),
+            (sensor_at("b", -3.66, 0.0), 10.0),
+            (sensor_at("c", 13.66, 0.0), 10.0),
+        ];
+        let gdop_good = t.compute_gdop(&target, &good).expect("good geometry");
+
+        // Near-collinear: bearings nearly all along ±y with a tiny x-spread, so
+        // HᵀH is ill-conditioned (invertible but with a small eigenvalue) and the
+        // GDOP is large but finite.
+        let bad = vec![
+            (sensor_at("a", 5.3, 15.0), 10.0),
+            (sensor_at("b", 4.7, 15.0), 10.0),
+            (sensor_at("c", 5.1, -5.0), 10.0),
+        ];
+        let gdop_bad = t.compute_gdop(&target, &bad).expect("bad geometry");
+
+        assert!(gdop_good >= 1.0, "GDOP must be >= 1 (dilution, dimensionless)");
+        assert!(
+            gdop_good < gdop_bad,
+            "well-spread GDOP {gdop_good} must be < near-collinear GDOP {gdop_bad}"
+        );
+
+        // Closed-form cross-check for the well-spread case: each unit bearing
+        // vector contributes to HᵀH; verify trace((HᵀH)⁻¹) explicitly.
+        let (mut hxx, mut hxy, mut hyy) = (0.0, 0.0, 0.0);
+        for (s, _d) in &good {
+            let dx = s.x - target[0];
+            let dy = s.y - target[1];
+            let d = (dx * dx + dy * dy).sqrt();
+            let (ux, uy) = (dx / d, dy / d);
+            hxx += ux * ux;
+            hxy += ux * uy;
+            hyy += uy * uy;
+        }
+        let det = hxx * hyy - hxy * hxy;
+        let expected = ((hxx + hyy) / det).sqrt();
+        assert!((gdop_good - expected).abs() < 1e-9);
+    }
+
+    /// Collinear geometry makes HᵀH singular -> compute_gdop returns None,
+    /// and the uncertainty path falls back to a unit factor (no fabrication).
+    #[test]
+    fn test_gdop_singular_collinear_is_none() {
+        let t = Triangulator::with_defaults();
+        let target = [0.0_f64, 0.0_f64];
+        // All sensors on the +x axis through the target: bearings all ±x -> rank 1.
+        let collinear = vec![
+            (sensor_at("a", 1.0, 0.0), 1.0),
+            (sensor_at("b", 2.0, 0.0), 2.0),
+            (sensor_at("c", 3.0, 0.0), 3.0),
+        ];
+        assert!(t.compute_gdop(&target, &collinear).is_none());
     }
 }
 
@@ -424,9 +536,9 @@ pub fn solve_tdoa_triangulation(
         let ai1 = yi - yj;
 
         // RHS: C * tdoa / 2 + (xi^2 - xj^2 + yi^2 - yj^2) / 2 - x_ref*(xi-xj) - y_ref*(yi-yj)
-        let bi = C * tdoa / 2.0
-            + ((xi * xi - xj * xj) + (yi * yi - yj * yj)) / 2.0
-            - x_ref * ai0 - y_ref * ai1;
+        let bi = C * tdoa / 2.0 + ((xi * xi - xj * xj) + (yi * yi - yj * yj)) / 2.0
+            - x_ref * ai0
+            - y_ref * ai1;
 
         ata[0][0] += ai0 * ai0;
         ata[0][1] += ai0 * ai1;

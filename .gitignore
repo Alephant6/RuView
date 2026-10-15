@@ -15,11 +15,33 @@ firmware/esp32-csi-node/managed_components/
 firmware/esp32-csi-node/dependencies.lock
 firmware/esp32-csi-node/sdkconfig.defaults.bak
 
+# ESP-IDF set-target backup (local only)
+firmware/esp32-hello-world/sdkconfig.old
+
+# Host-built firmware test binaries (compiled from test/*.c, not source)
+# Compiled host-test and fuzz binaries. The Makefile writes them beside their
+# sources, so they land in a tracked directory. Ignore them by SHAPE rather
+# than by name: every source here carries an extension and no binary does.
+#
+# This replaced a hand-maintained list of five targets, which had gone stale --
+# test_csi_sanitize, test_mmwave_detect and test_thermal were all built by
+# `make host_tests`, ignored by nothing, and got committed by accident.
+firmware/esp32-csi-node/test/test_*
+firmware/esp32-csi-node/test/fuzz_*
+!firmware/esp32-csi-node/test/*.*
+firmware/esp32-csi-node/test/*.exe
+firmware/esp32-csi-node/test/*.obj
+
 # Claude Flow swarm runtime state
 .swarm/
 
-# CSI recordings (local training data, machine-specific)
+# CSI recordings (local training/capture data — CSI is person data per
+# CLAUDE.md; never commit). Covers current and legacy layouts. See ADR-299.
+data/recordings/
+v2/data/recordings/
 rust-port/wifi-densepose-rs/data/recordings/
+**/*.csi.jsonl
+**/*.csi.meta.json
 
 # NVS partition images and CSVs (contain WiFi credentials)
 nvs.bin
@@ -260,3 +282,48 @@ v2/crates/rvcsi-node/*.node
 v2/crates/rvcsi-node/binding.js
 v2/crates/rvcsi-node/binding.d.ts
 v2/crates/rvcsi-node/npm/
+
+# AetherArena private optimization staging — never published until reviewed
+aether-arena/staging/
+
+# MM-Fi benchmark dataset archives — large data, fetch separately, never commit
+assets/MM-Fi/E0*.zip
+assets/MM-Fi/*.zip
+
+# through-wall demo: regenerable trained model artifact
+examples/through-wall/model/
+
+# RuView harness (npx ruview) build artifacts — ADR-182
+harness/**/node_modules/
+harness/**/*.tgz
+harness/**/package-lock.json
+!harness/ruview/package-lock.json
+!harness/homecore/package-lock.json
+harness/**/.claude-flow/
+harness/**/.metaharness/
+harness/**/ruvector.db
+
+# ruvector runtime/hook DB — never tracked (any depth)
+ruvector.db
+**/ruvector.db
+
+# sensing-server runtime artifacts written by its test suite (trained model
+# snapshots + the generated session-secret) — never tracked
+v2/crates/wifi-densepose-sensing-server/data/
+# The server also writes this secret when launched from v2/. Keep the rule
+# file-specific so tracked datasets below v2/data remain visible.
+/v2/data/session-secret
+*.proptest-regressions
+
+# ADR-324: wasm-bindgen output for ruview-offaxis is generated locally
+# (see the crate README); never commit generated artifacts.
+v2/crates/ruview-offaxis/pkg/
+
+# fal.ai visual-teacher LoRA training data/weights -- regenerable, never
+# commit training images or model weights (ADR-353)
+scripts/fal-visual-teacher/training-data/
+scripts/fal-visual-teacher/training-data.zip
+scripts/fal-visual-teacher/output/
+
+# Trained adaptive classifier (auto-created at runtime; #2135)
+/v2/data/adaptive_model.json

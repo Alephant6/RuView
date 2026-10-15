@@ -10,6 +10,11 @@
 // Helper math functions
 // ---------------------------------------------------------------------------
 
+/// LayerNorm numerical-stability epsilon added under the variance square root
+/// (`(x − μ)/√(σ² + ε)`). The standard transformer default (ADR-155 M2 §8:
+/// de-magicked from a bare `1e-5`; value unchanged, no behaviour change).
+const LAYER_NORM_EPS: f32 = 1e-5;
+
 /// GELU activation (Hendrycks & Gimpel, 2016 approximation).
 pub fn gelu(x: f32) -> f32 {
     let c = (2.0_f32 / std::f32::consts::PI).sqrt();
@@ -19,10 +24,12 @@ pub fn gelu(x: f32) -> f32 {
 /// Layer normalization: `(x - mean) / sqrt(var + eps)`. No affine parameters.
 pub fn layer_norm(x: &[f32]) -> Vec<f32> {
     let n = x.len() as f32;
-    if n == 0.0 { return vec![]; }
+    if n == 0.0 {
+        return vec![];
+    }
     let mean = x.iter().sum::<f32>() / n;
     let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
-    let inv_std = 1.0 / (var + 1e-5_f32).sqrt();
+    let inv_std = 1.0 / (var + LAYER_NORM_EPS).sqrt();
     x.iter().map(|v| (v - mean) * inv_std).collect()
 }
 
@@ -34,9 +41,13 @@ pub fn global_mean_pool(features: &[f32], n_items: usize, dim: usize) -> Vec<f32
     let scale = 1.0 / n_items as f32;
     for i in 0..n_items {
         let off = i * dim;
-        for j in 0..dim { out[j] += features[off + j]; }
+        for j in 0..dim {
+            out[j] += features[off + j];
+        }
     }
-    for v in out.iter_mut() { *v *= scale; }
+    for v in out.iter_mut() {
+        *v *= scale;
+    }
     out
 }
 
@@ -78,23 +89,37 @@ impl Linear {
             .wrapping_add(out_features as u64)
             .wrapping_add(instance.wrapping_mul(2654435761));
         let mut next = || -> f32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((seed >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
         };
         let weight: Vec<f32> = (0..n).map(|_| next() * bound).collect();
         let bias: Vec<f32> = (0..out_features).map(|_| next() * bound).collect();
-        Linear { weight, bias, in_features, out_features }
+        Linear {
+            weight,
+            bias,
+            in_features,
+            out_features,
+        }
     }
 
     /// Forward: `y = x W^T + b`.
     pub fn forward(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.in_features);
-        (0..self.out_features).map(|o| {
-            let row = o * self.in_features;
-            let mut s = self.bias[o];
-            for i in 0..self.in_features { s += self.weight[row + i] * x[i]; }
-            s
-        }).collect()
+        (0..self.out_features)
+            .map(|o| {
+                let row = o * self.in_features;
+                let mut s = self.bias[o];
+                for (&xi, &wi) in x
+                    .iter()
+                    .zip(self.weight[row..row + self.in_features].iter())
+                {
+                    s += wi * xi;
+                }
+                s
+            })
+            .collect()
     }
 }
 
@@ -113,10 +138,14 @@ pub struct GradientReversalLayer {
 
 impl GradientReversalLayer {
     /// Create a new GRL.
-    pub fn new(lambda: f32) -> Self { Self { lambda } }
+    pub fn new(lambda: f32) -> Self {
+        Self { lambda }
+    }
 
     /// Forward pass (identity).
-    pub fn forward(&self, x: &[f32]) -> Vec<f32> { x.to_vec() }
+    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        x.to_vec()
+    }
 
     /// Backward pass: returns `-lambda * grad`.
     pub fn backward(&self, grad: &[f32]) -> Vec<f32> {
@@ -154,7 +183,8 @@ impl DomainFactorizer {
             pose_fc1: Linear::new(part_dim, 128),
             pose_fc2: Linear::new(128, part_dim),
             env_fc: Linear::new(part_dim, 32),
-            n_parts, part_dim,
+            n_parts,
+            part_dim,
         }
     }
 
@@ -207,7 +237,9 @@ impl DomainClassifier {
         Self {
             fc1: Linear::new(part_dim, 32),
             fc2: Linear::new(32, n_domains),
-            n_parts, part_dim, n_domains,
+            n_parts,
+            part_dim,
+            n_domains,
         }
     }
 
@@ -354,13 +386,20 @@ mod tests {
 
     #[test]
     fn layer_norm_constant_gives_zeros() {
-        let normed = layer_norm(&vec![3.0; 16]);
+        let normed = layer_norm(&[3.0; 16]);
         assert!(normed.iter().all(|v| v.abs() < 1e-4));
     }
 
     #[test]
     fn layer_norm_empty() {
         assert!(layer_norm(&[]).is_empty());
+    }
+
+    /// ADR-155 M2 §8: the de-magicked LayerNorm epsilon must equal the prior
+    /// inline `1e-5` literal exactly (operating-value guard).
+    #[test]
+    fn layer_norm_eps_unchanged_from_literal() {
+        assert_eq!(LAYER_NORM_EPS, 1e-5_f32);
     }
 
     #[test]

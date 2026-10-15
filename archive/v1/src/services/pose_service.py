@@ -107,16 +107,25 @@ class PoseService:
     async def _initialize_models(self):
         """Initialize neural network models."""
         try:
-            # Initialize DensePose model
+            # Initialize DensePose model. DensePoseHead requires a config
+            # dict — input_channels matches the modality translator's output
+            # (256), with the standard DensePose 24 body parts and 2 (U,V)
+            # coordinates. (Previously called with no args → TypeError at
+            # startup, which broke the API service.)
+            densepose_config = {
+                'input_channels': 256,
+                'num_body_parts': 24,
+                'num_uv_coordinates': 2,
+            }
             if self.settings.pose_model_path:
-                self.densepose_model = DensePoseHead()
+                self.densepose_model = DensePoseHead(densepose_config)
                 # Load model weights if path is provided
                 # model_state = torch.load(self.settings.pose_model_path)
                 # self.densepose_model.load_state_dict(model_state)
                 self.logger.info("DensePose model loaded")
             else:
                 self.logger.warning("No pose model path provided, using default model")
-                self.densepose_model = DensePoseHead()
+                self.densepose_model = DensePoseHead(densepose_config)
             
             # Initialize modality translation
             config = {
@@ -220,7 +229,11 @@ class PoseService:
                 # Apply phase sanitization if we have phase data
                 if hasattr(detection_result.features, 'phase_difference'):
                     phase_data = detection_result.features.phase_difference
-                    sanitized_phase = self.phase_sanitizer.sanitize(phase_data)
+                    # PhaseSanitizer's full-pipeline method is sanitize_phase,
+                    # not sanitize (issue #612). The shorter name was an
+                    # AttributeError waiting to fire on any code path that
+                    # reaches this branch.
+                    sanitized_phase = self.phase_sanitizer.sanitize_phase(phase_data)
                     # Combine amplitude and phase data
                     return np.concatenate([amplitude_data, sanitized_phase])
                 

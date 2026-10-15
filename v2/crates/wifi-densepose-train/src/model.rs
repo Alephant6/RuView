@@ -30,9 +30,9 @@
 use std::path::Path;
 use tch::{nn, nn::Module, nn::ModuleT, Device, Kind, Tensor};
 
-use ruvector_attn_mincut::attn_mincut;
 use ruvector_attention::attention::ScaledDotProductAttention;
 use ruvector_attention::traits::Attention;
+use ruvector_attn_mincut::attn_mincut;
 
 use crate::config::TrainingConfig;
 use crate::error::TrainError;
@@ -82,16 +82,13 @@ impl WiFiDensePoseModel {
         let root = vs.root();
 
         // Compute the flattened CSI input size used by the modality translator.
-        let n_ant = (config.window_frames
-            * config.num_antennas_tx
-            * config.num_antennas_rx) as i64;
+        let n_ant = (config.window_frames * config.num_antennas_tx * config.num_antennas_rx) as i64;
         let n_sc = config.num_subcarriers as i64;
         let flat_csi = n_ant * n_sc;
 
         let num_parts = config.num_body_parts as i64;
 
-        let translator =
-            ModalityTranslator::new(&root / "translator", flat_csi, n_ant, n_sc);
+        let translator = ModalityTranslator::new(&root / "translator", flat_csi, n_ant, n_sc);
         let backbone = Backbone::new(&root / "backbone", config.backbone_channels as i64);
         let kp_head = KeypointHead::new(
             &root / "kp_head",
@@ -129,7 +126,15 @@ impl WiFiDensePoseModel {
         tch::no_grad(|| self.forward_impl(amplitude, phase, false))
     }
 
-    /// Save model weights to a file (tch safetensors / .pt format).
+    /// Save model weights to a file. The tch `VarStore` dispatches the format
+    /// on the file extension: `.safetensors` → safetensors, anything else →
+    /// torch `.pt`.
+    ///
+    /// **Platform constraint:** prefer `.safetensors`. The `.pt` path
+    /// (`_save_parameters`/`_load_parameters`) is broken on Windows with
+    /// torch 2.11 (GenericDict internal assert on the load roundtrip — see
+    /// `wiflow_std/model.rs::save_and_load_roundtrip`), which is why
+    /// [`crate::trainer::Trainer`] writes `.safetensors` checkpoints.
     ///
     /// # Errors
     ///
@@ -140,7 +145,8 @@ impl WiFiDensePoseModel {
             .map_err(|e| TrainError::training_step(format!("save failed: {e}")))
     }
 
-    /// Load model weights from a file.
+    /// Load model weights from a file (format dispatched on extension; see
+    /// the `.pt`-on-Windows caveat on [`Self::save`]).
     ///
     /// # Errors
     ///
@@ -185,7 +191,7 @@ impl WiFiDensePoseModel {
         self.vs
             .trainable_variables()
             .iter()
-            .map(|t| t.numel())
+            .map(|t| t.numel() as i64)
             .sum()
     }
 
@@ -300,19 +306,23 @@ fn apply_antenna_attention(x: &Tensor, lambda: f32) -> Tensor {
         let xi = x.select(0, bi as i64); // [n_ant, n_sc]
 
         // Move to CPU and convert to f32 for the pure-Rust attention kernel.
-        let flat: Vec<f32> =
-            Vec::from(xi.to_kind(Kind::Float).to_device(Device::Cpu).contiguous());
+        let flat: Vec<f32> = Vec::<f32>::try_from(
+            xi.to_kind(Kind::Float)
+                .to_device(Device::Cpu)
+                .flatten(0, -1),
+        )
+        .expect("antenna tensor to vec");
 
         // Q = K = V = the antenna features (self-attention over antenna paths).
         let out = attn_mincut(
-            &flat,        // q: [n_ant * n_sc]
-            &flat,        // k: [n_ant * n_sc]
-            &flat,        // v: [n_ant * n_sc]
-            n_sc_usize,   // d: feature dim = n_sc subcarriers
-            n_ant_usize,  // seq_len: number of antenna paths
-            lambda,       // lambda: min-cut threshold
-            1,            // tau: no temporal hysteresis (single-frame)
-            1e-6,         // eps: numerical epsilon
+            &flat,       // q: [n_ant * n_sc]
+            &flat,       // k: [n_ant * n_sc]
+            &flat,       // v: [n_ant * n_sc]
+            n_sc_usize,  // d: feature dim = n_sc subcarriers
+            n_ant_usize, // seq_len: number of antenna paths
+            lambda,      // lambda: min-cut threshold
+            1,           // tau: no temporal hysteresis (single-frame)
+            1e-6,        // eps: numerical epsilon
         );
 
         let attended = Tensor::from_slice(&out.output)
@@ -354,13 +364,15 @@ fn apply_spatial_attention(x: &Tensor) -> Tensor {
     for bi in 0..b {
         // Extract [C, H*W] and transpose to [H*W, C].
         let xi = x.select(0, bi).reshape([c, h * w]).transpose(0, 1); // [H*W, C]
-        let flat: Vec<f32> =
-            Vec::from(xi.to_kind(Kind::Float).to_device(Device::Cpu).contiguous());
+        let flat: Vec<f32> = Vec::<f32>::try_from(
+            xi.to_kind(Kind::Float)
+                .to_device(Device::Cpu)
+                .flatten(0, -1),
+        )
+        .expect("spatial tensor to vec");
 
         // Build token slices — one per spatial position.
-        let tokens: Vec<&[f32]> = (0..n_spatial)
-            .map(|i| &flat[i * d..(i + 1) * d])
-            .collect();
+        let tokens: Vec<&[f32]> = (0..n_spatial).map(|i| &flat[i * d..(i + 1) * d]).collect();
 
         // For each spatial token as query, compute attended output.
         let mut out_flat = vec![0.0f32; n_spatial * d];
@@ -670,11 +682,7 @@ impl BasicBlock {
             None => x.shallow_clone(),
         };
 
-        let out = self
-            .conv1
-            .forward(x)
-            .apply_t(&self.bn1, train)
-            .relu();
+        let out = self.conv1.forward(x).apply_t(&self.bn1, train).relu();
         let out = self.conv2.forward(&out).apply_t(&self.bn2, train);
 
         (out + residual).relu()
@@ -810,21 +818,9 @@ impl DensePoseHead {
         let shared_bn2 = nn::batch_norm2d(&vs / "shared_bn2", 256, Default::default());
 
         // num_parts + 1: 24 body-part classes + 1 background class
-        let part_out = nn::conv2d(
-            &vs / "part_out",
-            256,
-            num_parts + 1,
-            1,
-            Default::default(),
-        );
+        let part_out = nn::conv2d(&vs / "part_out", 256, num_parts + 1, 1, Default::default());
         // num_parts * 2: U and V channel for each of the 24 body parts
-        let uv_out = nn::conv2d(
-            &vs / "uv_out",
-            256,
-            num_parts * 2,
-            1,
-            Default::default(),
-        );
+        let uv_out = nn::conv2d(&vs / "uv_out", 256, num_parts * 2, 1, Default::default());
 
         DensePoseHead {
             shared_conv1,
@@ -888,8 +884,7 @@ mod tests {
         let model = WiFiDensePoseModel::new(&cfg, device);
 
         let batch = 2_i64;
-        let antennas =
-            (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
+        let antennas = (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
         let n_sub = cfg.num_subcarriers as i64;
 
         let amp = Tensor::ones([batch, antennas, n_sub], (Kind::Float, device));
@@ -928,8 +923,7 @@ mod tests {
         let model = WiFiDensePoseModel::new(&cfg, Device::Cpu);
 
         let batch = 1_i64;
-        let antennas =
-            (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
+        let antennas = (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
         let n_sub = cfg.num_subcarriers as i64;
         let amp = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));
         let ph = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));
@@ -947,8 +941,7 @@ mod tests {
         let model = WiFiDensePoseModel::new(&cfg, Device::Cpu);
 
         let batch = 2_i64;
-        let antennas =
-            (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
+        let antennas = (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
         let n_sub = cfg.num_subcarriers as i64;
         let amp = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));
         let ph = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));
@@ -957,14 +950,8 @@ mod tests {
 
         let uv_min: f64 = out.uv_coords.min().double_value(&[]);
         let uv_max: f64 = out.uv_coords.max().double_value(&[]);
-        assert!(
-            uv_min >= 0.0 - 1e-5,
-            "UV min should be >= 0, got {uv_min}"
-        );
-        assert!(
-            uv_max <= 1.0 + 1e-5,
-            "UV max should be <= 1, got {uv_max}"
-        );
+        assert!(uv_min >= 0.0 - 1e-5, "UV min should be >= 0, got {uv_min}");
+        assert!(uv_max <= 1.0 + 1e-5, "UV max should be <= 1, got {uv_max}");
     }
 
     #[test]
@@ -1005,15 +992,16 @@ mod tests {
         let mut model = WiFiDensePoseModel::new(&cfg, Device::Cpu);
 
         let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("weights.pt");
+        // safetensors, not .pt: this torch build's .pt roundtrip is broken on
+        // Windows (torch 2.11 GenericDict internal assert).
+        let path = tmp.path().join("weights.safetensors");
 
         model.save(&path).expect("save should succeed");
         model.load(&path).expect("load should succeed");
 
         // After loading, a forward pass should still work.
         let batch = 1_i64;
-        let antennas =
-            (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
+        let antennas = (cfg.num_antennas_tx * cfg.num_antennas_rx * cfg.window_frames) as i64;
         let n_sub = cfg.num_subcarriers as i64;
         let amp = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));
         let ph = Tensor::rand([batch, antennas, n_sub], (Kind::Float, Device::Cpu));

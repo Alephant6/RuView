@@ -28,11 +28,15 @@ impl CsiFrame {
     /// - amplitude = sqrt(I^2 + Q^2)
     /// - phase = atan2(Q, I)
     pub fn to_amplitude_phase(&self) -> (Vec<f64>, Vec<f64>) {
-        let amplitudes: Vec<f64> = self.subcarriers.iter()
+        let amplitudes: Vec<f64> = self
+            .subcarriers
+            .iter()
             .map(|sc| (sc.i as f64 * sc.i as f64 + sc.q as f64 * sc.q as f64).sqrt())
             .collect();
 
-        let phases: Vec<f64> = self.subcarriers.iter()
+        let phases: Vec<f64> = self
+            .subcarriers
+            .iter()
             .map(|sc| (sc.q as f64).atan2(sc.i as f64))
             .collect();
 
@@ -44,7 +48,9 @@ impl CsiFrame {
         if self.subcarriers.is_empty() {
             return 0.0;
         }
-        let sum: f64 = self.subcarriers.iter()
+        let sum: f64 = self
+            .subcarriers
+            .iter()
             .map(|sc| (sc.i as f64 * sc.i as f64 + sc.q as f64 * sc.q as f64).sqrt())
             .sum();
         sum / self.subcarriers.len() as f64
@@ -52,8 +58,7 @@ impl CsiFrame {
 
     /// Check if this frame has valid data (non-zero subcarriers with non-zero I/Q).
     pub fn is_valid(&self) -> bool {
-        !self.subcarriers.is_empty()
-            && self.subcarriers.iter().any(|sc| sc.i != 0 || sc.q != 0)
+        !self.subcarriers.is_empty() && self.subcarriers.iter().any(|sc| sc.i != 0 || sc.q != 0)
     }
 }
 
@@ -80,6 +85,97 @@ pub struct CsiMetadata {
     pub antenna_config: AntennaConfig,
     /// Sequence number for ordering
     pub sequence: u32,
+    /// ADR-110: PPDU type from ADR-018 byte 18. None on pre-ADR-110 firmware
+    /// (or when CONFIG_CSI_FRAME_HE_TAGGING is disabled — byte stays zero
+    /// and pre-ADR-110 readers see the same zero, full backwards compat).
+    /// Byte 18 = 0 reads as PpduType::HtLegacy (the wire encoding for the
+    /// HT/legacy bucket); 0xFF reads as PpduType::Unknown.
+    pub ppdu_type: PpduType,
+    /// ADR-110: flags from ADR-018 byte 19 — bandwidth bits, STBC, LDPC,
+    /// 802.15.4-time-sync-valid bit. See [`Adr018Flags`].
+    pub adr018_flags: Adr018Flags,
+}
+
+/// PPDU type encoded in ADR-018 byte 18 (ADR-110 extension).
+///
+/// Wire encoding (matches firmware `csi_collector.c`):
+///   0    = HT / legacy bucket (11b/g/HT/VHT all collapse here)
+///   1    = HE-SU (802.11ax single-user)
+///   2    = HE-MU (802.11ax multi-user)
+///   3    = HE-TB (802.11ax trigger-based)
+///   0xFF = Unknown
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PpduType {
+    HtLegacy,
+    HeSu,
+    HeMu,
+    HeTb,
+    Unknown,
+}
+
+impl PpduType {
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::HtLegacy,
+            1 => Self::HeSu,
+            2 => Self::HeMu,
+            3 => Self::HeTb,
+            _ => Self::Unknown,
+        }
+    }
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::HtLegacy => 0,
+            Self::HeSu => 1,
+            Self::HeMu => 2,
+            Self::HeTb => 3,
+            Self::Unknown => 0xFF,
+        }
+    }
+    pub fn is_he(self) -> bool {
+        matches!(self, Self::HeSu | Self::HeMu | Self::HeTb)
+    }
+}
+
+/// Flags encoded in ADR-018 byte 19 (ADR-110 extension).
+///
+/// Wire encoding:
+///   bit 0   : bandwidth wide (set = 40 MHz, clear = 20 MHz)
+///   bit 1   : (reserved for 80/160 future)
+///   bit 2   : STBC
+///   bit 3   : LDPC (reserved — not yet populated by firmware)
+///   bit 4   : 802.15.4 time-sync valid (C6 only)
+///   bit 5   : ESP-IDF invalid first CSI word was zeroed by firmware
+///   bit 6-7 : reserved
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adr018Flags {
+    pub bw40: bool,
+    pub stbc: bool,
+    pub ldpc: bool,
+    pub ieee802154_sync_valid: bool,
+    #[serde(default)]
+    pub first_word_sanitized: bool,
+}
+
+impl Adr018Flags {
+    pub fn from_byte(b: u8) -> Self {
+        Self {
+            bw40: (b & 0x01) != 0,
+            stbc: (b & 0x04) != 0,
+            ldpc: (b & 0x08) != 0,
+            ieee802154_sync_valid: (b & 0x10) != 0,
+            first_word_sanitized: (b & 0x20) != 0,
+        }
+    }
+    pub fn to_byte(self) -> u8 {
+        let mut b = 0u8;
+        if self.bw40 { b |= 0x01; }
+        if self.stbc { b |= 0x04; }
+        if self.ldpc { b |= 0x08; }
+        if self.ieee802154_sync_valid { b |= 0x10; }
+        if self.first_word_sanitized { b |= 0x20; }
+        b
+    }
 }
 
 /// WiFi channel bandwidth.
@@ -154,11 +250,25 @@ mod tests {
                 bandwidth: Bandwidth::Bw20,
                 antenna_config: AntennaConfig::default(),
                 sequence: 1,
+                ppdu_type: PpduType::HtLegacy,
+                adr018_flags: Adr018Flags::default(),
             },
             subcarriers: vec![
-                SubcarrierData { i: 100, q: 0, index: -28 },
-                SubcarrierData { i: 0, q: 50, index: -27 },
-                SubcarrierData { i: 30, q: 40, index: -26 },
+                SubcarrierData {
+                    i: 100,
+                    q: 0,
+                    index: -28,
+                },
+                SubcarrierData {
+                    i: 0,
+                    q: 50,
+                    index: -27,
+                },
+                SubcarrierData {
+                    i: 30,
+                    q: 40,
+                    index: -26,
+                },
             ],
         }
     }

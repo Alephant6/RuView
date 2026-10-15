@@ -11,11 +11,13 @@
 //! TrainError (top-level)
 //! ├── ConfigError      (config validation / file loading)
 //! ├── DatasetError     (data loading, I/O, format)
-//! └── SubcarrierError  (frequency-axis resampling)
+//! ├── SubcarrierError  (frequency-axis resampling)
+//! ├── MaeError         (MAE patchify / masking — ADR-152 §2.3)
+//! └── ProtocolError    (split protocols / leakage audit — ADR-291)
 //! ```
 
-use thiserror::Error;
 use std::path::PathBuf;
+use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // TrainResult
@@ -43,6 +45,14 @@ pub enum TrainError {
     /// A dataset loading or access error.
     #[error("Dataset error: {0}")]
     Dataset(#[from] DatasetError),
+
+    /// A MAE pretraining patchify / masking error (ADR-152 §2.3).
+    #[error("MAE pretraining error: {0}")]
+    Mae(#[from] MaeError),
+
+    /// A split-protocol / leakage-audit error (ADR-291).
+    #[error("Protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
 
     /// JSON (de)serialization error.
     #[error("JSON error: {0}")]
@@ -96,7 +106,10 @@ impl TrainError {
 
     /// Construct a [`TrainError::Checkpoint`].
     pub fn checkpoint<S: Into<String>>(msg: S, path: impl Into<PathBuf>) -> Self {
-        TrainError::Checkpoint { message: msg.into(), path: path.into() }
+        TrainError::Checkpoint {
+            message: msg.into(),
+            path: path.into(),
+        }
     }
 
     /// Construct a [`TrainError::NotImplemented`].
@@ -159,7 +172,10 @@ pub enum ConfigError {
 impl ConfigError {
     /// Construct a [`ConfigError::InvalidValue`].
     pub fn invalid_value<S: Into<String>>(field: &'static str, reason: S) -> Self {
-        ConfigError::InvalidValue { field, reason: reason.into() }
+        ConfigError::InvalidValue {
+            field,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -206,9 +222,7 @@ pub enum DatasetError {
     },
 
     /// The number of subcarriers in the file doesn't match expectations.
-    #[error(
-        "Subcarrier count mismatch in `{path}`: file has {found}, expected {expected}"
-    )]
+    #[error("Subcarrier count mismatch in `{path}`: file has {found}, expected {expected}")]
     SubcarrierMismatch {
         /// Path of the offending file.
         path: PathBuf,
@@ -260,9 +274,7 @@ pub enum DatasetError {
     },
 
     /// No subjects matching the requested IDs were found.
-    #[error(
-        "No subjects found in `{data_dir}` for IDs: {requested:?}"
-    )]
+    #[error("No subjects found in `{data_dir}` for IDs: {requested:?}")]
     NoSubjectsFound {
         /// Root data directory.
         data_dir: PathBuf,
@@ -273,32 +285,54 @@ pub enum DatasetError {
     /// An I/O error that carries no path context.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A train/test split is invalid — it leaks information across the boundary
+    /// (a subject appears in both partitions, or a window is shared) or is
+    /// degenerate (an empty partition). ADR-155 §Tier-1.2.
+    #[error("Invalid split: {0}")]
+    InvalidSplit(String),
 }
 
 impl DatasetError {
     /// Construct a [`DatasetError::DataNotFound`].
     pub fn not_found<S: Into<String>>(path: impl Into<PathBuf>, msg: S) -> Self {
-        DatasetError::DataNotFound { path: path.into(), message: msg.into() }
+        DatasetError::DataNotFound {
+            path: path.into(),
+            message: msg.into(),
+        }
     }
 
     /// Construct a [`DatasetError::InvalidFormat`].
     pub fn invalid_format<S: Into<String>>(path: impl Into<PathBuf>, msg: S) -> Self {
-        DatasetError::InvalidFormat { path: path.into(), message: msg.into() }
+        DatasetError::InvalidFormat {
+            path: path.into(),
+            message: msg.into(),
+        }
     }
 
     /// Construct a [`DatasetError::IoError`].
     pub fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
-        DatasetError::IoError { path: path.into(), source }
+        DatasetError::IoError {
+            path: path.into(),
+            source,
+        }
     }
 
     /// Construct a [`DatasetError::SubcarrierMismatch`].
     pub fn subcarrier_mismatch(path: impl Into<PathBuf>, found: usize, expected: usize) -> Self {
-        DatasetError::SubcarrierMismatch { path: path.into(), found, expected }
+        DatasetError::SubcarrierMismatch {
+            path: path.into(),
+            found,
+            expected,
+        }
     }
 
     /// Construct a [`DatasetError::NpyReadError`].
     pub fn npy_read<S: Into<String>>(path: impl Into<PathBuf>, msg: S) -> Self {
-        DatasetError::NpyReadError { path: path.into(), message: msg.into() }
+        DatasetError::NpyReadError {
+            path: path.into(),
+            message: msg.into(),
+        }
     }
 }
 
@@ -354,4 +388,181 @@ impl SubcarrierError {
     pub fn numerical<S: Into<String>>(msg: S) -> Self {
         SubcarrierError::NumericalError(msg.into())
     }
+}
+
+// ---------------------------------------------------------------------------
+// MaeError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by the MAE pretraining patchify / masking functions
+/// ([`crate::mae`], ADR-152 §2.3).
+#[derive(Debug, Error)]
+pub enum MaeError {
+    /// The flat window buffer does not match the declared `time × subc` shape.
+    #[error(
+        "Window length {actual} does not match time × subcarriers = \
+         {time} × {subc} = {expected}"
+    )]
+    WindowShapeMismatch {
+        /// Declared time dimension.
+        time: usize,
+        /// Declared subcarrier dimension.
+        subc: usize,
+        /// Expected buffer length (`time * subc`).
+        expected: usize,
+        /// Actual buffer length.
+        actual: usize,
+    },
+
+    /// A patch dimension is larger than the window along that axis.
+    #[error("Patch {axis} extent {patch} exceeds window {axis} extent {window}")]
+    PatchExceedsWindow {
+        /// Axis name (`"time"` or `"subcarrier"`).
+        axis: &'static str,
+        /// Patch extent along the axis.
+        patch: usize,
+        /// Window extent along the axis.
+        window: usize,
+    },
+
+    /// The window is not an exact multiple of the patch extent along an axis.
+    ///
+    /// Patchification never silently truncates; crop the window to `crop`
+    /// (the largest divisible extent) or change the patch size.
+    #[error(
+        "Window {axis} extent {window} is not divisible by patch {axis} extent \
+         {patch} (remainder {remainder}); crop the window to {crop} or change \
+         the patch size"
+    )]
+    NotDivisible {
+        /// Axis name (`"time"` or `"subcarrier"`).
+        axis: &'static str,
+        /// Window extent along the axis.
+        window: usize,
+        /// Patch extent along the axis.
+        patch: usize,
+        /// `window % patch`.
+        remainder: usize,
+        /// Largest divisible extent (`window - remainder`).
+        crop: usize,
+    },
+
+    /// The mask ratio is not a finite value strictly inside `(0, 1)` — the
+    /// same rule as [`MaePretrainConfig::validate`]. A NaN ratio must never
+    /// silently mask zero patches, and ratios ≤ 0 / ≥ 1 degenerate to
+    /// all-visible / all-masked grids.
+    ///
+    /// [`MaePretrainConfig::validate`]: crate::mae::MaePretrainConfig::validate
+    #[error("Invalid mask ratio {ratio}: must be finite and strictly inside (0, 1)")]
+    InvalidMaskRatio {
+        /// The offending ratio.
+        ratio: f64,
+    },
+
+    /// A NaN or ±inf CSI value was found; corrupted input must be cleaned
+    /// upstream, never masked over.
+    #[error("Non-finite CSI value {value} at (t={row}, sc={col})")]
+    NonFiniteValue {
+        /// Time index of the offending value.
+        row: usize,
+        /// Subcarrier index of the offending value.
+        col: usize,
+        /// The non-finite value itself.
+        value: f32,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolError
+// ---------------------------------------------------------------------------
+
+/// Errors produced by the public-benchmark split protocols and leakage guards
+/// ([`crate::protocols`], ADR-291).
+///
+/// Every leakage-audit failure is an `Err`, never a warning: a split that
+/// leaks subjects, environments, or windows of a continuous recording across
+/// the train/test boundary must not be usable for reporting.
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    /// The requested held-out fraction is not a finite value strictly inside
+    /// `(0, 1)`.
+    #[error("Invalid test fraction {value}: must be finite and strictly inside (0, 1)")]
+    InvalidTestFraction {
+        /// The offending fraction.
+        value: f64,
+    },
+
+    /// A split side contains no samples — a degenerate split cannot support
+    /// any claim.
+    #[error("The {side} partition is empty")]
+    EmptyPartition {
+        /// Which side is empty (`"train"` or `"test"`).
+        side: &'static str,
+    },
+
+    /// A subject appears on both sides of a split that claims
+    /// subject-disjointness.
+    #[error("Subject {subject_id} appears in both train and test (subject leakage)")]
+    SubjectOverlap {
+        /// The leaked subject id.
+        subject_id: u32,
+    },
+
+    /// An environment/room appears on both sides of a split that claims
+    /// environment-disjointness.
+    #[error("Environment {environment_id} appears in both train and test (environment leakage)")]
+    EnvironmentOverlap {
+        /// The leaked environment id.
+        environment_id: u32,
+    },
+
+    /// An orientation appears on both sides of a split that claims
+    /// orientation-disjointness.
+    #[error("Orientation {orientation_id} appears in both train and test (orientation leakage)")]
+    OrientationOverlap {
+        /// The leaked orientation id.
+        orientation_id: u32,
+    },
+
+    /// Two windows cut from the same continuous recording ended up on
+    /// opposite sides of the split. Overlapping/adjacent windows are
+    /// near-identical, so this is window-level leakage regardless of the
+    /// protocol (the 2024–2025 leakage reckoning; ADR-291 §Context).
+    #[error(
+        "Recording {recording_id} has windows on both sides of the split \
+         (window-level leakage from a continuous recording)"
+    )]
+    RecordingCrossesSplit {
+        /// The recording whose windows straddle the boundary.
+        recording_id: u64,
+    },
+
+    /// The mean-pose baseline cannot be fitted because the training split
+    /// contributed no poses.
+    #[error("Cannot fit mean-pose baseline: the training split contains no poses")]
+    EmptyTrainingPoses,
+
+    /// A pose array has a different shape from the first pose seen.
+    #[error("Pose shape mismatch: expected {expected:?}, got {actual:?}")]
+    PoseShapeMismatch {
+        /// Shape established by the first pose.
+        expected: Vec<usize>,
+        /// Offending shape.
+        actual: Vec<usize>,
+    },
+
+    /// A `MEASURED` evidence grade was requested without a reproducer
+    /// command. CLAUDE.md: accuracy statements tagged `MEASURED` require a
+    /// reproducer; anything else must be `SYNTHETIC` or `CLAIMED`.
+    #[error("MEASURED evidence requires a non-empty reproducer command string")]
+    MissingReproducer,
+
+    /// A reported metric is NaN or ±inf.
+    #[error("Metric `{name}` is not finite: {value}")]
+    NonFiniteMetric {
+        /// Name of the offending metric.
+        name: String,
+        /// The non-finite value.
+        value: f64,
+    },
 }

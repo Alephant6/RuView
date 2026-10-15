@@ -10,6 +10,25 @@ import { wsService } from './services/websocket.service.js';
 import { healthService } from './services/health.service.js';
 import { sensingService } from './services/sensing.service.js';
 import { backendDetector } from './utils/backend-detector.js';
+import { KeyboardShortcuts } from './utils/keyboard-shortcuts.js';
+import { PerfMonitor } from './utils/perf-monitor.js';
+import { toastManager } from './utils/toast.js';
+import { ThemeToggle } from './utils/theme-toggle.js';
+import { CommandPalette } from './utils/command-palette.js';
+import { ActivityLog } from './utils/activity-log.js';
+import { DataExport } from './utils/data-export.js';
+import { FullscreenManager } from './utils/fullscreen.js';
+import { ConnectionStatus } from './utils/connection-status.js';
+import { MobileNav } from './utils/mobile-nav.js';
+import { Router } from './utils/router.js';
+import { Onboarding } from './utils/onboarding.js';
+import { IdleManager } from './utils/idle-manager.js';
+import { NotificationCenter } from './utils/notification-center.js';
+import { i18n } from './utils/i18n.js';
+import { ScreenshotTool } from './utils/screenshot.js';
+import { UptimeClock } from './utils/uptime-clock.js';
+import { QuickSettings } from './utils/quick-settings.js';
+import { dataSourceBanner } from './utils/data-source-banner.js';
 
 class WiFiDensePoseApp {
   constructor() {
@@ -30,10 +49,13 @@ class WiFiDensePoseApp {
       
       // Initialize UI components
       this.initializeComponents();
-      
+
+      // Initialize enhancements
+      this.initializeEnhancements();
+
       // Set up global event listeners
       this.setupEventListeners();
-      
+
       this.isInitialized = true;
       console.log('WiFi DensePose UI initialized successfully');
       
@@ -76,6 +98,10 @@ class WiFiDensePoseApp {
         console.warn('⚠️ Backend not available:', error.message);
         this.showBackendStatus('Backend unavailable — start sensing-server', 'warning');
       }
+
+      // Mount the global provenance bar before the service starts, so the very
+      // first non-live state is visible on whichever tab is showing.
+      dataSourceBanner.init();
 
       // Start the sensing WebSocket service early so the dashboard and
       // live-demo tabs can show the correct data-source status immediately.
@@ -167,6 +193,118 @@ class WiFiDensePoseApp {
     }
   }
 
+  // Initialize enhancement modules
+  initializeEnhancements() {
+    // Toast notifications
+    toastManager.init();
+
+    // Connection status widget in header
+    this.connectionStatus = new ConnectionStatus();
+    this.connectionStatus.init();
+
+    // Theme toggle
+    this.themeToggle = new ThemeToggle();
+    this.themeToggle.init();
+
+    // Performance monitor
+    this.perfMonitor = new PerfMonitor();
+    this.perfMonitor.init();
+
+    // Activity log
+    this.activityLog = new ActivityLog();
+    this.activityLog.init();
+
+    // Data export
+    this.dataExport = new DataExport();
+    this.dataExport.init();
+
+    // Fullscreen manager
+    this.fullscreenManager = new FullscreenManager();
+    this.fullscreenManager.init();
+
+    // Command palette (Ctrl+K)
+    this.commandPalette = new CommandPalette(this);
+    this.commandPalette.init();
+
+    // Mobile navigation (hamburger menu for small screens)
+    this.mobileNav = new MobileNav();
+    this.mobileNav.init();
+
+    // Notification center (bell icon in header)
+    this.notificationCenter = new NotificationCenter();
+    this.notificationCenter.init();
+
+    // Screenshot tool
+    this.screenshotTool = new ScreenshotTool();
+    this.screenshotTool.init();
+
+    // Uptime clock
+    this.uptimeClock = new UptimeClock();
+    this.uptimeClock.init();
+
+    // Quick settings panel
+    this.quickSettings = new QuickSettings(this);
+    this.quickSettings.init();
+
+    // Internationalization (EN/PL)
+    i18n.init();
+
+    // Keyboard shortcuts (pass app reference for tab switching)
+    this.keyboardShortcuts = new KeyboardShortcuts(this);
+    this.keyboardShortcuts.register('l', 'Toggle activity log', () => {
+      document.dispatchEvent(new CustomEvent('toggle-activity-log'));
+    });
+    this.keyboardShortcuts.register('e', 'Export sensor data', () => {
+      document.dispatchEvent(new CustomEvent('export-data'));
+    });
+    this.keyboardShortcuts.register('f', 'Toggle fullscreen', () => {
+      document.dispatchEvent(new CustomEvent('toggle-fullscreen'));
+    });
+    this.keyboardShortcuts.register('s', 'Take screenshot', () => {
+      document.dispatchEvent(new CustomEvent('take-screenshot'));
+    });
+    this.keyboardShortcuts.init();
+
+    // Listen for show-shortcuts from command palette
+    document.addEventListener('show-shortcuts', () => {
+      this.keyboardShortcuts.showHelp();
+    });
+
+    // Register PWA service worker
+    this.registerServiceWorker();
+
+    // URL hash router (bookmarkable tabs)
+    this.router = new Router(this);
+    this.router.init();
+
+    // Idle detection (pause updates when inactive)
+    this.idleManager = new IdleManager();
+    this.idleManager.onIdle(() => {
+      healthService.stopHealthMonitoring();
+      console.info('[App] Paused health monitoring (idle)');
+    });
+    this.idleManager.onActive(() => {
+      healthService.startHealthMonitoring();
+      console.info('[App] Resumed health monitoring (active)');
+    });
+    this.idleManager.init();
+
+    // Onboarding tour (first-run walkthrough)
+    this.onboarding = new Onboarding(this);
+    this.onboarding.init();
+  }
+
+  // Register service worker for offline capability
+  registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js').then(reg => {
+        console.info('Service worker registered:', reg.scope);
+      }).catch(err => {
+        console.warn('Service worker registration failed:', err);
+      });
+    }
+  }
+
   // Handle tab changes
   handleTabChange(newTab, oldTab) {
     console.log(`Tab changed from ${oldTab} to ${newTab}`);
@@ -227,6 +365,22 @@ class WiFiDensePoseApp {
     window.addEventListener('beforeunload', () => {
       this.cleanup();
     });
+
+    // `beforeunload` above tears down every component and disconnects the
+    // sensing WebSocket. If the browser restores this page from bfcache on
+    // Back/Forward instead of doing a fresh navigation, that torn-down state
+    // comes back frozen exactly as-is — nothing re-runs DOMContentLoaded, so
+    // sensingService.start() never fires again and disposed components (e.g.
+    // Room Builder) never get recreated. `pageshow`'s `event.persisted` is
+    // the standard signal for "this is a bfcache restore, not a fresh load";
+    // forcing a real reload here is simpler and more robust than trying to
+    // hand-reinitialize every component/connection back to a clean state.
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted) {
+        console.log('Page restored from bfcache after cleanup() — forcing reload');
+        window.location.reload();
+      }
+    });
   }
 
   // Handle window resize
@@ -272,45 +426,17 @@ class WiFiDensePoseApp {
     });
   }
 
-  // Show backend status notification
+  // Show backend status notification (uses enhanced toast system)
   showBackendStatus(message, type) {
-    // Create status notification if it doesn't exist
-    let statusToast = document.getElementById('backendStatusToast');
-    if (!statusToast) {
-      statusToast = document.createElement('div');
-      statusToast.id = 'backendStatusToast';
-      statusToast.className = 'backend-status-toast';
-      document.body.appendChild(statusToast);
-    }
-
-    statusToast.textContent = message;
-    statusToast.className = `backend-status-toast ${type}`;
-    statusToast.classList.add('show');
-
-    // Auto-hide success messages, keep warnings and errors longer
-    const timeout = type === 'success' ? 3000 : 8000;
-    setTimeout(() => {
-      statusToast.classList.remove('show');
-    }, timeout);
+    const toastType = type === 'success' ? 'success' : 'warning';
+    toastManager[toastType](message, {
+      duration: type === 'success' ? 3000 : 8000
+    });
   }
 
-  // Show global error message
+  // Show global error message (uses enhanced toast system)
   showGlobalError(message) {
-    // Create error toast if it doesn't exist
-    let errorToast = document.getElementById('globalErrorToast');
-    if (!errorToast) {
-      errorToast = document.createElement('div');
-      errorToast.id = 'globalErrorToast';
-      errorToast.className = 'error-toast';
-      document.body.appendChild(errorToast);
-    }
-
-    errorToast.textContent = message;
-    errorToast.classList.add('show');
-
-    setTimeout(() => {
-      errorToast.classList.remove('show');
-    }, 5000);
+    toastManager.error(message, { duration: 6000 });
   }
 
   // Clean up resources
@@ -326,9 +452,29 @@ class WiFiDensePoseApp {
 
     // Disconnect all WebSocket connections
     wsService.disconnectAll();
-    
+
     // Stop health monitoring
     healthService.dispose();
+
+    // Dispose enhancements
+    if (this.keyboardShortcuts) this.keyboardShortcuts.dispose();
+    if (this.perfMonitor) this.perfMonitor.dispose();
+    if (this.themeToggle) this.themeToggle.dispose();
+    if (this.commandPalette) this.commandPalette.dispose();
+    if (this.activityLog) this.activityLog.dispose();
+    if (this.dataExport) this.dataExport.dispose();
+    if (this.fullscreenManager) this.fullscreenManager.dispose();
+    if (this.connectionStatus) this.connectionStatus.dispose();
+    if (this.mobileNav) this.mobileNav.dispose();
+    if (this.router) this.router.dispose();
+    if (this.onboarding) this.onboarding.dispose();
+    if (this.idleManager) this.idleManager.dispose();
+    if (this.notificationCenter) this.notificationCenter.dispose();
+    if (this.screenshotTool) this.screenshotTool.dispose();
+    if (this.uptimeClock) this.uptimeClock.dispose();
+    if (this.quickSettings) this.quickSettings.dispose();
+    i18n.dispose();
+    toastManager.dispose();
   }
 
   // Public API

@@ -7,6 +7,7 @@ on:
       - 'archive/v1/src/core/**'
       - 'archive/v1/src/hardware/**'
       - 'archive/v1/data/proof/**'
+      - 'archive/v1/requirements-lock.txt'
       - '.github/workflows/verify-pipeline.yml'
   pull_request:
     branches: [ main, master ]
@@ -14,6 +15,7 @@ on:
       - 'archive/v1/src/core/**'
       - 'archive/v1/src/hardware/**'
       - 'archive/v1/data/proof/**'
+      - 'archive/v1/requirements-lock.txt'
       - '.github/workflows/verify-pipeline.yml'
   workflow_dispatch:
 
@@ -27,10 +29,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -57,7 +61,18 @@ jobs:
           "
 
       - name: Run pipeline verification
-        working-directory: v1
+        working-directory: archive/v1
+        env:
+          # Pin thread count for scipy.fft / BLAS — multi-threaded reduction
+          # order is otherwise non-deterministic across CI runs (issue #560
+          # follow-up: 9- and 6-decimal quantization were not enough because
+          # the divergence is from threading order, not SIMD reordering).
+          # Single-threaded keeps the proof reproducible at a ~2-3x slowdown.
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          VECLIB_MAXIMUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
         run: |
           echo "=== Running pipeline verification ==="
           python data/proof/verify.py
@@ -65,7 +80,13 @@ jobs:
           echo "Pipeline verification PASSED."
 
       - name: Run verification twice to confirm determinism
-        working-directory: v1
+        working-directory: archive/v1
+        env:
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          VECLIB_MAXIMUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
         run: |
           echo "=== Second run for determinism confirmation ==="
           python data/proof/verify.py

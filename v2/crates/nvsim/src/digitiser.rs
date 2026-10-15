@@ -39,7 +39,20 @@ pub const DEFAULT_SAMPLE_RATE_HZ: f64 = 10_000.0;
 pub const DEFAULT_F_MOD_HZ: f64 = 1_000.0;
 
 /// Quantise one input sample (T) to a signed ADC code. Returns `(code, saturated)`.
+///
+/// A **non-finite** input (`NaN` / `±Inf`) is treated as an out-of-range
+/// condition: it clamps to code `0` and raises the saturation flag. This is
+/// the funnel point that stops the NaN-state-poisoning class — a non-finite
+/// physical field (e.g. produced by a degenerate scene with a NaN dipole
+/// position) would otherwise coerce silently to code `0` *with the saturation
+/// flag clear*, yielding a frame indistinguishable from a legitimate
+/// zero-field reading. Flagging it preserves the "every frame is honest about
+/// its own validity" contract the proof bundle relies on.
 pub fn adc_quantise(b_in_t: f64) -> (i32, bool) {
+    if !b_in_t.is_finite() {
+        // Non-finite => not representable on the ±FS scale; mark saturated.
+        return (0, true);
+    }
     let code_f = (b_in_t / ADC_LSB_T).round();
     let max_code = (1_i32 << (ADC_BITS - 1)) - 1; // 32_767 for 16-bit signed
     let min_code = -max_code; // symmetric
@@ -154,6 +167,23 @@ mod tests {
     }
 
     #[test]
+    fn adc_quantise_flags_non_finite_as_saturated() {
+        // Security pinning (NaN-state-poisoning guard): a non-finite field
+        // value must clamp to code 0 AND raise the saturation flag, so the
+        // pipeline can flag the frame rather than emitting it as a silent,
+        // indistinguishable zero-field reading. Pre-fix this returned
+        // (0, false) for NaN — a silent corruption.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (code, sat) = adc_quantise(bad);
+            assert_eq!(code, 0, "non-finite input {bad} must clamp to code 0");
+            assert!(sat, "non-finite input {bad} must raise the saturation flag");
+        }
+        // A finite in-range value is unaffected (no false positives).
+        let (_, sat) = adc_quantise(1.0e-7);
+        assert!(!sat, "a finite in-range value must NOT be flagged saturated");
+    }
+
+    #[test]
     fn adc_saturates_above_full_scale() {
         let (code_pos, sat_pos) = adc_quantise(20.0e-6);
         let (code_neg, sat_neg) = adc_quantise(-20.0e-6);
@@ -238,9 +268,6 @@ mod tests {
             let x = (2.0 * std::f64::consts::PI * f_off * t).cos();
             last = lockin.process(x);
         }
-        assert!(
-            last.abs() < 0.1,
-            "off-resonance output {last} should be ~0"
-        );
+        assert!(last.abs() < 0.1, "off-resonance output {last} should be ~0");
     }
 }

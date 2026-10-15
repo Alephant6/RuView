@@ -20,9 +20,30 @@ COPY v2/crates/ ./crates/
 # Copy vendored RuVector crates
 COPY vendor/ruvector/ /build/vendor/ruvector/
 
-# Build release binary
-RUN cargo build --release -p wifi-densepose-sensing-server 2>&1 \
-    && strip target/release/sensing-server
+# Copy vendored RuField submodule — the `wifi-densepose-rufield` bridge crate
+# (ADR-262) path-deps `../../../vendor/rufield/crates/*`, which from the Docker
+# build layout (v2/ collapsed into /build) resolves to /vendor/rufield. Copy the
+# whole tree so the rufield workspace Cargo.toml (workspace-dep inheritance) and
+# the four bridged crates (rufield-core/-provenance/-privacy/-fusion) all resolve.
+COPY vendor/rufield/ /vendor/rufield/
+
+# Build release binaries:
+#   - sensing-server with `mqtt` feature so the HA-DISCO MQTT publisher
+#     (ADR-115) is wired in (auto-discovery topics flow to Home Assistant)
+#   - cog-ha-matter, the ADR-116 Cognitum cog that wraps HA-DISCO +
+#     HA-MIND + mDNS + embedded broker for Home Assistant / Matter
+#   - homecore-server, the ADRs-126-134 HOMECORE native Rust port of
+#     Home Assistant (HA-wire-compat REST + WebSocket on :8123,
+#     SQLite + ruvector recorder, automation, assist, plugins, HAP)
+#
+# SENSING_FEATURES lets a compose file extend the sensing-server feature
+# set (docker/otel-compose.yml builds with `mqtt,otel` for OTLP log
+# export) without forking this Dockerfile.
+ARG SENSING_FEATURES=mqtt
+RUN cargo build --release -p wifi-densepose-sensing-server --features "${SENSING_FEATURES}" 2>&1 \
+ && cargo build --release -p cog-ha-matter 2>&1 \
+ && cargo build --release -p homecore-server 2>&1 \
+ && strip target/release/sensing-server target/release/cog-ha-matter target/release/homecore-server
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -33,8 +54,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy binary
+# Copy binaries
 COPY --from=builder /build/target/release/sensing-server /app/sensing-server
+COPY --from=builder /build/target/release/cog-ha-matter /app/cog-ha-matter
+COPY --from=builder /build/target/release/homecore-server /app/homecore-server
 
 # Copy UI assets
 COPY ui/ /app/ui/
@@ -51,19 +74,23 @@ RUN set -e; \
         test -d "$d" || { echo "FATAL: missing UI directory $d"; exit 1; }; \
     done; \
     test -x /app/sensing-server || { echo "FATAL: /app/sensing-server is not executable"; exit 1; }; \
+    test -x /app/cog-ha-matter || { echo "FATAL: /app/cog-ha-matter is not executable"; exit 1; }; \
+    test -x /app/homecore-server || { echo "FATAL: /app/homecore-server is not executable"; exit 1; }; \
     echo "image assets OK"
 
 # Optional bearer-token auth on /api/v1/*: leave unset for LAN-mode (default),
 # set to enforce `Authorization: Bearer <token>` (see bearer_auth module, #443).
 #   docker run -e RUVIEW_API_TOKEN=$(openssl rand -hex 32) ...
-ENV RUVIEW_API_TOKEN=
-
 # HTTP API
 EXPOSE 3000
 # WebSocket
 EXPOSE 3001
 # ESP32 UDP
 EXPOSE 5005/udp
+# MQTT broker (cog-ha-matter embedded broker — Home Assistant + Matter)
+EXPOSE 1883
+# HOMECORE HA-compatible REST + WebSocket (homecore-server)
+EXPOSE 8123
 
 ENV RUST_LOG=info
 

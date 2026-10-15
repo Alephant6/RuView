@@ -20,6 +20,11 @@
 #   FUZZ_JOBS=4               # Parallel fuzzing jobs
 
 CC       = clang
+# ADR-110: -DCONFIG_CSI_FRAME_HE_TAGGING=1 enables the byte-18/19 HE path
+# in csi_collector.c so the fuzzer exercises that code as well as the
+# legacy zero-fill path. CONFIG_SOC_WIFI_HE_SUPPORT is left UNSET to
+# exercise the legacy S3 branch (sig_mode/cwb/stbc). Add it to CFLAGS for
+# a parallel HE-stub build if you want fuzz coverage of the C6 branch.
 CFLAGS   = -fsanitize=fuzzer,address,undefined -g -O1 \
            -Istubs -I../main \
            -DCONFIG_CSI_NODE_ID=1 \
@@ -28,18 +33,128 @@ CFLAGS   = -fsanitize=fuzzer,address,undefined -g -O1 \
            -DCONFIG_CSI_TARGET_IP=\"192.168.1.1\" \
            -DCONFIG_CSI_TARGET_PORT=5500 \
            -DCONFIG_ESP_WIFI_CSI_ENABLED=1 \
+           -DCONFIG_CSI_FRAME_HE_TAGGING=1 \
            -Wno-unused-function
 
 STUBS_SRC = stubs/esp_stubs.c
 MAIN_DIR  = ../main
 
+# GNU ld and Apple's ld spell dead section elimination differently.
+# Keep the host sanitation test portable across the Linux CI runner and macOS.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+DEAD_STRIP_LDFLAGS := -Wl,-dead_strip
+else
+DEAD_STRIP_LDFLAGS := -Wl,--gc-sections
+endif
+
 # Default fuzz duration (seconds) and jobs
 FUZZ_DURATION ?= 30
 FUZZ_JOBS     ?= 1
 
-.PHONY: all clean run_serialize run_edge run_nvs run_all
+.PHONY: all clean run_serialize run_edge run_nvs run_all test_adr110 run_adr110 \
+        test_vitals run_vitals test_mmwave_detect run_mmwave_detect host_tests \
+        test_thermal run_thermal test_csi_sanitize run_csi_sanitize \
+        test_c6_antenna run_c6_antenna test_serial_onboarding run_serial_onboarding \
+        run_delivery_contract test_ota_health run_ota_health run_onboarding_identity
 
-all: fuzz_serialize fuzz_edge fuzz_nvs
+all: fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_vitals test_mmwave_detect \
+     test_thermal test_csi_sanitize test_c6_antenna test_serial_onboarding \
+     test_ota_health
+
+# --- XIAO ESP32-C6 RF switch selection ---
+# Host-side truth table for the GPIO14 antenna selector. GPIO3 is always driven
+# low by the device implementation before this level is applied.
+test_c6_antenna: test_c6_antenna_select.c $(MAIN_DIR)/c6_antenna_select.h
+	cc -std=c99 -Wall -Wextra -I$(MAIN_DIR) -o $@ $<
+
+run_c6_antenna: test_c6_antenna
+	./test_c6_antenna
+
+# --- ESP-IDF invalid first-word sanitation ---
+# Links the production serializer. Function sections and dead stripping keep
+# unrelated device-only callback code out of this host executable.
+test_csi_sanitize: test_csi_sanitize.c $(MAIN_DIR)/csi_collector.c $(STUBS_SRC)
+	cc -std=c99 -Wall -Wextra -Istubs -I$(MAIN_DIR) -ffunction-sections \
+		$^ $(DEAD_STRIP_LDFLAGS) -o $@ -lm
+
+run_csi_sanitize: test_csi_sanitize
+	./test_csi_sanitize
+
+# --- ADR-110 encoding unit tests ---
+# Host-side, no libFuzzer needed — plain C99 deterministic table tests
+# for mac_to_eui64() and PPDU-type → ADR-018 byte 18 mapping.
+# Builds with stock cc/gcc/clang — runs in CI on Ubuntu.
+test_adr110: test_adr110_encoding.c
+	cc -std=c99 -Wall -Wextra -o $@ $<
+
+run_adr110: test_adr110
+	./test_adr110
+
+# --- Vitals count + presence logic unit tests (issue #998 / #996) ---
+# Host-side, no libFuzzer. Pins the person-count gate (no over-count for one
+# body) and the presence hysteresis (no flicker on a dithering score). Pulls
+# the named tuning constants from ../main/edge_processing.h so the test and the
+# firmware can never disagree on thresholds.
+test_vitals: test_vitals_count_presence.c $(MAIN_DIR)/edge_processing.h
+	cc -std=c99 -Wall -Wextra -Istubs -I$(MAIN_DIR) -o $@ $< -lm
+
+run_vitals: test_vitals
+	./test_vitals
+
+# --- mmWave LD2410 detection predicate (#1135 bug #2) ---
+# Host-side, no libFuzzer. Proves a floating-UART head pattern (0xF4F3F2F1)
+# without a valid frame length+tail is REJECTED, so a phantom LD2410 is never
+# detected on a node with no sensor wired. Tests the real predicate the
+# firmware uses (../main/mmwave_detect.h) — test and firmware can't disagree.
+test_mmwave_detect: test_mmwave_detect.c $(MAIN_DIR)/mmwave_detect.h
+	cc -std=c99 -Wall -Wextra -I$(MAIN_DIR) -o $@ $<
+
+run_mmwave_detect: test_mmwave_detect
+	./test_mmwave_detect
+
+# --- Thermal state hysteresis ---
+# Host-side. Exercises thermal_next_state() from ../main/thermal.h directly --
+# the same function the device build runs -- so the test and the firmware cannot
+# drift. Pins every edge in both directions, including the CRITICAL -> THROTTLED
+# flap that had no hysteresis at all.
+test_thermal: test_thermal_hysteresis.c $(MAIN_DIR)/thermal.h
+	cc -std=c99 -Wall -Wextra -Istubs -I$(MAIN_DIR) -o $@ $<
+
+run_thermal: test_thermal
+	./test_thermal
+
+# --- Native Mac USB onboarding protocol ---
+# Tests the production parser and secret validation without ESP-IDF. This pins
+# nonce shape, IPv4 and node bounds, base64 handling, and control-byte denial.
+test_serial_onboarding: test_serial_onboarding_protocol.c $(MAIN_DIR)/serial_onboarding_protocol.c $(MAIN_DIR)/serial_onboarding_protocol.h
+	cc -std=c11 -Wall -Wextra -Werror -pedantic -I$(MAIN_DIR) -o $@ \
+		test_serial_onboarding_protocol.c $(MAIN_DIR)/serial_onboarding_protocol.c
+
+run_serial_onboarding: test_serial_onboarding
+	./test_serial_onboarding
+
+test_onboarding_identity: test_onboarding_identity.c $(MAIN_DIR)/onboarding_identity.h identity_stubs/esp_mac.h identity_stubs/psa/crypto.h
+	cc -std=c11 -Wall -Wextra -Werror -pedantic -Iidentity_stubs -I$(MAIN_DIR) -o $@ $<
+
+run_onboarding_identity: test_onboarding_identity
+	./test_onboarding_identity
+
+# --- OTA first-boot health check (ADR-379) ---
+# Host-side. Exercises ota_health_step() from ../main/ota_health.h directly --
+# the decision the device runs to confirm or roll back an OTA'd image.
+test_ota_health: test_ota_health.c $(MAIN_DIR)/ota_health.h
+	cc -std=c99 -Wall -Wextra -Werror -I$(MAIN_DIR) -o $@ $<
+
+run_ota_health: test_ota_health
+	./test_ota_health
+
+run_delivery_contract:
+	python3 test_delivery_contract.py
+
+host_tests: run_adr110 run_vitals run_mmwave_detect run_thermal run_csi_sanitize \
+            run_c6_antenna run_serial_onboarding run_onboarding_identity run_delivery_contract run_ota_health
+	@echo "Host tests passed (ADR-110 + CSI sanitation + vitals + mmwave + thermal + C6 antenna + USB onboarding + delivery contract + OTA health)"
 
 # --- Serialize fuzzer ---
 # Tests csi_serialize_frame() with random wifi_csi_info_t inputs.
@@ -75,5 +190,7 @@ run_nvs: fuzz_nvs
 run_all: run_serialize run_edge run_nvs
 
 clean:
-	rm -f fuzz_serialize fuzz_edge fuzz_nvs
+	rm -f fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_vitals test_mmwave_detect \
+		test_thermal test_csi_sanitize test_c6_antenna test_serial_onboarding \
+		test_ota_health test_onboarding_identity
 	rm -rf corpus_serialize/ corpus_edge/ corpus_nvs/

@@ -18,11 +18,43 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Login(args) => {
+            wifi_densepose_cli::auth::login_cmd(args).await?;
+        }
+        Commands::Logout(args) => {
+            wifi_densepose_cli::auth::logout_cmd(args).await?;
+        }
+        Commands::Whoami(args) => {
+            wifi_densepose_cli::auth::whoami_cmd(args).await?;
+        }
+        Commands::Spaces(args) => {
+            wifi_densepose_cli::spaces::spaces_cmd(args).await?;
+        }
+        Commands::Calibrate(args) => {
+            wifi_densepose_cli::calibrate::execute(args).await?;
+        }
+        Commands::CalibrateServe(args) => {
+            wifi_densepose_cli::calibrate_api::execute(args).await?;
+        }
+        Commands::Enroll(args) => {
+            wifi_densepose_cli::room::enroll(args).await?;
+        }
+        Commands::TrainRoom(args) => {
+            wifi_densepose_cli::room::train_room(args).await?;
+        }
+        Commands::RoomStatus(args) => {
+            wifi_densepose_cli::room::room_status(args).await?;
+        }
+        Commands::RoomWatch(args) => {
+            wifi_densepose_cli::room::room_watch(args).await?;
+        }
+        #[cfg(feature = "mat")]
         Commands::Mat(mat_cmd) => {
             wifi_densepose_cli::mat::execute(mat_cmd).await?;
         }
         Commands::Version => {
             println!("wifi-densepose {}", env!("CARGO_PKG_VERSION"));
+            #[cfg(feature = "mat")]
             println!("MAT module version: {}", wifi_densepose_mat::VERSION);
         }
     }

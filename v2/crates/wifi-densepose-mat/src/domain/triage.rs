@@ -3,7 +3,7 @@
 //! The START (Simple Triage and Rapid Treatment) protocol is used to
 //! quickly categorize victims in mass casualty incidents.
 
-use super::{VitalSignsReading, BreathingType, MovementType};
+use super::{BreathingType, MovementType, VitalSignsReading};
 
 /// Triage status following START protocol
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -104,7 +104,20 @@ impl TriageCalculator {
         let movement_status = Self::assess_movement(vitals);
 
         // Step 4: Combine assessments
-        Self::combine_assessments(breathing_status, movement_status)
+        let status = Self::combine_assessments(breathing_status, movement_status);
+
+        // Step 5: SAFETY OVERRIDE — a detectable heartbeat means the survivor is
+        // ALIVE. `combine_assessments` only sees breathing + movement, so a
+        // person with a pulse but no *sensed* breathing/movement (respiratory
+        // arrest, or breathing too shallow for CSI to pick up) would otherwise
+        // be reported Deceased and deprioritized for rescue. No breathing + a
+        // pulse is the most time-critical *savable* state, so escalate to
+        // Immediate rather than ever calling a survivor with a heartbeat dead.
+        if status == TriageStatus::Deceased && vitals.heartbeat.is_some() {
+            return TriageStatus::Immediate;
+        }
+
+        status
     }
 
     /// Assess breathing status
@@ -132,9 +145,7 @@ impl TriageCalculator {
     /// Assess movement/responsiveness
     fn assess_movement(vitals: &VitalSignsReading) -> MovementAssessment {
         match vitals.movement.movement_type {
-            MovementType::Gross if vitals.movement.is_voluntary => {
-                MovementAssessment::Responsive
-            }
+            MovementType::Gross if vitals.movement.is_voluntary => MovementAssessment::Responsive,
             MovementType::Gross => MovementAssessment::Moving,
             MovementType::Fine => MovementAssessment::MinimalMovement,
             MovementType::Tremor => MovementAssessment::InvoluntaryOnly,
@@ -150,32 +161,20 @@ impl TriageCalculator {
     ) -> TriageStatus {
         match (breathing, movement) {
             // No breathing
-            (BreathingAssessment::Absent, MovementAssessment::None) => {
-                TriageStatus::Deceased
-            }
-            (BreathingAssessment::Agonal, _) => {
-                TriageStatus::Immediate
-            }
+            (BreathingAssessment::Absent, MovementAssessment::None) => TriageStatus::Deceased,
+            (BreathingAssessment::Agonal, _) => TriageStatus::Immediate,
             (BreathingAssessment::Absent, _) => {
                 // No breathing but movement - possible airway obstruction
                 TriageStatus::Immediate
             }
 
             // Abnormal breathing rates
-            (BreathingAssessment::TooFast, _) => {
-                TriageStatus::Immediate
-            }
-            (BreathingAssessment::TooSlow, _) => {
-                TriageStatus::Immediate
-            }
+            (BreathingAssessment::TooFast, _) => TriageStatus::Immediate,
+            (BreathingAssessment::TooSlow, _) => TriageStatus::Immediate,
 
             // Normal breathing with movement assessment
-            (BreathingAssessment::Normal, MovementAssessment::Responsive) => {
-                TriageStatus::Minor
-            }
-            (BreathingAssessment::Normal, MovementAssessment::Moving) => {
-                TriageStatus::Delayed
-            }
+            (BreathingAssessment::Normal, MovementAssessment::Responsive) => TriageStatus::Minor,
+            (BreathingAssessment::Normal, MovementAssessment::Moving) => TriageStatus::Delayed,
             (BreathingAssessment::Normal, MovementAssessment::MinimalMovement) => {
                 TriageStatus::Delayed
             }
@@ -231,7 +230,9 @@ enum MovementAssessment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{BreathingPattern, ConfidenceScore, MovementProfile};
+    use crate::domain::{
+        BreathingPattern, ConfidenceScore, HeartbeatSignature, MovementProfile, SignalStrength,
+    };
     use chrono::Utc;
 
     fn create_vitals(
@@ -245,6 +246,29 @@ mod tests {
             timestamp: Utc::now(),
             confidence: ConfidenceScore::new(0.8),
         }
+    }
+
+    /// SAFETY regression: a survivor with a detectable heartbeat but no sensed
+    /// breathing or movement is in respiratory arrest — Immediate (Red), and
+    /// must NEVER be reported Deceased. (Before the fix, `combine_assessments`
+    /// ignored heartbeat and returned Deceased; that path was in fact only
+    /// reachable *because* a heartbeat made `has_vitals()` true.)
+    #[test]
+    fn heartbeat_with_no_breathing_or_movement_is_immediate_not_deceased() {
+        let vitals = VitalSignsReading {
+            breathing: None,
+            heartbeat: Some(HeartbeatSignature {
+                rate_bpm: 72.0,
+                variability: 0.1,
+                strength: SignalStrength::Moderate,
+            }),
+            movement: MovementProfile::default(),
+            timestamp: Utc::now(),
+            confidence: ConfidenceScore::new(0.8),
+        };
+        let status = TriageCalculator::calculate(&vitals);
+        assert_eq!(status, TriageStatus::Immediate, "pulse present ⇒ alive");
+        assert_ne!(status, TriageStatus::Deceased);
     }
 
     #[test]
@@ -288,7 +312,10 @@ mod tests {
                 is_voluntary: false,
             },
         );
-        assert_eq!(TriageCalculator::calculate(&vitals), TriageStatus::Immediate);
+        assert_eq!(
+            TriageCalculator::calculate(&vitals),
+            TriageStatus::Immediate
+        );
     }
 
     #[test]
@@ -307,7 +334,10 @@ mod tests {
                 is_voluntary: false,
             },
         );
-        assert_eq!(TriageCalculator::calculate(&vitals), TriageStatus::Immediate);
+        assert_eq!(
+            TriageCalculator::calculate(&vitals),
+            TriageStatus::Immediate
+        );
     }
 
     #[test]
@@ -321,7 +351,10 @@ mod tests {
             }),
             MovementProfile::default(),
         );
-        assert_eq!(TriageCalculator::calculate(&vitals), TriageStatus::Immediate);
+        assert_eq!(
+            TriageCalculator::calculate(&vitals),
+            TriageStatus::Immediate
+        );
     }
 
     #[test]

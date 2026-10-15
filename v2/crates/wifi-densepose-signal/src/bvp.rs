@@ -15,9 +15,9 @@
 
 use ndarray::Array2;
 use num_complex::Complex64;
-use ruvector_attention::ScaledDotProductAttention;
-use ruvector_attention::traits::Attention;
 use rustfft::FftPlanner;
+use ruvector_attention::traits::Attention;
+use ruvector_attention::ScaledDotProductAttention;
 use std::f64::consts::PI;
 
 /// Configuration for BVP extraction.
@@ -84,17 +84,25 @@ pub fn extract_bvp(
         return Err(BvpError::NoSubcarriers);
     }
     if config.hop_size == 0 || config.window_size == 0 {
-        return Err(BvpError::InvalidConfig("window_size and hop_size must be > 0".into()));
+        return Err(BvpError::InvalidConfig(
+            "window_size and hop_size must be > 0".into(),
+        ));
     }
 
     let wavelength = 2.998e8 / config.carrier_frequency;
     let n_frames = (n_samples - config.window_size) / config.hop_size + 1;
     let n_fft_bins = config.window_size / 2 + 1;
 
-    // Hann window
-    let window: Vec<f64> = (0..config.window_size)
-        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f64 / (config.window_size - 1) as f64).cos()))
-        .collect();
+    // Hann window. ADR-154: `window_size == 0` is rejected above, but
+    // `window_size == 1` would divide by `(1 - 1) == 0` → NaN samples. Guard the
+    // length-1 case to the standard constant-1.0 window.
+    let window: Vec<f64> = if config.window_size == 1 {
+        vec![1.0]
+    } else {
+        (0..config.window_size)
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f64 / (config.window_size - 1) as f64).cos()))
+            .collect()
+    };
 
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(config.window_size);
@@ -206,9 +214,7 @@ pub fn attention_weighted_bvp(
             stft_rows
                 .iter()
                 .zip(sensitivity.iter())
-                .map(|(row, &s)| {
-                    row.get(v).copied().unwrap_or(0.0) * s
-                })
+                .map(|(row, &s)| row.get(v).copied().unwrap_or(0.0) * s)
                 .sum::<f32>()
                 / sens_sum
         })
@@ -217,20 +223,19 @@ pub fn attention_weighted_bvp(
     let keys: Vec<&[f32]> = stft_rows.iter().map(|r| r.as_slice()).collect();
     let values: Vec<&[f32]> = stft_rows.iter().map(|r| r.as_slice()).collect();
 
-    attn.compute(&query, &keys, &values)
-        .unwrap_or_else(|_| {
-            // Fallback: plain weighted sum
-            (0..n_velocity_bins)
-                .map(|v| {
-                    stft_rows
-                        .iter()
-                        .zip(sensitivity.iter())
-                        .map(|(row, &s)| row.get(v).copied().unwrap_or(0.0) * s)
-                        .sum::<f32>()
-                        / sens_sum
-                })
-                .collect()
-        })
+    attn.compute(&query, &keys, &values).unwrap_or_else(|_| {
+        // Fallback: plain weighted sum
+        (0..n_velocity_bins)
+            .map(|v| {
+                stft_rows
+                    .iter()
+                    .zip(sensitivity.iter())
+                    .map(|(row, &s)| row.get(v).copied().unwrap_or(0.0) * s)
+                    .sum::<f32>()
+                    / sens_sum
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -241,9 +246,7 @@ mod attn_bvp_tests {
     fn attention_bvp_output_shape() {
         let n_sc = 4_usize;
         let n_vbins = 8_usize;
-        let stft_rows: Vec<Vec<f32>> = (0..n_sc)
-            .map(|i| vec![i as f32 * 0.1; n_vbins])
-            .collect();
+        let stft_rows: Vec<Vec<f32>> = (0..n_sc).map(|i| vec![i as f32 * 0.1; n_vbins]).collect();
         let sensitivity = vec![0.9_f32, 0.1, 0.8, 0.2];
         let bvp = attention_weighted_bvp(&stft_rows, &sensitivity, n_vbins);
         assert_eq!(bvp.len(), n_vbins);
@@ -283,6 +286,24 @@ mod tests {
         let expected_frames = (1000 - 128) / 32 + 1;
         assert_eq!(bvp.n_time, expected_frames);
         assert_eq!(bvp.velocity_bins.len(), 64);
+    }
+
+    // ADR-154: window_size == 1 divided by (1-1) == 0 → NaN Hann window. The
+    // guard must produce a finite (constant-1.0) window instead.
+    #[test]
+    fn bvp_window_size_one_is_finite() {
+        let csi = Array2::from_shape_fn((64, 4), |(t, _)| (t as f64 * 0.1).sin());
+        let config = BvpConfig {
+            window_size: 1,
+            hop_size: 1,
+            n_velocity_bins: 8,
+            ..Default::default()
+        };
+        let bvp = extract_bvp(&csi, 100.0, &config).unwrap();
+        assert!(
+            bvp.data.iter().all(|v| v.is_finite()),
+            "window_size=1 must not produce NaN BVP samples"
+        );
     }
 
     #[test]
@@ -350,7 +371,10 @@ mod tests {
 
         let bvp = extract_bvp(&csi, 100.0, &config).unwrap();
         let total_energy: f64 = bvp.data.iter().sum();
-        assert!(total_energy > 0.0, "Moving body should produce Doppler energy");
+        assert!(
+            total_energy > 0.0,
+            "Moving body should produce Doppler energy"
+        );
     }
 
     #[test]

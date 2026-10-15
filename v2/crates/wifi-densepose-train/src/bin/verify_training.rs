@@ -12,9 +12,12 @@
 //!
 //! | Code | Meaning |
 //! |------|---------|
-//! | 0    | PASS — hash matches AND loss decreased |
-//! | 1    | FAIL — hash mismatch OR loss did not decrease |
-//! | 2    | SKIP — no expected hash file found; run `--generate-hash` first |
+//! | 0    | PASS — committed hash matches AND loss decreased ≥ margin |
+//! | 1    | FAIL — hash mismatch OR loss did not decrease by the margin |
+//! | 2    | SKIP — loss decreased but no committed hash to compare against |
+//!
+//! Note (ADR-155 §Tier-1.4): a sub-margin loss change is a **FAIL**, never a
+//! SKIP — a missing baseline can no longer mask a non-learning pipeline.
 //!
 //! # Usage
 //!
@@ -106,10 +109,7 @@ fn main() {
             Ok(hash) => {
                 println!("  Hash written: {hash}");
                 println!();
-                println!(
-                    "  File: {}/expected_proof.sha256",
-                    args.proof_dir.display()
-                );
+                println!("  File: {}/expected_proof.sha256", args.proof_dir.display());
                 println!();
                 println!("  Commit this file to version control, then run");
                 println!("  verify-training (without --generate-hash) to verify.");
@@ -133,7 +133,10 @@ fn main() {
     println!("  Model seed:  {}", proof::MODEL_SEED);
     println!("  Data seed:   {}", proof::PROOF_SEED);
     println!("  Batch size:  {}", proof::PROOF_BATCH_SIZE);
-    println!("  Dataset:     SyntheticCsiDataset ({} samples, deterministic)", proof::PROOF_DATASET_SIZE);
+    println!(
+        "  Dataset:     SyntheticCsiDataset ({} samples, deterministic)",
+        proof::PROOF_DATASET_SIZE
+    );
     println!("  Subcarriers: {}", cfg.num_subcarriers);
     println!("  Window len:  {}", cfg.window_frames);
     println!("  Heatmap:     {}×{}", cfg.heatmap_size, cfg.heatmap_size);
@@ -156,11 +159,31 @@ fn main() {
     println!("  Initial loss:    {:.6}", result.initial_loss);
     println!("  Final loss:      {:.6}", result.final_loss);
     println!(
-        "  Loss decreased:  {} ({:.6} → {:.6})",
+        "  Loss decreased:  {} (Δ={:.6}, need ≥ {:.0e}) ({:.6} → {:.6})",
         if result.loss_decreased { "YES" } else { "NO" },
+        result.loss_decrease,
+        proof::MIN_LOSS_DECREASE,
         result.initial_loss,
         result.final_loss
     );
+
+    // ADR-155 §Tier-1.4: a sub-margin / non-decrease is a FAIL regardless of
+    // whether an expected hash exists — it can never be silently downgraded to
+    // SKIP. Fail fast before the hash comparison.
+    if !result.loss_decreased {
+        println!();
+        println!("[VERDICT] FAIL");
+        println!("{}", "=".repeat(72));
+        println!(
+            "  REASON: loss did not decrease by the required margin \
+             (Δ={:.6} < {:.0e}).",
+            result.loss_decrease,
+            proof::MIN_LOSS_DECREASE
+        );
+        println!("  The optimiser is not measurably learning on the fixed proof problem.");
+        println!("{}", "=".repeat(72));
+        std::process::exit(1);
+    }
 
     if args.verbose {
         println!();
@@ -184,14 +207,20 @@ fn main() {
             println!("  SKIP — no expected hash file found.");
             println!();
             println!("  Run the following to generate the expected hash:");
-            println!("    verify-training --generate-hash --proof-dir {}", args.proof_dir.display());
+            println!(
+                "    verify-training --generate-hash --proof-dir {}",
+                args.proof_dir.display()
+            );
             println!("{}", "=".repeat(72));
             std::process::exit(2);
         }
         Some(expected) => {
             println!("  Expected:  {expected}");
             let matched = result.hash_matches.unwrap_or(false);
-            println!("  Status:    {}", if matched { "MATCH" } else { "MISMATCH" });
+            println!(
+                "  Status:    {}",
+                if matched { "MATCH" } else { "MISMATCH" }
+            );
             println!();
 
             // Step 4: final verdict.
@@ -208,7 +237,10 @@ fn main() {
                 println!("       Same seed → same weight trajectory → same hash.");
                 println!();
                 println!("    2. Loss DECREASED over {} steps", proof::N_PROOF_STEPS);
-                println!("       ({:.6} → {:.6})", result.initial_loss, result.final_loss);
+                println!(
+                    "       ({:.6} → {:.6})",
+                    result.initial_loss, result.final_loss
+                );
                 println!("       The model is genuinely learning signal structure.");
                 println!();
                 println!("    3. No non-determinism was introduced");

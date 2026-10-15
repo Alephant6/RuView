@@ -17,14 +17,13 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "ota_update";
 
 /** OTA HTTP server port. */
 #define OTA_PORT 8032
-
-/** Maximum firmware size (900 KB — matches CI binary size gate). */
-#define OTA_MAX_SIZE (900 * 1024)
 
 /** NVS namespace and key for the OTA pre-shared key. */
 #define OTA_NVS_NAMESPACE "security"
@@ -38,14 +37,24 @@ static char s_ota_psk[OTA_PSK_MAX_LEN] = {0};
 
 /**
  * ADR-050: Verify the Authorization header contains the correct PSK.
- * Returns true if auth is disabled (no PSK provisioned) or if the
- * Bearer token matches the stored PSK.
+ * Returns true only when a PSK is provisioned AND the Bearer token
+ * matches it. An unprovisioned node refuses all OTA requests
+ * (fail-closed, see RuView#596 audit). The OTA server still starts so
+ * the operator can `provision.py --ota-psk-file <path>` over USB without
+ * a reflash, but the upload endpoint will reject every request until
+ * the PSK is set.
  */
 static bool ota_check_auth(httpd_req_t *req)
 {
     if (s_ota_psk[0] == '\0') {
-        /* No PSK provisioned — auth disabled (permissive for dev). */
-        return true;
+        /* No PSK provisioned — fail closed. Previously this returned
+         * true ("permissive for dev"), which let any host on the WiFi
+         * push attacker-controlled firmware to a freshly-flashed node.
+         * Plain HTTP transport + no Secure Boot V2 + no signed-image
+         * verification meant a single LAN call could brick or back-
+         * door a node. Reject until provisioned. */
+        ESP_LOGW(TAG, "OTA rejected: no PSK in NVS (run provision.py --ota-psk-file <path>)");
+        return false;
     }
 
     char auth_header[128] = {0};
@@ -81,25 +90,55 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
 
+    /* ADR-379: lets an operator confirm remotely that an OTA'd image left
+     * pending_verify (and so survives a power cycle) without a serial log. */
+    esp_ota_img_states_t st;
+    const char *ota_state = "none";
+    if (running && esp_ota_get_state_partition(running, &st) == ESP_OK) {
+        ota_state = st == ESP_OTA_IMG_VALID          ? "valid" :
+                    st == ESP_OTA_IMG_PENDING_VERIFY ? "pending_verify" :
+                    st == ESP_OTA_IMG_NEW            ? "new" :
+                    st == ESP_OTA_IMG_UNDEFINED      ? "undefined" : "other";
+    }
+
     char response[512];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%d}",
+        "\"ota_state\":\"%s\",\"max_size\":%lu}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        OTA_MAX_SIZE);
+        ota_state,
+        (unsigned long)(update ? update->size : 0));
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
     return ESP_OK;
 }
 
+/* Receive chunk for POST /ota. Static, not on the httpd task stack: handlers
+ * run one at a time on the single httpd task, so one buffer is enough, and
+ * 1 KB was a quarter of the default 4 KB stack (ADR-379).
+ * NOT reentrant: this shared buffer is safe only because a single httpd task
+ * serves requests. Do not use it from another task or a multi-threaded
+ * httpd configuration. */
+static char s_ota_rx_buf[1024];
+
+void ota_update_log_httpd_stack(const char *what)
+{
+    /* ESP-IDF FreeRTOS counts stack in bytes. */
+    ESP_LOGI(TAG, "httpd stack after %s: %u of %d bytes never used",
+             what, (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             CONFIG_OTA_HTTPD_STACK_SIZE);
+}
+
 /**
- * POST /ota — receive and flash firmware binary.
+ * POST /ota — receive and flash firmware binary. Returns ESP_OK only after the
+ * new slot is set as boot partition and the response is sent; the caller
+ * reboots.
  */
-static esp_err_t ota_upload_handler(httpd_req_t *req)
+static esp_err_t ota_upload_receive(httpd_req_t *req)
 {
     /* ADR-050: Authenticate before accepting firmware upload. */
     if (!ota_check_auth(req)) {
@@ -111,16 +150,19 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "OTA update started, content_length=%d", req->content_len);
 
-    if (req->content_len <= 0 || req->content_len > OTA_MAX_SIZE) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Invalid firmware size (must be 1B - 900KB)");
-        return ESP_FAIL;
-    }
-
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len <= 0 || (size_t)req->content_len > update_partition->size) {
+        ESP_LOGW(TAG, "OTA rejected: content_length=%d exceeds partition '%s' size=%lu",
+                 req->content_len, update_partition->label,
+                 (unsigned long)update_partition->size);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid firmware size for OTA partition");
         return ESP_FAIL;
     }
 
@@ -134,12 +176,12 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     }
 
     /* Read firmware in chunks. */
-    char buf[1024];
+    char *buf = s_ota_rx_buf;
     int received = 0;
     int total = 0;
 
     while (total < req->content_len) {
-        received = httpd_req_recv(req, buf, sizeof(buf));
+        received = httpd_req_recv(req, buf, sizeof(s_ota_rx_buf));
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) {
                 continue;  /* Retry on timeout. */
@@ -163,9 +205,11 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
         total += received;
         if ((total % (64 * 1024)) == 0) {
-            ESP_LOGI(TAG, "OTA progress: %d / %d bytes (%.0f%%)",
+            /* Integer percent: %f pulls newlib's float formatter onto this
+             * task's stack for no benefit. */
+            ESP_LOGI(TAG, "OTA progress: %d / %d bytes (%d%%)",
                      total, req->content_len,
-                     (float)total * 100.0f / (float)req->content_len);
+                     (int)((int64_t)total * 100 / req->content_len));
         }
     }
 
@@ -191,12 +235,24 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     const char *resp = "{\"status\":\"ok\",\"message\":\"OTA update successful. Rebooting...\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
 
-    /* Delay briefly to let the response flush, then reboot. */
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+static esp_err_t ota_upload_handler(httpd_req_t *req)
+{
+    esp_err_t ret = ota_upload_receive(req);
 
-    return ESP_OK;  /* Never reached. */
+    /* The deepest path this server runs is esp_ota_end() -> esp_image_verify().
+     * Log the headroom it left so the stack size is set from evidence, not
+     * guessed a second time. */
+    ota_update_log_httpd_stack("POST /ota");
+
+    if (ret == ESP_OK) {
+        /* Delay briefly to let the response flush, then reboot. */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
+    return ret;
 }
 
 /** Internal: start the HTTP server and register OTA endpoints. */
@@ -204,6 +260,11 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_PORT;
+    /* HTTPD_DEFAULT_CONFIG gives 4096 B. MEASURED 2026-09-29 on an S3 (node 4,
+     * v0.8.12): POST /ota overflowed it every time ("stack overflow in task
+     * httpd", RTC_SW_CPU_RST), so no OTA had ever completed on this firmware.
+     * See CONFIG_OTA_HTTPD_STACK_SIZE for the sizing. */
+    config.stack_size = CONFIG_OTA_HTTPD_STACK_SIZE;
     config.max_uri_handlers = 12;  /* Extra slots for WASM endpoints (ADR-040). */
     /* Increase receive timeout for large uploads. */
     config.recv_wait_timeout = 30;
@@ -241,26 +302,45 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     return ESP_OK;
 }
 
-esp_err_t ota_update_init(void)
+/**
+ * Load the OTA PSK from NVS into the module-local s_ota_psk cache and log
+ * the resulting posture. Called by both ota_update_init() and
+ * ota_update_init_ex() so the per-boot diagnostic prints no matter which
+ * entry point main.c uses — historically only ota_update_init() loaded the
+ * PSK, which left ota_update_init_ex() with an empty s_ota_psk and an
+ * invisible fail-closed posture (RuView#596 follow-up).
+ */
+static void ota_load_psk_from_nvs(void)
 {
-    /* ADR-050: Load OTA PSK from NVS if provisioned. */
     nvs_handle_t nvs;
     if (nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         size_t len = sizeof(s_ota_psk);
         if (nvs_get_str(nvs, OTA_NVS_KEY, s_ota_psk, &len) == ESP_OK) {
             ESP_LOGI(TAG, "OTA PSK loaded from NVS (%d chars) — authentication enabled", (int)len - 1);
         } else {
-            ESP_LOGW(TAG, "No OTA PSK in NVS — OTA authentication DISABLED (provision with nvs_set)");
+            ESP_LOGW(TAG, "No OTA PSK in NVS — OTA upload endpoint will REJECT all requests until "
+                          "provisioned (provision.py --ota-psk-file <path>). Fail-closed per RuView#596.");
         }
         nvs_close(nvs);
     } else {
-        ESP_LOGW(TAG, "NVS namespace '%s' not found — OTA authentication DISABLED", OTA_NVS_NAMESPACE);
+        ESP_LOGW(TAG, "NVS namespace '%s' not found — OTA upload endpoint will REJECT all "
+                      "requests until provisioned. Fail-closed per RuView#596.", OTA_NVS_NAMESPACE);
     }
+}
 
+esp_err_t ota_update_init(void)
+{
+    /* ADR-050: Load OTA PSK from NVS if provisioned. */
+    ota_load_psk_from_nvs();
     return ota_start_server(NULL);
 }
 
 esp_err_t ota_update_init_ex(void **out_server)
 {
+    /* ADR-050: Load OTA PSK from NVS if provisioned. main.c uses this
+     * variant (not ota_update_init), so without this call s_ota_psk
+     * stayed empty forever and the fail-closed posture was invisible
+     * in serial logs. */
+    ota_load_psk_from_nvs();
     return ota_start_server((httpd_handle_t *)out_server);
 }

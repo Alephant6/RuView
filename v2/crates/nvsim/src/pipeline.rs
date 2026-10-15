@@ -18,7 +18,7 @@ use crate::sensor::{NvSensor, NvSensorConfig};
 use crate::source::scene_field_at;
 
 /// Pipeline configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct PipelineConfig {
     /// Sensor / digitiser sampling parameters.
     pub digitiser: DigitiserConfig,
@@ -26,16 +26,6 @@ pub struct PipelineConfig {
     pub sensor: NvSensorConfig,
     /// Per-sample integration time (s). Default 1/f_s.
     pub dt_s: Option<f64>,
-}
-
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        Self {
-            digitiser: DigitiserConfig::default(),
-            sensor: NvSensorConfig::default(),
-            dt_s: None,
-        }
-    }
 }
 
 /// Forward-only NV-diamond pipeline.
@@ -50,15 +40,39 @@ impl Pipeline {
     /// Construct a pipeline. `seed` makes shot-noise reproducible — same
     /// `(scene, config, seed)` produces byte-identical output.
     pub fn new(scene: Scene, config: PipelineConfig, seed: u64) -> Self {
-        Self { scene, config, seed }
+        Self {
+            scene,
+            config,
+            seed,
+        }
     }
 
     /// Run `n_samples` of the pipeline. Returns one [`MagFrame`] per
     /// (sensor × sample) — i.e. `n_samples · scene.sensors.len()` frames
     /// in scene-major / sample-minor order.
     pub fn run(&self, n_samples: usize) -> Vec<MagFrame> {
-        let dt = self.config.dt_s.unwrap_or(1.0 / self.config.digitiser.f_s_hz);
-        let dt_us = (dt * 1.0e6) as u64;
+        // `dt` is derived from caller-supplied config — an external boundary
+        // (e.g. the WASM `config_json`). A degenerate `f_s_hz == 0` makes
+        // `1.0 / f_s_hz == +Inf`; a non-finite or non-positive `dt_s` is
+        // equally hostile. Sanitise before any arithmetic that could panic.
+        let raw_dt = self
+            .config
+            .dt_s
+            .unwrap_or(1.0 / self.config.digitiser.f_s_hz);
+        // Fall back to a 1 µs step (the smallest physically meaningful
+        // sample interval here) when `dt` is non-finite or non-positive, so
+        // the run produces well-defined frames instead of garbage / a panic.
+        let dt = if raw_dt.is_finite() && raw_dt > 0.0 {
+            raw_dt
+        } else {
+            1.0e-6
+        };
+        // `dt` is now finite & positive, so `dt * 1e6` is finite. Cap the
+        // `u64` cast defensively (a huge but finite `dt` could still exceed
+        // `u64::MAX`) and use `saturating_mul` for the per-sample timestamp so
+        // a pathological config can never trigger a multiply-with-overflow
+        // panic (debug / WASM panic=abort) or wrap to a garbage timestamp.
+        let dt_us = (dt * 1.0e6).min(u64::MAX as f64) as u64;
         let nv = NvSensor::new(self.config.sensor);
 
         let mut out: Vec<MagFrame> =
@@ -82,11 +96,11 @@ impl Pipeline {
                 // saturation flag if any axis clips.
                 let mut adc_sat = false;
                 let mut b_pt = [0.0_f32; 3];
-                for k in 0..3 {
+                for (k, b) in b_pt.iter_mut().enumerate() {
                     let (code, sat) = adc_quantise(reading.b_recovered[k]);
                     adc_sat |= sat;
                     let recovered_t = code as f64 * crate::digitiser::ADC_LSB_T;
-                    b_pt[k] = (recovered_t * 1.0e12) as f32; // T → pT
+                    *b = (recovered_t * 1.0e12) as f32; // T → pT
                 }
                 let sigma_pt = [
                     (reading.sigma_per_axis[0] * 1.0e12) as f32,
@@ -95,11 +109,10 @@ impl Pipeline {
                 ];
 
                 let mut frame = MagFrame::empty(sensor_idx as u16);
-                frame.t_us = (sample as u64) * dt_us;
+                frame.t_us = (sample as u64).saturating_mul(dt_us);
                 frame.b_pt = b_pt;
                 frame.sigma_pt = sigma_pt;
-                frame.noise_floor_pt_sqrt_hz =
-                    (reading.noise_floor_t_sqrt_hz * 1.0e12) as f32;
+                frame.noise_floor_pt_sqrt_hz = (reading.noise_floor_t_sqrt_hz * 1.0e12) as f32;
                 frame.temperature_k = 295.0;
                 if near_field {
                     frame.set_flag(flag::SATURATION_NEAR_FIELD);
@@ -198,13 +211,69 @@ mod tests {
         let (b_analytic, _) = scene_field_at(&scene, scene.sensors[0]);
         for f in &frames {
             assert!(f.has_flag(flag::SHOT_NOISE_DISABLED));
-            for k in 0..3 {
-                let recovered_t = f.b_pt[k] as f64 * 1.0e-12;
+            for (k, (&b_pt, &b_ref)) in f.b_pt.iter().zip(b_analytic.iter()).enumerate() {
+                let recovered_t = b_pt as f64 * 1.0e-12;
                 let lsb_t = crate::digitiser::ADC_LSB_T;
                 assert!(
-                    (recovered_t - b_analytic[k]).abs() <= lsb_t,
+                    (recovered_t - b_ref).abs() <= lsb_t,
                     "noise-off recovery error > 1 LSB for axis {k}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn degenerate_zero_sample_rate_does_not_panic() {
+        // Security pinning (panic / DoS guard): an externally-supplied
+        // `f_s_hz == 0` makes `1/f_s_hz == +Inf`; pre-fix that produced
+        // `dt_us == u64::MAX`, and `sample * dt_us` panicked with
+        // "attempt to multiply with overflow" (debug / WASM panic=abort) at
+        // sample >= 2, or wrapped to a garbage timestamp in release. The
+        // sanitised `dt` + `saturating_mul` must keep the run finite.
+        let scene = fixture_scene();
+        let cfg = PipelineConfig {
+            digitiser: crate::digitiser::DigitiserConfig {
+                f_s_hz: 0.0,
+                f_mod_hz: 1000.0,
+            },
+            ..PipelineConfig::default()
+        };
+        let frames = Pipeline::new(scene, cfg, 42).run(8);
+        assert_eq!(frames.len(), 8);
+        for f in &frames {
+            // Timestamps are monotone-well-defined, not garbage.
+            assert!(f.t_us < u64::MAX);
+        }
+    }
+
+    #[test]
+    fn non_finite_scene_input_flags_frame_instead_of_silently_zeroing() {
+        // Security pinning (NaN-state-poisoning guard): a NaN dipole position
+        // makes `r_norm` NaN, which bypasses the near-field clamp
+        // (`NaN < R_MIN_M` is false) and yields a NaN field. Pre-fix the
+        // digitiser silently coerced that NaN to code 0 with the saturation
+        // flag CLEAR — a frame indistinguishable from a real zero-field
+        // reading. Post-fix the frame must carry ADC_SATURATED so the
+        // corruption is visible downstream.
+        let mut scene = Scene::new();
+        scene.add_dipole(DipoleSource::new([f64::NAN, 0.0, 0.5], [0.0, 0.0, 1.0e-3]));
+        scene.add_sensor([0.0, 0.0, 0.0]);
+        let cfg = PipelineConfig {
+            sensor: NvSensorConfig {
+                shot_noise_disabled: true,
+                ..NvSensorConfig::default()
+            },
+            ..PipelineConfig::default()
+        };
+        let frames = Pipeline::new(scene, cfg, 0).run(4);
+        for f in &frames {
+            assert!(
+                f.has_flag(flag::ADC_SATURATED),
+                "non-finite field must raise ADC_SATURATED, not emit a silent zero frame"
+            );
+            // And the emitted value is a defined number, not NaN.
+            for b in f.b_pt {
+                assert!(b.is_finite());
             }
         }
     }

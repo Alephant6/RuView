@@ -1,15 +1,15 @@
 //! Position fusion combining multiple localization techniques.
 
+use super::{DepthEstimator, DepthEstimatorConfig, TriangulationConfig, Triangulator};
 use crate::domain::{
-    Coordinates3D, LocationUncertainty, ScanZone, VitalSignsReading,
-    DepthEstimate, DebrisProfile,
+    Coordinates3D, DebrisProfile, DepthEstimate, LocationUncertainty, ScanZone, VitalSignsReading,
 };
-use super::{Triangulator, TriangulationConfig, DepthEstimator, DepthEstimatorConfig};
 
 /// Service for survivor localization
 pub struct LocalizationService {
     triangulator: Triangulator,
     depth_estimator: DepthEstimator,
+    #[allow(dead_code)]
     position_fuser: PositionFuser,
 }
 
@@ -35,12 +35,23 @@ impl LocalizationService {
         }
     }
 
-    /// Estimate survivor position
+    /// Estimate survivor position from real per-sensor RSSI + debris-aware depth.
+    ///
+    /// `vitals` is currently used only as a presence guard (position is only
+    /// meaningful for a real detection) — the position itself is derived from
+    /// sensor geometry + RSSI and the zone debris profile, not from the vital
+    /// waveform. It is retained in the signature so depth weighting can later
+    /// incorporate breathing-amplitude SNR without a breaking API change.
     pub fn estimate_position(
         &self,
         vitals: &VitalSignsReading,
         zone: &ScanZone,
     ) -> Option<Coordinates3D> {
+        // Only attempt localization for a real detection.
+        if !vitals.has_vitals() {
+            return None;
+        }
+
         // Get sensor positions
         let sensors = zone.sensor_positions();
 
@@ -48,19 +59,21 @@ impl LocalizationService {
             return None;
         }
 
-        // Estimate 2D position from triangulation
-        // In real implementation, RSSI values would come from actual measurements
-        let rssi_values = self.simulate_rssi_measurements(sensors, vitals);
+        // Estimate 2D position from triangulation using REAL per-sensor RSSI.
+        // Sensors that have no live RSSI reading contribute nothing — we never
+        // fabricate a measurement. If fewer than the triangulator's minimum
+        // report real RSSI, `estimate_position` returns None and the caller
+        // records the survivor with `location: None` (dedup then falls back to
+        // the zone + vitals-signature path rather than inflating the count).
+        let rssi_values = self.collect_rssi_measurements(sensors);
         let position_2d = self.triangulator.estimate_position(sensors, &rssi_values)?;
 
         // Estimate depth
         let debris_profile = self.estimate_debris_profile(zone);
         let signal_attenuation = self.calculate_signal_attenuation(&rssi_values);
-        let depth_estimate = self.depth_estimator.estimate_depth(
-            signal_attenuation,
-            0.0,
-            &debris_profile,
-        )?;
+        let depth_estimate =
+            self.depth_estimator
+                .estimate_depth(signal_attenuation, 0.0, &debris_profile)?;
 
         // Combine into 3D position
         let position_3d = Coordinates3D::new(
@@ -73,21 +86,35 @@ impl LocalizationService {
         Some(position_3d)
     }
 
-    /// Read RSSI measurements from sensors.
+    /// Collect REAL per-sensor RSSI measurements for triangulation.
     ///
-    /// Returns empty when no real sensor hardware is connected.
-    /// Real RSSI readings require ESP32 mesh (ADR-012) or Linux WiFi interface (ADR-013).
-    /// Caller handles empty readings by returning None/default.
-    fn simulate_rssi_measurements(
+    /// Reads each operational sensor's most recent live RSSI (`last_rssi`,
+    /// populated by the hardware layer from actual signal-strength readings).
+    /// Sensors without a real reading are omitted — no value is fabricated. When
+    /// the number of real measurements is below the triangulator's minimum the
+    /// returned vector is short and `Triangulator::estimate_position` yields
+    /// `None`, so the survivor is recorded with no location and de-duplicated by
+    /// vitals signature instead of being counted multiple times.
+    fn collect_rssi_measurements(
         &self,
-        _sensors: &[crate::domain::SensorPosition],
-        _vitals: &VitalSignsReading,
+        sensors: &[crate::domain::SensorPosition],
     ) -> Vec<(String, f64)> {
-        // No real sensor hardware connected - return empty.
-        // Real RSSI readings require ESP32 mesh (ADR-012) or Linux WiFi interface (ADR-013).
-        // Caller handles empty readings by returning None from estimate_position.
-        tracing::warn!("No sensor hardware connected. Real RSSI readings require ESP32 mesh (ADR-012) or Linux WiFi interface (ADR-013).");
-        vec![]
+        let measurements: Vec<(String, f64)> = sensors
+            .iter()
+            .filter(|s| s.is_operational)
+            .filter_map(|s| s.last_rssi.map(|rssi| (s.id.clone(), rssi)))
+            .collect();
+
+        if measurements.len() < self.triangulator.config().min_sensors {
+            tracing::debug!(
+                real_rssi_count = measurements.len(),
+                required = self.triangulator.config().min_sensors,
+                "Insufficient real RSSI measurements for triangulation; \
+                 survivor will be recorded without a fixed location (no RSSI fabricated)."
+            );
+        }
+
+        measurements
     }
 
     /// Estimate debris profile for the zone
@@ -105,8 +132,8 @@ impl LocalizationService {
         // Reference RSSI at surface (typical open-air value)
         const REFERENCE_RSSI: f64 = -30.0;
 
-        let avg_rssi: f64 = rssi_values.iter().map(|(_, r)| r).sum::<f64>()
-            / rssi_values.len() as f64;
+        let avg_rssi: f64 =
+            rssi_values.iter().map(|(_, r)| r).sum::<f64>() / rssi_values.len() as f64;
 
         (REFERENCE_RSSI - avg_rssi).max(0.0)
     }
@@ -283,13 +310,17 @@ impl PositionFuser {
         // Combined uncertainty is reduced with multiple estimates
         let n = estimates.len() as f64;
 
-        let avg_h_error: f64 = estimates.iter()
+        let avg_h_error: f64 = estimates
+            .iter()
             .map(|e| e.position.uncertainty.horizontal_error)
-            .sum::<f64>() / n;
+            .sum::<f64>()
+            / n;
 
-        let avg_v_error: f64 = estimates.iter()
+        let avg_v_error: f64 = estimates
+            .iter()
             .map(|e| e.position.uncertainty.vertical_error)
-            .sum::<f64>() / n;
+            .sum::<f64>()
+            / n;
 
         // Uncertainty reduction factor (more estimates = more confidence)
         let reduction = (1.0 / n.sqrt()).max(0.5);
@@ -312,7 +343,6 @@ impl Default for PositionFuser {
         Self::new()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -379,7 +409,86 @@ mod tests {
     fn test_localization_service_creation() {
         let service = LocalizationService::new();
         // Just verify it creates without panic
-        assert!(true);
         drop(service);
+    }
+
+    /// Real-RSSI localization: when ≥3 sensors carry live RSSI the service
+    /// produces a position (exercises the real triangulator path, replacing the
+    /// old `simulate_rssi_measurements` that always returned `vec![]`).
+    #[test]
+    fn test_estimate_position_uses_real_rssi() {
+        use crate::domain::{
+            BreathingPattern, BreathingType, MovementProfile, ScanZone, SensorPosition, SensorType,
+            VitalSignsReading, ZoneBounds,
+        };
+
+        let mut zone = ScanZone::new("Z", ZoneBounds::rectangle(0.0, 0.0, 12.0, 12.0));
+        for (id, x, y, rssi) in [
+            ("s1", 0.0, 0.0, -55.0),
+            ("s2", 10.0, 0.0, -60.0),
+            ("s3", 5.0, 10.0, -58.0),
+        ] {
+            zone.add_sensor(SensorPosition {
+                id: id.to_string(),
+                x,
+                y,
+                z: 1.5,
+                sensor_type: SensorType::Transceiver,
+                is_operational: true,
+                last_rssi: Some(rssi),
+            });
+        }
+
+        let vitals = VitalSignsReading::new(
+            Some(BreathingPattern {
+                rate_bpm: 16.0,
+                amplitude: 0.8,
+                regularity: 0.9,
+                pattern_type: BreathingType::Normal,
+            }),
+            None,
+            MovementProfile::default(),
+        );
+
+        let service = LocalizationService::new();
+        let pos = service.estimate_position(&vitals, &zone);
+        assert!(pos.is_some(), "3 real RSSI sensors should yield a position");
+    }
+
+    /// Honest negative: sensors WITHOUT real RSSI yield no position (no
+    /// fabrication). The caller then records `location: None`.
+    #[test]
+    fn test_estimate_position_none_without_real_rssi() {
+        use crate::domain::{
+            BreathingPattern, BreathingType, MovementProfile, ScanZone, SensorPosition, SensorType,
+            VitalSignsReading, ZoneBounds,
+        };
+
+        let mut zone = ScanZone::new("Z", ZoneBounds::rectangle(0.0, 0.0, 12.0, 12.0));
+        for (id, x, y) in [("s1", 0.0, 0.0), ("s2", 10.0, 0.0), ("s3", 5.0, 10.0)] {
+            zone.add_sensor(SensorPosition {
+                id: id.to_string(),
+                x,
+                y,
+                z: 1.5,
+                sensor_type: SensorType::Transceiver,
+                is_operational: true,
+                last_rssi: None, // no live signal
+            });
+        }
+
+        let vitals = VitalSignsReading::new(
+            Some(BreathingPattern {
+                rate_bpm: 16.0,
+                amplitude: 0.8,
+                regularity: 0.9,
+                pattern_type: BreathingType::Normal,
+            }),
+            None,
+            MovementProfile::default(),
+        );
+
+        let service = LocalizationService::new();
+        assert!(service.estimate_position(&vitals, &zone).is_none());
     }
 }

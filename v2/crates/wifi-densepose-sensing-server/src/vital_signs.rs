@@ -139,13 +139,15 @@ impl VitalSignDetector {
         // Cardiac-induced body surface displacement is < 0.5 mm, producing
         // tiny phase changes. Cross-subcarrier phase variance captures this
         // more sensitively than amplitude alone.
+        //
+        // Phases come from atan2() and are wrapped to (-pi, pi]. Linear mean
+        // and variance on wrapped values is wrong: two phases close across
+        // the +/-pi discontinuity (e.g. pi-eps and -pi+eps) are physically
+        // ~2*eps rad apart but produce arithmetic variance ~pi^2. Use the
+        // standard circular variance (1 - mean resultant length), which is
+        // stable across the wrap.
         let phase_var = if phase.len() > 1 {
-            let mean_phase: f64 = phase.iter().sum::<f64>() / phase.len() as f64;
-            phase
-                .iter()
-                .map(|p| (p - mean_phase).powi(2))
-                .sum::<f64>()
-                / phase.len() as f64
+            phase_circular_variance(phase)
         } else {
             // Fallback: use amplitude high-pass residual when phase is unavailable
             let half = amplitude.len() / 2;
@@ -209,12 +211,7 @@ impl VitalSignDetector {
 
     /// Find the dominant frequency in `buffer` within the [min_hz, max_hz] band
     /// using FFT. Returns (frequency_as_bpm, confidence).
-    pub fn compute_fft_peak(
-        &self,
-        buffer: &[f64],
-        min_hz: f64,
-        max_hz: f64,
-    ) -> (Option<f64>, f64) {
+    pub fn compute_fft_peak(&self, buffer: &[f64], min_hz: f64, max_hz: f64) -> (Option<f64>, f64) {
         if buffer.len() < 4 {
             return (None, 0.0);
         }
@@ -225,6 +222,7 @@ impl VitalSignDetector {
         signal[..buffer.len()].copy_from_slice(buffer);
 
         // Apply Hann window to reduce spectral leakage
+        #[allow(clippy::needless_range_loop)]
         for i in 0..buffer.len() {
             let w = 0.5 * (1.0 - (2.0 * PI * i as f64 / (buffer.len() as f64 - 1.0)).cos());
             signal[i] *= w;
@@ -250,6 +248,7 @@ impl VitalSignDetector {
         let mut band_sum = 0.0f64;
         let mut band_count = 0usize;
 
+        #[allow(clippy::needless_range_loop)]
         for bin in min_bin..=max_bin {
             let mag = spectrum[bin];
             band_sum += mag;
@@ -334,8 +333,7 @@ impl VitalSignDetector {
         };
 
         // Factor in buffer fill level (need enough history for reliable estimates)
-        let fill =
-            (self.breathing_buffer.len() as f64) / (self.breathing_capacity as f64).max(1.0);
+        let fill = (self.breathing_buffer.len() as f64) / (self.breathing_capacity as f64).max(1.0);
         let fill_factor = fill.clamp(0.0, 1.0);
 
         (quality * (0.3 + 0.7 * fill_factor)).clamp(0.0, 1.0)
@@ -346,6 +344,31 @@ impl VitalSignDetector {
         self.breathing_buffer.clear();
         self.heartbeat_buffer.clear();
         self.frame_count = 0;
+    }
+
+    /// Retune temporal windows to an observed CSI clock. Changes smaller than
+    /// twenty percent are ignored to avoid resetting on normal arrival jitter.
+    /// A real clock change clears history so samples from different clocks are
+    /// never interpreted in one spectrum.
+    pub fn reconfigure_sample_rate(&mut self, sample_rate: f64) -> bool {
+        if !sample_rate.is_finite() || sample_rate < 1.0 {
+            return false;
+        }
+        let relative_change = (sample_rate - self.sample_rate).abs() / self.sample_rate.max(1.0);
+        if relative_change < 0.20 {
+            return false;
+        }
+        self.sample_rate = sample_rate;
+        self.breathing_capacity =
+            ((sample_rate * self.breathing_window_secs) as usize).max(1);
+        self.heartbeat_capacity =
+            ((sample_rate * self.heartbeat_window_secs) as usize).max(1);
+        self.reset();
+        true
+    }
+
+    pub fn sample_rate_hz(&self) -> f64 {
+        self.sample_rate
     }
 
     /// Current buffer fill levels for diagnostics.
@@ -367,6 +390,25 @@ impl VitalSignDetector {
 /// Constructs a bandpass by subtracting two lowpass filters (LPF_high - LPF_low)
 /// with a Hamming window. This is a zero-external-dependency implementation
 /// suitable for the buffer sizes we encounter (up to ~600 samples).
+/// Circular variance of wrapped phase samples in radians.
+///
+/// Returns `1 - R` where `R` is the mean resultant length of the unit-circle
+/// representation of the input. `0.0` means all samples point in the same
+/// direction; `1.0` means they are uniformly spread. Stable across the +/-pi
+/// discontinuity of `atan2`-derived phases. Returns `0.0` for inputs shorter
+/// than 2 samples.
+pub(crate) fn phase_circular_variance(phase: &[f64]) -> f64 {
+    if phase.len() < 2 {
+        return 0.0;
+    }
+    let (sin_sum, cos_sum) = phase
+        .iter()
+        .fold((0.0_f64, 0.0_f64), |(s, c), &p| (s + p.sin(), c + p.cos()));
+    let n = phase.len() as f64;
+    let r = (sin_sum * sin_sum + cos_sum * cos_sum).sqrt() / n;
+    (1.0 - r).clamp(0.0, 1.0)
+}
+
 pub fn bandpass_filter(data: &[f64], low_hz: f64, high_hz: f64, sample_rate: f64) -> Vec<f64> {
     if data.len() < 3 || sample_rate < f64::EPSILON {
         return data.to_vec();
@@ -393,6 +435,7 @@ pub fn bandpass_filter(data: &[f64], low_hz: f64, high_hz: f64, sample_rate: f64
     let mut coeffs = vec![0.0f64; filter_order];
 
     // BPF = LPF(high_norm) - LPF(low_norm) with Hamming window
+    #[allow(clippy::needless_range_loop)]
     for i in 0..filter_order {
         let n = i as f64 - half as f64;
         let lp_high = if n.abs() < f64::EPSILON {
@@ -426,6 +469,7 @@ pub fn bandpass_filter(data: &[f64], low_hz: f64, high_hz: f64, sample_rate: f64
 
     // Apply filter via convolution
     let mut output = vec![0.0f64; data.len()];
+    #[allow(clippy::needless_range_loop)]
     for i in 0..data.len() {
         let mut sum = 0.0;
         for (j, &coeff) in coeffs.iter().enumerate() {
@@ -582,7 +626,10 @@ pub fn run_benchmark(n_frames: usize) -> (std::time::Duration, std::time::Durati
         "  Breathing rate:       {:?} BPM",
         last_vital.breathing_rate_bpm
     );
-    eprintln!("  Heart rate:           {:?} BPM", last_vital.heart_rate_bpm);
+    eprintln!(
+        "  Heart rate:           {:?} BPM",
+        last_vital.heart_rate_bpm
+    );
     eprintln!(
         "  Breathing confidence: {:.3}",
         last_vital.breathing_confidence
@@ -591,10 +638,7 @@ pub fn run_benchmark(n_frames: usize) -> (std::time::Duration, std::time::Durati
         "  Heartbeat confidence: {:.3}",
         last_vital.heartbeat_confidence
     );
-    eprintln!(
-        "  Signal quality:       {:.3}",
-        last_vital.signal_quality
-    );
+    eprintln!("  Signal quality:       {:.3}", last_vital.signal_quality);
 
     (total, per_frame)
 }
@@ -604,6 +648,95 @@ pub fn run_benchmark(n_frames: usize) -> (std::time::Duration, std::time::Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the linear-vs-circular phase variance bug.
+    ///
+    /// Two CSI subcarriers whose phases land just either side of the +/-pi
+    /// wrap are physically ~2*eps rad apart, but the previous code computed
+    /// arithmetic mean + arithmetic variance on the wrapped values, treating
+    /// them as ~2*pi apart and producing variance ~pi^2 ~= 9.87. The corrected
+    /// circular variance returns ~1e-6 for the same input.
+    #[test]
+    fn test_phase_variance_handles_wraparound() {
+        // Two phases ~0.002 rad apart, straddling the +/-pi discontinuity.
+        let phases = [PI - 0.001, -PI + 0.001];
+
+        let v = phase_circular_variance(&phases);
+        assert!(
+            v < 0.01,
+            "circular variance of nearly-identical wrapped phases must be tiny, got {v}"
+        );
+
+        // For reference, the *old* (buggy) linear formula on the same input
+        // produced ~9.87. Document that gap here so the assertion above
+        // explicitly fails on any regression to the linear computation.
+        let mean_linear: f64 = phases.iter().sum::<f64>() / phases.len() as f64;
+        let v_linear_buggy: f64 = phases
+            .iter()
+            .map(|p| (p - mean_linear).powi(2))
+            .sum::<f64>()
+            / phases.len() as f64;
+        assert!(
+            v_linear_buggy > 9.0,
+            "sanity: linear formula on wrapped input should be ~pi^2, got {v_linear_buggy}"
+        );
+    }
+
+    /// End-to-end: `process_frame` must not blow up `heartbeat_buffer` when
+    /// the input phases happen to straddle the +/-pi wrap. Anyone can run this
+    /// against `main` (with the inline linear-formula bug) and observe the
+    /// stored value of ~9.86; with the fix it is ~1e-6.
+    #[test]
+    fn test_process_frame_handles_wrapped_phases() {
+        let mut detector = VitalSignDetector::new(20.0);
+        let amp = vec![1.0_f64; 8];
+        // 8 subcarriers, all physically ~aligned at ~+/-pi, alternating sign.
+        let phase = vec![
+            PI - 0.001,
+            -PI + 0.001,
+            PI - 0.001,
+            -PI + 0.001,
+            PI - 0.001,
+            -PI + 0.001,
+            PI - 0.001,
+            -PI + 0.001,
+        ];
+
+        detector.process_frame(&amp, &phase);
+
+        let stored = *detector
+            .heartbeat_buffer
+            .back()
+            .expect("process_frame should push exactly one phase_var");
+
+        assert!(
+            stored < 0.1,
+            "phase_var pushed into heartbeat_buffer should be near 0 for \
+             physically-aligned wrapped phases, got {stored}. The linear \
+             (buggy) formula produces ~pi^2 = 9.87 here; the circular \
+             (fixed) formula produces ~1e-6."
+        );
+    }
+
+    /// Diametrically opposite phases must yield maximum circular variance.
+    #[test]
+    fn test_phase_variance_opposite_phases() {
+        let v = phase_circular_variance(&[0.0, PI]);
+        assert!(
+            v > 0.99,
+            "two opposite phases must give circular variance near 1.0, got {v}"
+        );
+    }
+
+    /// Identical phases must yield zero circular variance, even far from zero.
+    #[test]
+    fn test_phase_variance_identical_phases() {
+        let v = phase_circular_variance(&[2.5, 2.5, 2.5, 2.5]);
+        assert!(
+            v < 1e-9,
+            "identical phases must give circular variance ~0, got {v}"
+        );
+    }
 
     #[test]
     fn test_fft_magnitude_dc() {
@@ -620,10 +753,9 @@ mod tests {
     fn test_fft_magnitude_sine() {
         // 16-point signal with a single sinusoid at bin 2
         let n = 16;
-        let mut signal = vec![0.0; n];
-        for i in 0..n {
-            signal[i] = (2.0 * PI * 2.0 * i as f64 / n as f64).sin();
-        }
+        let signal: Vec<f64> = (0..n)
+            .map(|i| (2.0 * PI * 2.0 * i as f64 / n as f64).sin())
+            .collect();
         let mag = fft_magnitude(&signal);
         // Peak should be at bin 2
         let peak_bin = mag
@@ -733,6 +865,22 @@ mod tests {
         let (br_len, _, hb_len, _) = detector.buffer_status();
         assert_eq!(br_len, 0);
         assert_eq!(hb_len, 0);
+    }
+
+    #[test]
+    fn measured_clock_reconfigures_once_and_clears_mixed_history() {
+        let mut detector = VitalSignDetector::new(20.0);
+        let amp = vec![10.0; 56];
+        let phase = vec![0.0; 56];
+        for _ in 0..32 {
+            detector.process_frame(&amp, &phase);
+        }
+        assert!(!detector.reconfigure_sample_rate(18.0));
+        assert_eq!(detector.sample_rate_hz(), 20.0);
+        assert!(detector.reconfigure_sample_rate(12.0));
+        assert_eq!(detector.sample_rate_hz(), 12.0);
+        assert_eq!(detector.buffer_status(), (0, 360, 0, 180));
+        assert!(!detector.reconfigure_sample_rate(f64::NAN));
     }
 
     #[test]
