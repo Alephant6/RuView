@@ -5,7 +5,7 @@ On the iPhone: Health app -> profile picture -> Export All Health Data.
 Copy the resulting export.zip (or the export.xml inside it) to the NAS and run:
 
   docker compose -f docker-compose.yml -f docker-compose.health.yml run --rm \
-      -u root -v /path/to/dir:/import:ro --entrypoint python health-ingest \
+      -v /path/to/dir:/import:ro --entrypoint python health-ingest \
       /app/import_export.py --person sq /import/export.zip
 
 Only vitals and sleep are imported by default (steps and energy add millions

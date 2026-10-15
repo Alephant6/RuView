@@ -52,13 +52,13 @@ iPhone 锁着时 iOS 不让读健康数据，那次就会失败，下次运行�
 
 ## 历史数据回填（每人一次）
 
-1. iPhone 健康 App → 右上角头像 → **导出所有健康数据**，得到 `导出.zip`（可能有几百 MB），传到 NAS，比如 `/volume1/docker/RuView/health-import/sq.zip`。
+1. iPhone 健康 App → 右上角头像 → **导出所有健康数据**，得到 `导出.zip`（可能有几百 MB），传到 NAS，比如 `/volume1/docker/RuView/health-import/sq.zip`，并执行 `chmod a+r` 让容器能读（容器以无特权用户运行）。
 2. 先试运行看看解析结果，再正式导入（默认只导入心率、HRV、血氧、呼吸、体温和睡眠；`--types all` 导入全部）：
 
 ```bash
 cd /volume1/docker/RuView/docker
 docker compose -f docker-compose.yml -f docker-compose.health.yml run --rm \
-  -u root -v /volume1/docker/RuView/health-import:/import:ro --entrypoint python health-ingest \
+  -v /volume1/docker/RuView/health-import:/import:ro --entrypoint python health-ingest \
   /app/import_export.py --person sq /import/sq.zip --dry-run
 # 确认没问题后去掉 --dry-run 再跑一次；ml 同理
 ```
