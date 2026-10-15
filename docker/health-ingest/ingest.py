@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Apple Health (Health Auto Export) -> InfluxDB receiver.
 
-Each household member's iPhone runs a Health Auto Export "REST API"
-automation that POSTs JSON here. The bearer token identifies the person,
+Each household member's iPhone POSTs here, either from an iOS Shortcuts
+automation (free; POST /shortcut, one sample per line) or from a Health
+Auto Export "REST API" automation (POST /, HAE JSON). The Health app's
+full XML export can be backfilled with import_export.py. The bearer token identifies the person,
 so the stored points carry a `person` tag that lines up with RuView's
 profile names. Points go straight into InfluxDB as line protocol, using
 the sample's own timestamp, so late or repeated syncs land in the right
@@ -102,12 +104,17 @@ def parse_date(s: Any) -> int | None:
     """'2026-10-15 03:12:00 +0800' -> unix seconds."""
     if not isinstance(s, str):
         return None
+    s = s.strip()
     for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z"):
         try:
-            return int(datetime.strptime(s.strip(), fmt).timestamp())
+            return int(datetime.strptime(s, fmt).timestamp())
         except ValueError:
             pass
-    return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp()) if dt.tzinfo else None
 
 
 def _snake(k: str) -> str:
@@ -196,6 +203,69 @@ def workout_lines(person: str, w: dict[str, Any]) -> Iterable[str]:
         yield l
 
 
+# Sleep stage names as they appear in HAE, Shortcuts (English or Chinese UI)
+# and the Health app's XML export, mapped to HAE's spelling.
+_STAGES = {
+    "core": "Core", "asleepcore": "Core", "核心": "Core", "核心睡眠": "Core",
+    "deep": "Deep", "asleepdeep": "Deep", "深度": "Deep", "深度睡眠": "Deep",
+    "rem": "REM", "asleeprem": "REM", "快速动眼": "REM", "快速动眼睡眠": "REM", "快速眼动": "REM",
+    "awake": "Awake", "清醒": "Awake", "醒着": "Awake",
+    "inbed": "In Bed", "卧床": "In Bed", "在床上": "In Bed",
+    "asleep": "Asleep", "asleepunspecified": "Asleep", "睡眠": "Asleep", "已入睡": "Asleep",
+}
+
+
+def normalize_stage(v: Any) -> str:
+    raw = str(v or "").strip()
+    key = raw.replace("HKCategoryValueSleepAnalysis", "").replace(" ", "").lower()
+    return _STAGES.get(key, raw or "Unspecified")
+
+
+def sample_line(person: str, metric: str, start: int, end: int | None, value: str,
+                unit: str, source: str) -> str | None:
+    """One raw sample (Shortcuts or XML export) in the same schema HAE uses."""
+    if metric == "sleep_analysis":
+        fields: dict[str, Any] = {}
+        if end is not None:
+            fields["end_ts"] = end
+            fields["duration_h"] = (end - start) / 3600.0
+        return line("apple_sleep_stage", {"person": person, "stage": normalize_stage(value), "source": source},
+                    fields, start)
+    try:
+        qty = float(str(value).replace(",", "").strip())
+    except ValueError:
+        return None
+    fields = {"qty": qty}
+    if end is not None and end != start:
+        fields["end_ts"] = end
+    return line("apple_health", {"person": person, "metric": metric, "unit": unit, "source": source},
+                fields, start)
+
+
+_METRIC_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def shortcut_lines(person: str, text: str) -> list[str]:
+    """Parse the iOS Shortcuts upload: one sample per line,
+    metric<TAB>start<TAB>end<TAB>value<TAB>unit<TAB>source (dates ISO 8601).
+    Separators may also be '|' since tabs are awkward to type in Shortcuts."""
+    out: list[str] = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = [p.strip() for p in (raw.split("\t") if "\t" in raw else raw.split("|"))]
+        parts += [""] * (6 - len(parts))
+        metric, start_s, end_s, value, unit, source = parts[:6]
+        start = parse_date(start_s)
+        if not _METRIC_RE.match(metric) or start is None:
+            continue
+        l = sample_line(person, metric, start, parse_date(end_s), value, unit, source)
+        if l:
+            out.append(l)
+    return out
+
+
 def payload_lines(person: str, payload: dict[str, Any]) -> list[str]:
     data = payload.get("data", payload)
     out: list[str] = []
@@ -252,10 +322,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(413 if length > MAX_BODY else 400, {"error": "bad length"})
             return
         try:
-            payload = json.loads(self.rfile.read(length))
-            lines = payload_lines(person, payload)
+            body = self.rfile.read(length)
+            if self.path.rstrip("/").endswith("/shortcut"):
+                lines = shortcut_lines(person, body.decode("utf-8-sig"))
+            else:
+                lines = payload_lines(person, json.loads(body))
         except (ValueError, AttributeError) as e:
-            self._send(400, {"error": f"bad json: {e}"})
+            self._send(400, {"error": f"bad body: {e}"})
             return
         try:
             if lines:
