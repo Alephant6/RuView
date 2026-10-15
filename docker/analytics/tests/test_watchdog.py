@@ -401,6 +401,9 @@ def test_poll_handles_auth_failure_and_missing_endpoints():
     assert not snap.auth_failed and snap.status == {"source_state": "live_verified"} and snap.stream is None
     snap = poll_sensing_server(cfg, T0, fake_get({"/health": (None, None, "timed out")}))
     assert snap.error == "timed out"
+    snap = poll_sensing_server(Config(ruview_http="http://192.0.2.10:3000"), T0,
+                               fake_get({"/health": (421, None, "HTTP 421")}))
+    assert snap.error == "HTTP 421: 192.0.2.10 is not in the server's SENSING_ALLOWED_HOSTS"
 
 
 def test_poll_ha_persons():

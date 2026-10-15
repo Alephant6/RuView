@@ -52,6 +52,11 @@ def poll_sensing_server(cfg: Config, now: float, get: Getter = http_get_json) ->
     base = cfg.ruview_http
     snap = RestSnapshot(at=now)
     status, body, error = get(f"{base}/health", cfg.api_token, cfg.http_timeout_s)
+    if status == 421:
+        # The server's Host allowlist (DNS-rebinding guard) does not list us.
+        host = urllib.parse.urlsplit(base).hostname or base
+        snap.error = f"HTTP 421: {host} is not in the server's SENSING_ALLOWED_HOSTS"
+        return snap
     if error or not isinstance(body, dict):
         snap.error = error or "unexpected /health response"
         return snap

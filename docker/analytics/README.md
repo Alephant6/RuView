@@ -58,7 +58,7 @@ and recoveries to a phone, and alert when the watchdog itself is offline.
 
 | Variable | Default | |
 |---|---|---|
-| `RUVIEW_HTTP` | `http://192.168.1.195:3000` | sensing-server REST base URL |
+| `RUVIEW_HTTP` | `http://192.168.1.195:3000` | sensing-server REST base URL; its host must be in the server's `SENSING_ALLOWED_HOSTS`, or the server answers HTTP 421 |
 | `RUVIEW_API_TOKEN` | — | same token as the server |
 | `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` | | broker the bridge publishes to |
 | `MQTT_PREFIX` / `HA_DISCOVERY_PREFIX` | `ruview` / `homeassistant` | |
@@ -74,7 +74,9 @@ and recoveries to a phone, and alert when the watchdog itself is offline.
 
 CI builds the image as `ghcr.io/alephant6/ruview-analytics`
 (`.github/workflows/fork-images.yml`). On the NAS, with `RUVIEW_API_TOKEN`
-(and optionally the `HA_*` settings) in `docker/.env`:
+(and optionally the `HA_*` settings) in `docker/.env`, after `git pull` in the
+checkout and with `IMAGE_TAG` in `.env` set to the merge commit's `sha-<7>`
+once `fork-images.yml` has finished for it:
 
 ```bash
 docker compose pull mqtt-bridge analytics
