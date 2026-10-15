@@ -105,10 +105,12 @@ jobs:
           # Telegraf flushes every second in the test config.
           sleep 5
 
-      - name: Telegraf logged no errors
+      - name: Telegraf logged no errors or deprecated options
         run: |
           docker logs telegraf 2>&1 | tail -n 20
-          if docker logs telegraf 2>&1 | grep " E! "; then
+          # A deprecated option is removed in a later Telegraf version, where
+          # the config would no longer load.
+          if docker logs telegraf 2>&1 | grep -E " E! | W! Deprecat"; then
             exit 1
           fi
 
