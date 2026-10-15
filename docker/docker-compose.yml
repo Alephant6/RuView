@@ -52,7 +52,8 @@ services:
       # Upstream UDP source guard (ADR-296): UDP binds 127.0.0.1 unless one of
       # these is set, so ESP32 frames from the LAN need e.g.
       # RUVIEW_UDP_ALLOW=192.168.1.0/24 (preferred) or RUVIEW_UDP_INSECURE_LAN=true.
-      - RUVIEW_UDP_ALLOW
+      # Defaults to the home LAN; narrow to the three node IPs in .env if desired.
+      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-192.168.1.0/24}
       - RUVIEW_UDP_INSECURE_LAN
       - RUVIEW_UDP_BIND
       - SENSING_ALLOWED_HOSTS
