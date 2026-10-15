@@ -61,7 +61,10 @@ services:
       - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-192.168.1.0/24}
       - RUVIEW_UDP_INSECURE_LAN
       - RUVIEW_UDP_BIND
-      - SENSING_ALLOWED_HOSTS
+      # Host-header allowlist (upstream host_validation): requests whose Host is
+      # not loopback or listed here get HTTP 421. mqtt-bridge connects to
+      # ws://192.168.1.195:3001 and browsers may use nas.local, so list both.
+      - SENSING_ALLOWED_HOSTS=${SENSING_ALLOWED_HOSTS:-192.168.1.195,nas.local,ruview-installation.local}
       # Built-in MQTT publisher (ADR-115): owns the room-level HA entities
       # (presence, HR/BR, person count, motion, fall, RSSI) per node, plus the
       # semantic states (sleeping, distress, bed exit, fall risk, no movement,
