@@ -1,9 +1,14 @@
+# Images are built by CI (.github/workflows/fork-images.yml, WP0.1) and pulled
+# from GHCR; the NAS never compiles. Pin a build with IMAGE_TAG=sha-<7> in .env
+# and roll back by setting it to the previous SHA:
+#   docker compose pull && docker compose up -d
+# `build:` stays so a dev machine can still `docker compose build` locally.
 services:
   sensing-server:
     build:
       context: ..
       dockerfile: docker/Dockerfile.rust
-    image: ruvnet/wifi-densepose:latest
+    image: ghcr.io/alephant6/ruview-sensing-server:${IMAGE_TAG:-latest}
     container_name: ruview-sensing-server
     network_mode: host
     # ports:
@@ -86,7 +91,7 @@ services:
     build:
       context: ./bridge
       dockerfile: Dockerfile
-    image: ruvnet/ruview-mqtt-bridge:latest
+    image: ghcr.io/alephant6/ruview-mqtt-bridge:${IMAGE_TAG:-latest}
     container_name: ruview-mqtt-bridge
     depends_on:
       - sensing-server
