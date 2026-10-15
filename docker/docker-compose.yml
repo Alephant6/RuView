@@ -145,12 +145,17 @@ services:
       - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
       - EXPECTED_NODES=${EXPECTED_NODES:-1,2,3}
       # Optional phone-presence check: HA URL, a long-lived token and the
-      # person entities, e.g. HA_PERSONS=person.alice,person.bob.
+      # person entities, e.g. HA_PERSONS=person.alice,person.bob. The token
+      # is passed through from docker/.env, like RUVIEW_API_TOKEN.
       - HA_URL=${HA_URL:-}
-      - HA_TOKEN=${HA_TOKEN:-}
+      - HA_TOKEN
       - HA_PERSONS=${HA_PERSONS:-}
       - WATCHDOG_LANG=${WATCHDOG_LANG:-zh}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    # Reads MQTT and REST and writes nothing to disk: no capabilities needed.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
     restart: unless-stopped
 
   # ── InfluxDB 2.x ─────────────────────────────────────────────────────────
