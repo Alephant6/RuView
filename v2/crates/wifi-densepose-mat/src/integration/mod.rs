@@ -13,6 +13,9 @@
 //! - **Intel 5300 NIC**: Using Linux CSI Tool (iwlwifi driver)
 //! - **Atheros NICs**: Using ath9k/ath10k/ath11k CSI patches
 //! - **Nexmon**: For Broadcom chips with CSI firmware
+//! - **FeitCSI (Intel AX200/AX210)**: Wideband 802.11ax CSI up to 160 MHz /
+//!   1992 subcarriers including 6 GHz, ingested from recorded captures or a
+//!   stream written by the external FeitCSI tool (ADR-292)
 //!
 //! # Example Usage
 //!
@@ -36,69 +39,83 @@
 //! let mut receiver = UdpCsiReceiver::new(config).await?;
 //! ```
 
-mod signal_adapter;
-mod neural_adapter;
-mod hardware_adapter;
 pub mod csi_receiver;
+pub mod feitcsi;
+mod hardware_adapter;
+mod neural_adapter;
+mod signal_adapter;
 
-pub use signal_adapter::SignalAdapter;
-pub use neural_adapter::NeuralAdapter;
 pub use hardware_adapter::{
+    AntennaConfig,
+    AtherosDriver,
+    Bandwidth,
+    ChannelConfig,
+    CsiMetadata,
+    // CSI data types
+    CsiReadings,
+    CsiStream,
+    DeviceSettings,
+    DeviceType,
+    // FeitCSI wideband ingest settings (ADR-292)
+    FeitCsiMode,
+    FeitCsiSettings,
+    FlowControl,
+    FrameControlType,
     // Main adapter
     HardwareAdapter,
     // Configuration types
     HardwareConfig,
-    DeviceType,
-    DeviceSettings,
-    AtherosDriver,
-    ChannelConfig,
-    Bandwidth,
-    // Serial settings
-    SerialSettings,
-    Parity,
-    FlowControl,
-    // Network interface settings
-    NetworkInterfaceSettings,
-    AntennaConfig,
-    // UDP settings
-    UdpSettings,
-    // PCAP settings
-    PcapSettings,
-    // Sensor types
-    SensorInfo,
-    SensorStatus,
-    // CSI data types
-    CsiReadings,
-    CsiMetadata,
-    SensorCsiReading,
-    FrameControlType,
-    CsiStream,
     // Health and stats
     HardwareHealth,
     HealthStatus,
+    // Network interface settings
+    NetworkInterfaceSettings,
+    Parity,
+    // PCAP settings
+    PcapSettings,
+    SensorCsiReading,
+    // Sensor types
+    SensorInfo,
+    SensorStatus,
+    // Serial settings
+    SerialSettings,
     StreamingStats,
+    // Wideband spectral provenance (ADR-292)
+    SubcarrierMapping,
+    // UDP settings
+    UdpSettings,
+    WidebandMeta,
+    WifiBand,
 };
 
+pub use feitcsi::{
+    parse_record as parse_feitcsi_record, resample_readings_to_pipeline, FeitCsiBandwidth,
+    FeitCsiError, FeitCsiFileReader, FeitCsiHeader, FeitCsiModType, FeitCsiRecord,
+    FeitCsiStreamReader,
+};
+pub use neural_adapter::NeuralAdapter;
+pub use signal_adapter::SignalAdapter;
+
 pub use csi_receiver::{
-    // Receiver types
-    UdpCsiReceiver,
-    SerialCsiReceiver,
-    PcapCsiReader,
-    // Configuration
-    ReceiverConfig,
-    CsiSource,
-    UdpSourceConfig,
-    SerialSourceConfig,
-    PcapSourceConfig,
-    SerialParity,
     // Packet types
     CsiPacket,
-    CsiPacketMetadata,
     CsiPacketFormat,
+    CsiPacketMetadata,
     // Parser
     CsiParser,
+    CsiSource,
+    PcapCsiReader,
+    PcapSourceConfig,
+    // Configuration
+    ReceiverConfig,
     // Stats
     ReceiverStats,
+    SerialCsiReceiver,
+    SerialParity,
+    SerialSourceConfig,
+    // Receiver types
+    UdpCsiReceiver,
+    UdpSourceConfig,
 };
 
 /// Configuration for integration layer
@@ -161,6 +178,20 @@ pub enum AdapterError {
     #[error("Hardware adapter error: {0}")]
     Hardware(String),
 
+    /// The requested device/driver is genuinely unavailable in this
+    /// environment (missing NIC, kernel module, or device file). This is an
+    /// HONEST error, NOT a stub — the real code path ran and found no hardware.
+    /// Callers must surface this rather than substituting fabricated CSI.
+    #[error("Hardware unavailable: {0}")]
+    HardwareUnavailable(String),
+
+    /// The adapter is recognised but its CSI wire format cannot be parsed in
+    /// this build (e.g. proprietary/NIC-specific format with no public spec or
+    /// no available hardware to validate against). Distinct from a transient
+    /// hardware fault: it will not succeed by retrying.
+    #[error("Unsupported adapter: {0}")]
+    UnsupportedAdapter(String),
+
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
@@ -181,16 +212,8 @@ pub enum AdapterError {
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use super::{
-        AdapterError,
-        HardwareAdapter,
-        HardwareConfig,
-        DeviceType,
-        AtherosDriver,
-        Bandwidth,
-        CsiReadings,
-        CsiPacket,
-        CsiPacketFormat,
-        IntegrationConfig,
+        AdapterError, AtherosDriver, Bandwidth, CsiPacket, CsiPacketFormat, CsiReadings,
+        DeviceType, HardwareAdapter, HardwareConfig, IntegrationConfig,
     };
 }
 

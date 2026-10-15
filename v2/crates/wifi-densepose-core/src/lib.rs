@@ -47,24 +47,47 @@
 extern crate alloc;
 
 pub mod error;
+pub mod pose_observation_v2;
+pub mod pose_refinement_v1;
 pub mod traits;
 pub mod types;
 pub mod utils;
 
 // Re-export commonly used types at the crate root
-pub use error::{CoreError, CoreResult, SignalError, InferenceError, StorageError};
-pub use traits::{SignalProcessor, NeuralInference, DataStore};
+pub use error::{CoreError, CoreResult, InferenceError, SignalError, StorageError};
+pub use pose_observation_v2::{
+    CalibrationId, Coco17Joint, FloorPlane, JointObservation, JointVisibility, ModelRef,
+    PoseDimensionality, PoseObservationV2, PoseTrustState, Probability, SourceProvenance,
+    SpatialFrameRef, SymmetricCovariance3, TrackId, POSE_OBSERVATION_SCHEMA_VERSION,
+};
+pub use pose_refinement_v1::{
+    AbstentionReason, ConstraintResiduals, ContactHypothesis, ContactState, DynamicsResiduals,
+    InterventionSummary, PhysicsMode, PhysicsProvenance, PoseRefinementV1, RefinementDisposition,
+};
+pub use traits::{CanonicalFrame, DataStore, NeuralInference, SignalProcessor};
 pub use types::{
-    // CSI types
-    CsiFrame, CsiMetadata, AntennaConfig,
-    // Signal types
-    ProcessedSignal, SignalFeatures, FrequencyBand,
-    // Pose types
-    PoseEstimate, PersonPose, Keypoint, KeypointType,
-    // Common types
-    Confidence, Timestamp, FrameId, DeviceId,
+    AntennaConfig,
     // Bounding box
     BoundingBox,
+    // ADR-136 canonical complex-sample contract
+    ComplexSample,
+    // Common types
+    Confidence,
+    // CSI types
+    CsiFrame,
+    CsiMetadata,
+    DeviceId,
+    FrameId,
+    FrequencyBand,
+    Keypoint,
+    KeypointType,
+    PersonPose,
+    // Pose types
+    PoseEstimate,
+    // Signal types
+    ProcessedSignal,
+    SignalFeatures,
+    Timestamp,
 };
 
 /// Crate version
@@ -89,13 +112,18 @@ pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 pub mod prelude {
 
     pub use crate::error::{CoreError, CoreResult};
-    pub use crate::traits::{DataStore, NeuralInference, SignalProcessor};
+    pub use crate::traits::{CanonicalFrame, DataStore, NeuralInference, SignalProcessor};
     pub use crate::types::{
-        AntennaConfig, BoundingBox, Confidence, CsiFrame, CsiMetadata, DeviceId, FrameId,
-        FrequencyBand, Keypoint, KeypointType, PersonPose, PoseEstimate, ProcessedSignal,
+        AntennaConfig, BoundingBox, ComplexSample, Confidence, CsiFrame, CsiMetadata, DeviceId,
+        FrameId, FrequencyBand, Keypoint, KeypointType, PersonPose, PoseEstimate, ProcessedSignal,
         SignalFeatures, Timestamp,
     };
 }
+
+// Compile-time assertions on module-level constants.
+const _: () = assert!(MAX_SUBCARRIERS > 0);
+const _: () = assert!(DEFAULT_CONFIDENCE_THRESHOLD > 0.0);
+const _: () = assert!(DEFAULT_CONFIDENCE_THRESHOLD < 1.0);
 
 #[cfg(test)]
 mod tests {
@@ -103,14 +131,13 @@ mod tests {
 
     #[test]
     fn test_version_is_valid() {
-        assert!(!VERSION.is_empty());
+        // CARGO_PKG_VERSION is always non-empty; verify the constant is
+        // accessible and has a dot-separated semver shape.
+        assert!(VERSION.contains('.'), "version should be semver: {VERSION}");
     }
 
     #[test]
     fn test_constants() {
         assert_eq!(MAX_KEYPOINTS, 17);
-        assert!(MAX_SUBCARRIERS > 0);
-        assert!(DEFAULT_CONFIDENCE_THRESHOLD > 0.0);
-        assert!(DEFAULT_CONFIDENCE_THRESHOLD < 1.0);
     }
 }

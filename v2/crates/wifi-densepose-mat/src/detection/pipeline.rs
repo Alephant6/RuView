@@ -3,14 +3,14 @@
 //! This module provides both traditional signal-processing-based detection
 //! and optional ML-enhanced detection for improved accuracy.
 
-use crate::domain::{ScanZone, VitalSignsReading};
-use crate::ml::{MlDetectionConfig, MlDetectionPipeline, MlDetectionResult};
-use crate::{DisasterConfig, MatError};
 use super::{
-    BreathingDetector, BreathingDetectorConfig,
-    HeartbeatDetector, HeartbeatDetectorConfig,
+    BreathingDetector, BreathingDetectorConfig, HeartbeatDetector, HeartbeatDetectorConfig,
     MovementClassifier, MovementClassifierConfig,
 };
+use crate::domain::{ScanZone, VitalSignsReading};
+#[cfg(feature = "ml")]
+use crate::ml::{MlDetectionConfig, MlDetectionPipeline, MlDetectionResult};
+use crate::{DisasterConfig, MatError};
 
 /// Configuration for the detection pipeline
 #[derive(Debug, Clone)]
@@ -27,9 +27,10 @@ pub struct DetectionConfig {
     pub enable_heartbeat: bool,
     /// Minimum overall confidence to report detection
     pub min_confidence: f64,
-    /// Enable ML-enhanced detection
+    /// Enable ML-enhanced detection (requires the `ml` feature to have any effect)
     pub enable_ml: bool,
     /// ML detection configuration (if enabled)
+    #[cfg(feature = "ml")]
     pub ml_config: Option<MlDetectionConfig>,
 }
 
@@ -43,6 +44,7 @@ impl Default for DetectionConfig {
             enable_heartbeat: false,
             min_confidence: 0.3,
             enable_ml: false,
+            #[cfg(feature = "ml")]
             ml_config: None,
         }
     }
@@ -65,6 +67,7 @@ impl DetectionConfig {
     }
 
     /// Enable ML-enhanced detection with the given configuration
+    #[cfg(feature = "ml")]
     pub fn with_ml(mut self, ml_config: MlDetectionConfig) -> Self {
         self.enable_ml = true;
         self.ml_config = Some(ml_config);
@@ -72,6 +75,7 @@ impl DetectionConfig {
     }
 
     /// Enable ML-enhanced detection with default configuration
+    #[cfg(feature = "ml")]
     pub fn with_default_ml(mut self) -> Self {
         self.enable_ml = true;
         self.ml_config = Some(MlDetectionConfig::default());
@@ -86,7 +90,7 @@ pub trait VitalSignsDetector: Send + Sync {
 }
 
 /// Buffer for CSI data samples
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CsiDataBuffer {
     /// Amplitude samples
     pub amplitudes: Vec<f64>,
@@ -148,12 +152,14 @@ pub struct DetectionPipeline {
     movement_classifier: MovementClassifier,
     data_buffer: parking_lot::RwLock<CsiDataBuffer>,
     /// Optional ML detection pipeline
+    #[cfg(feature = "ml")]
     ml_pipeline: Option<MlDetectionPipeline>,
 }
 
 impl DetectionPipeline {
     /// Create a new detection pipeline
     pub fn new(config: DetectionConfig) -> Self {
+        #[cfg(feature = "ml")]
         let ml_pipeline = if config.enable_ml {
             config.ml_config.clone().map(MlDetectionPipeline::new)
         } else {
@@ -165,12 +171,14 @@ impl DetectionPipeline {
             heartbeat_detector: HeartbeatDetector::new(config.heartbeat.clone()),
             movement_classifier: MovementClassifier::new(config.movement.clone()),
             data_buffer: parking_lot::RwLock::new(CsiDataBuffer::new(config.sample_rate)),
+            #[cfg(feature = "ml")]
             ml_pipeline,
             config,
         }
     }
 
     /// Initialize ML models asynchronously (if enabled)
+    #[cfg(feature = "ml")]
     pub async fn initialize_ml(&mut self) -> Result<(), MatError> {
         if let Some(ref mut ml) = self.ml_pipeline {
             ml.initialize().await.map_err(MatError::from)?;
@@ -179,8 +187,9 @@ impl DetectionPipeline {
     }
 
     /// Check if ML pipeline is ready
+    #[cfg(feature = "ml")]
     pub fn ml_ready(&self) -> bool {
-        self.ml_pipeline.as_ref().map_or(true, |ml| ml.is_ready())
+        self.ml_pipeline.as_ref().is_none_or(|ml| ml.is_ready())
     }
 
     /// Process a scan zone and return detected vital signs.
@@ -192,25 +201,42 @@ impl DetectionPipeline {
     ///
     /// Returns `None` if insufficient data is buffered (< 5 seconds) or if
     /// detection confidence is below the configured threshold.
-    pub async fn process_zone(&self, zone: &ScanZone) -> Result<Option<VitalSignsReading>, MatError> {
+    pub async fn process_zone(
+        &self,
+        zone: &ScanZone,
+    ) -> Result<Option<VitalSignsReading>, MatError> {
         // Process buffered CSI data through the signal processing pipeline.
         // Data arrives via add_data() from hardware adapters (ESP32, Intel 5300, etc.)
         // or from the CSI push API endpoint.
-        let buffer = self.data_buffer.read();
+        // Drop the MutexGuard before hitting any await point.
+        let reading = {
+            let buffer = self.data_buffer.read();
+            if !buffer.has_sufficient_data(5.0) {
+                // Need at least 5 seconds of data
+                return Ok(None);
+            }
+            // Detect vital signs using traditional pipeline
+            self.detect_from_buffer(&buffer, zone)?
+            // `buffer` guard dropped here
+        };
 
-        if !buffer.has_sufficient_data(5.0) {
-            // Need at least 5 seconds of data
-            return Ok(None);
-        }
-
-        // Detect vital signs using traditional pipeline
-        let reading = self.detect_from_buffer(&buffer, zone)?;
-
-        // If ML is enabled and ready, enhance with ML predictions
-        let enhanced_reading = if self.config.enable_ml && self.ml_ready() {
-            self.enhance_with_ml(reading, &buffer).await?
-        } else {
-            reading
+        // If ML is enabled and ready, enhance with ML predictions (only
+        // compiled under the `ml` feature; the base build is signal-only).
+        let enhanced_reading = {
+            #[cfg(feature = "ml")]
+            {
+                if self.config.enable_ml && self.ml_ready() {
+                    // Snapshot the buffer under the lock, then drop the guard before await.
+                    let buffer_snapshot = { self.data_buffer.read().clone() };
+                    self.enhance_with_ml(reading, &buffer_snapshot).await?
+                } else {
+                    reading
+                }
+            }
+            #[cfg(not(feature = "ml"))]
+            {
+                reading
+            }
         };
 
         // Check minimum confidence
@@ -224,6 +250,7 @@ impl DetectionPipeline {
     }
 
     /// Enhance detection results with ML predictions
+    #[cfg(feature = "ml")]
     async fn enhance_with_ml(
         &self,
         traditional_reading: Option<VitalSignsReading>,
@@ -256,13 +283,18 @@ impl DetectionPipeline {
     }
 
     /// Get the latest ML detection results (if ML is enabled)
+    #[cfg(feature = "ml")]
     pub async fn get_ml_results(&self) -> Option<MlDetectionResult> {
-        let buffer = self.data_buffer.read();
-        if let Some(ref ml) = self.ml_pipeline {
-            ml.process(&buffer).await.ok()
-        } else {
-            None
-        }
+        let ml = match &self.ml_pipeline {
+            Some(ml) => ml,
+            None => return None,
+        };
+        // Acquire lock, clone the relevant buffer data, then drop the guard before awaiting.
+        let buffer = {
+            let guard = self.data_buffer.read();
+            guard.clone()
+        };
+        ml.process(&buffer).await.ok()
     }
 
     /// Add CSI data to the processing buffer
@@ -292,31 +324,29 @@ impl DetectionPipeline {
         _zone: &ScanZone,
     ) -> Result<Option<VitalSignsReading>, MatError> {
         // Detect breathing
-        let breathing = self.breathing_detector.detect(
-            &buffer.amplitudes,
-            buffer.sample_rate,
-        );
+        let breathing = self
+            .breathing_detector
+            .detect(&buffer.amplitudes, buffer.sample_rate);
 
         // Detect heartbeat (if enabled)
         let heartbeat = if self.config.enable_heartbeat {
             let breathing_rate = breathing.as_ref().map(|b| b.rate_bpm as f64);
-            self.heartbeat_detector.detect(
-                &buffer.phases,
-                buffer.sample_rate,
-                breathing_rate,
-            )
+            self.heartbeat_detector
+                .detect(&buffer.phases, buffer.sample_rate, breathing_rate)
         } else {
             None
         };
 
         // Classify movement
-        let movement = self.movement_classifier.classify(
-            &buffer.amplitudes,
-            buffer.sample_rate,
-        );
+        let movement = self
+            .movement_classifier
+            .classify(&buffer.amplitudes, buffer.sample_rate);
 
         // Check if we detected anything
-        if breathing.is_none() && heartbeat.is_none() && movement.movement_type == crate::domain::MovementType::None {
+        if breathing.is_none()
+            && heartbeat.is_none()
+            && movement.movement_type == crate::domain::MovementType::None
+        {
             return Ok(None);
         }
 
@@ -338,6 +368,7 @@ impl DetectionPipeline {
         self.movement_classifier = MovementClassifier::new(config.movement.clone());
 
         // Update ML pipeline if configuration changed
+        #[cfg(feature = "ml")]
         if config.enable_ml != self.config.enable_ml || config.ml_config != self.config.ml_config {
             self.ml_pipeline = if config.enable_ml {
                 config.ml_config.clone().map(MlDetectionPipeline::new)
@@ -350,6 +381,7 @@ impl DetectionPipeline {
     }
 
     /// Get the ML pipeline (if enabled)
+    #[cfg(feature = "ml")]
     pub fn ml_pipeline(&self) -> Option<&MlDetectionPipeline> {
         self.ml_pipeline.as_ref()
     }
@@ -358,31 +390,27 @@ impl DetectionPipeline {
 impl VitalSignsDetector for DetectionPipeline {
     fn detect(&self, csi_data: &CsiDataBuffer) -> Option<VitalSignsReading> {
         // Detect breathing from amplitude variations
-        let breathing = self.breathing_detector.detect(
-            &csi_data.amplitudes,
-            csi_data.sample_rate,
-        );
+        let breathing = self
+            .breathing_detector
+            .detect(&csi_data.amplitudes, csi_data.sample_rate);
 
         // Detect heartbeat from phase variations
         let heartbeat = if self.config.enable_heartbeat {
             let breathing_rate = breathing.as_ref().map(|b| b.rate_bpm as f64);
-            self.heartbeat_detector.detect(
-                &csi_data.phases,
-                csi_data.sample_rate,
-                breathing_rate,
-            )
+            self.heartbeat_detector
+                .detect(&csi_data.phases, csi_data.sample_rate, breathing_rate)
         } else {
             None
         };
 
         // Classify movement
-        let movement = self.movement_classifier.classify(
-            &csi_data.amplitudes,
-            csi_data.sample_rate,
-        );
+        let movement = self
+            .movement_classifier
+            .classify(&csi_data.amplitudes, csi_data.sample_rate);
 
         // Create reading if we detected anything
-        if breathing.is_some() || heartbeat.is_some()
+        if breathing.is_some()
+            || heartbeat.is_some()
             || movement.movement_type != crate::domain::MovementType::None
         {
             Some(VitalSignsReading::new(breathing, heartbeat, movement))
@@ -457,9 +485,7 @@ mod tests {
 
     #[test]
     fn test_config_from_disaster_config() {
-        let disaster_config = DisasterConfig::builder()
-            .sensitivity(0.9)
-            .build();
+        let disaster_config = DisasterConfig::builder().sensitivity(0.9).build();
 
         let detection_config = DetectionConfig::from_disaster_config(&disaster_config);
 

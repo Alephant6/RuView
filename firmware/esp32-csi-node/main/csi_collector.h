@@ -17,6 +17,9 @@
 /** ADR-018 header size in bytes. */
 #define CSI_HEADER_SIZE 20
 
+/** ADR-018 byte 19: ESP-IDF reported and firmware sanitized invalid CSI prefix. */
+#define CSI_FLAG_FIRST_WORD_SANITIZED (1U << 5)
+
 /** Maximum frame buffer size (header + 4 antennas * 256 subcarriers * 2 bytes). */
 #define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE + 4 * 256 * 2)
 
@@ -91,6 +94,19 @@ void csi_hop_next_channel(void);
 void csi_collector_start_hop_timer(void);
 
 /**
+ * Upgrade the promiscuous filter to capture DATA frames in addition to MGMT
+ * (RuView#893/#521).
+ *
+ * Called on display-less boards: the MGMT-only filter (the #396 display-crash
+ * workaround set in csi_collector_init) only fires the CSI callback on sparse
+ * management frames, so yield collapses to 0 pps under real traffic and the
+ * node looks dead. A board with no AMOLED panel has no QSPI/SPI-flash cache
+ * contention, so it can safely capture DATA frames — restoring abundant CSI.
+ * Display boards keep MGMT-only to avoid the #396 crash.
+ */
+void csi_collector_enable_data_capture(void);
+
+/**
  * Inject an NDP (Null Data Packet) frame for sensing.
  *
  * Uses esp_wifi_80211_tx() to send a preamble-only frame (~24 us airtime)
@@ -122,5 +138,35 @@ uint16_t csi_collector_get_pkt_yield_per_sec(void);
  *         CSI callback path.
  */
 uint16_t csi_collector_get_send_fail_count(void);
+
+/**
+ * Get the cumulative count of CSI frames the stream sender accepted since boot.
+ *
+ * Nonzero means the whole capture path worked at least once: the driver
+ * delivered a CSI callback, the frame serialized, and sendto() accepted it.
+ * Used by the OTA health check (ota_health.c) as its "operational" signal.
+ *
+ * @return Number of successful stream_sender_send() calls from the CSI
+ *         callback path.
+ */
+uint32_t csi_collector_get_send_ok_count(void);
+
+/** Reported by the gate accessors when this build has no selectable gate. */
+#define CSI_GATE_NOT_CONFIGURABLE 0xFF
+
+/**
+ * Report which frame-selection gate is in force, for the on-node log.
+ *
+ * This build has exactly one gate -- mesh-aligned bucketing with an
+ * elapsed-time fallback -- fixed at compile time, so there is no mode or
+ * period to report and both accessors return CSI_GATE_NOT_CONFIGURABLE.
+ *
+ * They exist so the log record keeps a field of fixed width and meaning
+ * whether or not a build can select a gate at runtime, and so an explicit
+ * "not applicable" is stored rather than a plausible number that would
+ * later be reasoned from.
+ */
+uint8_t csi_collector_get_gate_mode(void);
+uint8_t csi_collector_get_gate_seq_period(void);
 
 #endif /* CSI_COLLECTOR_H */

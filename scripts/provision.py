@@ -103,7 +103,9 @@ def generate_nvs_binary(csv_content, size):
         gen_script = os.path.join(idf_path, "components", "nvs_flash",
                                   "nvs_partition_generator", "nvs_partition_gen.py")
         if os.path.isfile(gen_script):
-            subprocess.check_call([
+            # Fixed interpreter/script plus an argv list (never a shell);
+            # csv_path/bin_path are private NamedTemporaryFile paths.
+            subprocess.check_call([  # nosemgrep: dangerous-subprocess-use-tainted-env-args
                 sys.executable, gen_script, "generate",
                 csv_path, bin_path, hex(size)
             ])
@@ -213,7 +215,7 @@ def main():
     if args.ssid:
         print(f"  WiFi SSID:     {args.ssid}")
     if args.password is not None:
-        print(f"  WiFi Password: {'*' * len(args.password)}")
+        print(f"  WiFi Password: {'(set)' if args.password else '(empty)'}")
     if args.target_ip:
         print(f"  Target IP:     {args.target_ip}")
     if args.target_port:

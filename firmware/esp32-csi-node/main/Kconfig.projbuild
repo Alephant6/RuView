@@ -1,5 +1,27 @@
 menu "CSI Node Configuration"
 
+    config C6_XIAO_ANTENNA_SELECT
+        bool "Control the Seeed XIAO ESP32-C6 RF switch"
+        depends on IDF_TARGET_ESP32C6
+        default n
+        help
+            Enable only for Seeed XIAO ESP32-C6 boards. The XIAO uses GPIO3
+            to enable RF-switch control and GPIO14 to choose its internal or
+            external antenna. Leave this disabled for generic ESP32-C6 boards
+            because GPIO3 and GPIO14 may have unrelated functions there.
+
+    choice C6_XIAO_ANTENNA_PATH
+        prompt "Seeed XIAO ESP32-C6 antenna path"
+        depends on C6_XIAO_ANTENNA_SELECT
+        default C6_XIAO_ANTENNA_INTERNAL
+
+        config C6_XIAO_ANTENNA_INTERNAL
+            bool "Internal ceramic antenna"
+
+        config C6_XIAO_ANTENNA_EXTERNAL
+            bool "External U.FL antenna"
+    endchoice
+
     config CSI_NODE_ID
         int "Node ID (0-255)"
         default 1
@@ -39,6 +61,17 @@ menu "CSI Node Configuration"
         help
             WiFi channel to listen on for CSI data.
 
+    config CSI_SELF_PING_HZ
+        int "Connected-STA CSI probe rate (Hz)"
+        default 50
+        range 10 50
+        help
+            Rate of the one-byte ICMP probes used to create a stable OFDM
+            CSI source on quiet networks. Fifty hertz is the measured safety
+            ceiling for the current ESP-IDF WiFi callback path. Higher rates
+            are intentionally rejected because sustained callback load above
+            50 Hz has caused WiFi ISR and packet-buffer failures on S3 and C6.
+
 endmenu
 
 menu "Edge Intelligence (ADR-039)"
@@ -65,6 +98,18 @@ menu "Edge Intelligence (ADR-039)"
         range 1 32
         help
             Number of highest-variance subcarriers to use for DSP.
+
+    config EDGE_DSP_SAMPLE_HZ
+        int "On-device edge DSP sample rate (Hz)"
+        default 8 if IDF_TARGET_ESP32C6
+        default 20
+        range 8 50
+        help
+            Uniform rate at which CSI callbacks enter the Tier 1 and Tier 2
+            edge DSP. Raw CSI transmission keeps its independent full-rate
+            path. Eight hertz is the hardware-measured sustainable C6 Tier 2
+            setting and preserves a 4 Hz Nyquist limit for the 0.1-2.0 Hz
+            vital bands.
 
     config EDGE_FALL_THRESH
         int "Fall detection threshold (x1000)"
@@ -287,6 +332,170 @@ menu "WASM Programmable Sensing (ADR-040)"
 
 endmenu
 
+menu "OTA / WASM HTTP server (ADR-379)"
+
+config OTA_HTTPD_STACK_SIZE
+    int "Stack size of the OTA / WASM HTTP server task (bytes)"
+    range 4096 16384
+    default 8192
+    help
+      HTTPD_DEFAULT_CONFIG() gives 4096. MEASURED 2026-09-29 on an ESP32-S3
+      (node 4, v0.8.12): every POST /ota overflowed it ("stack overflow in
+      task httpd", RTC_SW_CPU_RST), so no OTA had ever completed on this
+      firmware. The same task runs POST /wasm/upload (signature check plus
+      wasm3 module load) and GET /wasm/list.
+
+      Every OTA and WASM upload logs "httpd stack after <handler>: N of M
+      bytes never used". Lower this only with those numbers in hand, and keep
+      at least 1 KB unused on the worst handler.
+
+endmenu
+
+menu "ESP32-C6 capabilities (ADR-110)"
+    depends on IDF_TARGET_ESP32C6
+
+    config C6_TWT_ENABLE
+        bool "Enable TWT (Target Wake Time) negotiation"
+        default y
+        # SOC_WIFI_HE_SUPPORT is auto-set on chips with HE (Wi-Fi 6) PHY (C6/C5)
+        depends on SOC_WIFI_HE_SUPPORT
+        help
+            After WiFi STA connect, request an individual TWT agreement
+            with the AP for deterministic CSI cadence. Falls back
+            gracefully if the AP doesn't support 11ax TWT.
+
+    config C6_TWT_WAKE_INTERVAL_US
+        int "TWT wake interval (microseconds)"
+        default 10000
+        range 1024 1048576
+        depends on C6_TWT_ENABLE
+        help
+            Period between TWT wake events. 10000 µs = 100 Hz CSI cadence.
+
+    config C6_TWT_MIN_WAKE_DURA_US
+        int "TWT minimum wake duration (microseconds)"
+        default 512
+        range 256 16384
+        depends on C6_TWT_ENABLE
+        help
+            Minimum awake duration per TWT wake. 512 µs is enough to
+            capture one CSI frame.
+
+    config C6_TIMESYNC_ENABLE
+        bool "Enable 802.15.4 mesh time-sync"
+        default y
+        depends on IEEE802154_ENABLED
+        help
+            Cross-node clock alignment over the 802.15.4 radio. Frees
+            WiFi airtime from coordination traffic — relevant to
+            ADR-029/030 multistatic sensing.
+
+    config C6_TIMESYNC_CHANNEL
+        int "802.15.4 time-sync channel (11-26)"
+        default 15
+        range 11 26
+        depends on C6_TIMESYNC_ENABLE
+
+    config C6_LP_CORE_ENABLE
+        bool "Enable LP-core wake-on-motion hibernation"
+        default n
+        depends on ULP_COPROC_TYPE_LP_CORE
+        help
+            Arm the LP RISC-V coprocessor as an always-on motion gate
+            in deep sleep. Targets ~5 µA hibernation for battery
+            seed nodes. Requires a motion sensor on a wake-capable GPIO.
+
+    config C6_LP_WAKE_GPIO
+        int "LP-core wake GPIO"
+        default 4
+        range 0 23
+        depends on C6_LP_CORE_ENABLE
+
+    config C6_LP_WAKE_ACTIVE_HIGH
+        bool "Wake on rising edge"
+        default y
+        depends on C6_LP_CORE_ENABLE
+
+    config C6_LP_POLL_PERIOD_US
+        int "LP-core poll period (microseconds)"
+        default 10000
+        range 1000 1000000
+        depends on C6_LP_CORE_ENABLE
+        help
+            How often the LP-core program reads the wake GPIO.
+            10000 µs = 100 Hz. Lower values give faster response
+            but increase the average LP-core duty cycle (and
+            current). 10 ms is a good balance for PIR sensors.
+
+    config C6_LP_DEBOUNCE_SAMPLES
+        int "LP-core debounce sample count"
+        default 3
+        range 1 32
+        depends on C6_LP_CORE_ENABLE
+        help
+            How many consecutive matching GPIO reads are required
+            before the LP-core wakes the HP core. 3 = ~30 ms at the
+            default 10 ms poll period.
+
+    config C6_SOFTAP_HE_ENABLE
+        bool "Run as Wi-Fi 6 soft-AP with TWT Responder (two-board bench)"
+        default n
+        depends on SOC_WIFI_HE_SUPPORT
+        help
+            When set, the C6 starts in AP+STA mode and advertises a
+            soft-AP that announces HE (Wi-Fi 6) capability with
+            TWT Responder=1. Lets a second C6 station-mode board
+            negotiate a real iTWT agreement against a known-cooperative
+            AP, unblocking ADR-110 §B1/B2 measurement without
+            buying an 11ax router. SSID/PSK configured via NVS
+            (keys `softap_ssid` / `softap_psk`) or the defaults below.
+
+    config C6_SOFTAP_HE_SSID
+        string "Soft-AP SSID (when C6_SOFTAP_HE_ENABLE)"
+        default "ruview-c6-twt"
+        depends on C6_SOFTAP_HE_ENABLE
+
+    config C6_SOFTAP_HE_PSK
+        string "Soft-AP WPA2 password (>= 8 chars)"
+        default "ruviewtwt"
+        depends on C6_SOFTAP_HE_ENABLE
+
+    config C6_SOFTAP_HE_CHANNEL
+        int "Soft-AP channel (1-13)"
+        default 6
+        range 1 13
+        depends on C6_SOFTAP_HE_ENABLE
+
+    config C6_SYNC_EVERY_N_FRAMES
+        int "Sync-packet emission cadence (CSI frames per sync)"
+        default 20
+        range 1 1000
+        help
+            How many CSI callbacks fire before csi_collector emits one
+            ADR-110 §A0.11 sync packet (magic 0xC511A110) carrying the
+            mesh-aligned epoch + sequence high-water for the host
+            aggregator to pair against incoming CSI frames.
+
+            Default 20 = ~2 s between sync packets at the bench's
+            observed 10 fps CSI rate. Raise for less wire overhead;
+            lower for tighter multistatic alignment windows.
+
+endmenu
+
+menu "ADR-018 frame extensions (ADR-110)"
+
+    config CSI_FRAME_HE_TAGGING
+        bool "Tag ADR-018 frames with HE PPDU metadata"
+        default y
+        help
+            When the WiFi driver reports an 802.11ax HE-SU/HE-MU/HE-TB
+            PPDU, write the PPDU type + bandwidth into ADR-018 frame
+            bytes 18-19 (previously reserved). Readers that don't know
+            about this extension see the bytes as zero — fully
+            backwards compatible.
+
+endmenu
+
 menu "Mock CSI (QEMU Testing)"
     config CSI_MOCK_ENABLED
         bool "Enable mock CSI generator (for QEMU testing)"
@@ -323,3 +532,224 @@ menu "Mock CSI (QEMU Testing)"
         depends on CSI_MOCK_ENABLED
         default n
 endmenu
+
+menu "Onboard LED (ADR-183)"
+
+    config LED_GAMMA_VIZ
+        bool "Onboard WS2812: 40 Hz gamma flicker + CSI-motion colour"
+        default y
+        help
+            Drive the onboard WS2812 as a GENUS-style 40 Hz gamma square wave
+            (12.5 ms on / 12.5 ms off, 50% duty). The ON-phase colour is live
+            CSI motion (edge motion_energy) mapped through the ruv-neural-viz
+            viridis colormap (still=purple, moving=yellow).
+
+            Disable to leave the LED off at boot — lower power, no flicker.
+            NOTE: a 40 Hz flicker can affect photosensitive users; disable or
+            shield the LED in those environments. Not a medical device.
+
+    config LED_MOTION_FULLSCALE_MILLI
+        int "Motion value (x1000) that saturates the colormap to yellow"
+        depends on LED_GAMMA_VIZ
+        default 250
+        range 1 100000
+        help
+            edge motion_energy that maps to the top (yellow) of the viridis
+            colormap, in milli-units (250 = 0.25). Lower = more sensitive
+            (reaches yellow with less motion).
+endmenu
+
+
+menu "Thermal monitoring"
+
+config THERMAL_MONITOR
+    bool "Read the on-chip temperature sensor and throttle the radio"
+    depends on IDF_TARGET_ESP32C6
+    default y
+    help
+      The C6 has a temperature sensor this firmware otherwise never reads.
+      Harmless on a bare bench board; not once a node is sealed in a printed
+      enclosure on a wall with the radio transmitting continuously.
+
+      What is being protected is the ENCLOSURE, not the silicon. The part is
+      rated far past anything it sees here, but PLA softens at its glass
+      transition (~55-60 C) and sags slowly under its own weight, which never
+      announces itself.
+
+config THERMAL_THROTTLE
+    bool "Act on the temperature by reducing transmit power"
+    depends on THERMAL_MONITOR
+    default n
+    help
+      Separate from monitoring on purpose. Reading the sensor is inert;
+      reducing transmit power moves every RSSI the node has, and doing that
+      mid-experiment gives any surprise two candidate causes.
+
+      Leave off until the fleet is stable and the logs show a node genuinely
+      running hot. If none ever does -- which is the likely outcome -- this
+      never needs enabling, and the thresholds below cost nothing.
+
+config THERMAL_WARN_C
+    int "Warn above this die temperature (C)"
+    depends on THERMAL_MONITOR
+    range 40 100
+    default 65
+
+config THERMAL_THROTTLE_C
+    int "Reduce transmit power above this die temperature (C)"
+    depends on THERMAL_MONITOR
+    range 45 105
+    default 72
+    help
+      Die temperature, not enclosure temperature -- the sensor is on the chip
+      and runs hotter than the plastic around it. ~72 C on the die in a small
+      vented box is roughly a 50-55 C enclosure, which is where PLA begins to
+      matter. Setting this at 55 would throttle a perfectly healthy node.
+
+      PETG (glass transition ~80 C) removes the concern; raise this if the
+      whole fleet is printed in it.
+
+config THERMAL_CRITICAL_C
+    int "Minimum transmit power above this die temperature (C)"
+    depends on THERMAL_MONITOR
+    range 50 110
+    default 80
+
+config THERMAL_HYSTERESIS_C
+    int "Degrees of cooling required before stepping down a thermal state"
+    depends on THERMAL_MONITOR
+    range 1 20
+    default 8
+    help
+      Recovering at the same threshold that tripped would oscillate, and every
+      oscillation is a visible RSSI step on every link the node has.
+
+      Applies to EVERY downward transition, each relative to the threshold that
+      was crossed on the way up: leaving CRITICAL needs CRITICAL_C minus this,
+      leaving THROTTLED needs THROTTLE_C minus this, leaving WARN needs WARN_C
+      minus this. Rising transitions are immediate at the plain thresholds --
+      heat is a reason to act now.
+
+endmenu
+
+menu "Network supervision"
+
+config UPLINK_WATCHDOG
+    bool "Restart the node if the CSI uplink stops for too long"
+    default y
+    help
+      Bounds how long a node can sit powered, capturing, and unable to reach
+      the network.
+
+      MEASURED 2026-08-30: an AP-side event at 03:37 EDT disconnected all three
+      wall-mounted nodes within three minutes of each other, and every one of
+      them stayed dead for 5.5-7.5 hours until it was physically unplugged. The
+      specific cause of that outage (a reconnect counter that gave up
+      permanently) is fixed in main.c, but this exists so the NEXT unknown
+      wedge costs minutes instead of a night of data.
+
+      The watchdog counts a successful sendto(), which on UDP means the network
+      stack accepted the datagram -- not that the aggregator received it. That
+      is deliberate: stopping the server does NOT reboot the fleet, because
+      sendto keeps succeeding into a socket whose peer is gone. It fires only
+      when the node's own network path is broken.
+
+      It arms on the first successful send rather than at boot, so a node
+      powered on while the AP is down does not reboot-loop; the unbounded
+      reconnect handles that case instead.
+
+config UPLINK_WATCHDOG_TIMEOUT_S
+    int "Restart after this many seconds with no successful send"
+    depends on UPLINK_WATCHDOG
+    range 30 3600
+    default 1200
+    help
+      Must sit above the worst SELF-HEALING gap, or the watchdog reboots nodes
+      that were about to recover on their own -- which is worse than the fault
+      it guards against, because every reboot re-runs ESP-NOW leader election
+      and discards the mesh time-sync state.
+
+      This was 120 s on the reasoning that the ENOMEM backoff caps at 2 s so a
+      healthy node is never quiet for long. A 58-minute soak on 2026-08-30
+      falsified that: nodes 0 and 2 each went silent repeatedly with a median
+      gap of 210 s and a maximum of 225 s, and recovered every time without
+      intervention. 120 s would have rebooted them every few minutes forever.
+      (The cause of those 210 s gaps is still unknown -- it is not the ENOMEM
+      backoff, which cannot produce a gap that long.)
+
+      Sized from the completed 112-minute soak, not the partial one: 30
+      silences across two nodes, median 225 s, p90 225 s, and a single 510 s
+      outlier that looks like two cycles running together. A third such merge
+      would reach ~735 s, so 600 s was too tight -- it left only 90 s of margin
+      over an event already observed once.
+
+      1200 s is 2.35x the observed maximum while still bounding a true wedge to
+      twenty minutes rather than the 7.5 hours measured the same day. Revisit
+      it if the ~225 s flapping is ever explained and fixed; until then do not
+      lower it below ~900 s.
+
+      If nodes do restart unexpectedly, check the reset reason in the sync
+      packet's health field before assuming the watchdog is responsible.
+
+endmenu
+
+menu "OTA health check (ADR-379)"
+
+config OTA_HEALTH_TIMEOUT_S
+    int "Seconds an OTA'd image has to prove itself before rolling back"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    range 30 900
+    default 120
+    help
+      Only applies when the running image is ESP_OTA_IMG_PENDING_VERIFY, i.e.
+      it was just delivered by OTA to a node whose bootloader has
+      CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE. USB-flashed and already-confirmed
+      images are never checked.
+
+      Healthy means: the STA got an IP, and the stream sender accepted at least
+      one CSI frame. Both must happen within this many seconds of boot, or the
+      image is marked invalid and the node reboots into the previous slot.
+
+      Measured from boot, and the WiFi boot wait alone can take about two
+      minutes against an absent AP, so an AP outage during a rollout rolls a
+      good image back. That is the safe direction: re-push it later.
+
+config OTA_HEALTH_MIN_UPTIME_S
+    int "Minimum uptime before an OTA'd image may be confirmed"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    range 0 600
+    default 30
+    help
+      Holds confirmation back for this long after boot even once both signals
+      are in, so an image that crashes shortly after starting its pipelines
+      still reverts (a crash while PENDING_VERIFY is a rollback). Clamped to
+      OTA_HEALTH_TIMEOUT_S.
+
+config OTA_HEALTH_FORCE_FAIL
+    bool "TEST ONLY: fail the OTA health check to exercise rollback"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    default n
+    help
+      Builds an image that rolls itself back at the point it would otherwise
+      confirm. OTA-push it to a node to prove rollback works end to end: the
+      node should reboot into the previous image. Has no effect when USB
+      flashed (such an image is not PENDING_VERIFY). Never ship this.
+
+endmenu
+
+config CSI_GATE_MESH_ALIGNED
+    bool "Align the CSI rate gate to mesh time (enables cross-node pairing)"
+    default y
+    help
+      The per-node elapsed gate ("20 ms since MY last accept") gives every node
+      an independent phase, so two healthy nodes at 50 Hz accept disjoint
+      frames and nothing can be paired across them. This aligns the 20 ms
+      window to mesh time so nodes choose the same windows.
+
+config CSI_SEQ_DIAG
+    bool "Log (source MAC, rx_seq) for every CSI callback (ADR-345 phase 2 probe)"
+    default n
+    help
+      Diagnostic. Emits the transmitter address and 802.11 sequence number for
+      each CSI callback so the effect of the gate above can be measured rather
+      than assumed. Verbose; leave off in normal operation.

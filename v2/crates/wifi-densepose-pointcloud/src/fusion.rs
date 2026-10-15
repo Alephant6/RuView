@@ -1,16 +1,16 @@
 //! Multi-modal fusion: camera depth + WiFi RF tomography → unified point cloud.
 
-use crate::pointcloud::{PointCloud, ColorPoint};
+use crate::pointcloud::{ColorPoint, PointCloud};
 use std::collections::HashMap;
 
 /// Occupancy volume from WiFi RF tomography (mirrors RuView's OccupancyVolume).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OccupancyVolume {
-    pub densities: Vec<f64>,   // [nz][ny][nx] voxel densities
+    pub densities: Vec<f64>, // [nz][ny][nx] voxel densities
     pub nx: usize,
     pub ny: usize,
     pub nz: usize,
-    pub bounds: [f64; 6],      // [x_min, y_min, z_min, x_max, y_max, z_max]
+    pub bounds: [f64; 6], // [x_min, y_min, z_min, x_max, y_max, z_max]
     pub occupied_count: usize,
 }
 
@@ -44,7 +44,9 @@ pub fn occupancy_to_pointcloud(vol: &OccupancyVolume) -> PointCloud {
                         x: x as f32,
                         y: y as f32,
                         z: z as f32,
-                        r, g, b: 50,
+                        r,
+                        g,
+                        b: 50,
                         intensity: density as f32,
                     });
                 }
@@ -58,9 +60,11 @@ pub fn occupancy_to_pointcloud(vol: &OccupancyVolume) -> PointCloud {
 ///
 /// Points from all clouds are binned into voxels of the given size.
 /// Each voxel produces one averaged point (position, color, max intensity).
+/// Per-voxel accumulator: (sum_x, sum_y, sum_z, sum_r, sum_g, sum_b, max_intensity, count).
+type VoxelAccum = (f32, f32, f32, f32, f32, f32, f32, u32);
+
 pub fn fuse_clouds(clouds: &[&PointCloud], voxel_size: f32) -> PointCloud {
-    let mut cells: HashMap<(i32, i32, i32), (f32, f32, f32, f32, f32, f32, f32, u32)> = HashMap::new();
-    // (sum_x, sum_y, sum_z, sum_r, sum_g, sum_b, max_intensity, count)
+    let mut cells: HashMap<(i32, i32, i32), VoxelAccum> = HashMap::new();
 
     for cloud in clouds {
         for p in &cloud.points {
@@ -69,7 +73,9 @@ pub fn fuse_clouds(clouds: &[&PointCloud], voxel_size: f32) -> PointCloud {
                 (p.y / voxel_size).floor() as i32,
                 (p.z / voxel_size).floor() as i32,
             );
-            let entry = cells.entry(key).or_insert((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0));
+            let entry = cells
+                .entry(key)
+                .or_insert((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0));
             entry.0 += p.x;
             entry.1 += p.y;
             entry.2 += p.z;
@@ -82,11 +88,15 @@ pub fn fuse_clouds(clouds: &[&PointCloud], voxel_size: f32) -> PointCloud {
     }
 
     let mut fused = PointCloud::new("fused");
-    for (_, (sx, sy, sz, sr, sg, sb, mi, n)) in &cells {
+    for (sx, sy, sz, sr, sg, sb, mi, n) in cells.values() {
         let n = *n as f32;
         fused.points.push(ColorPoint {
-            x: sx / n, y: sy / n, z: sz / n,
-            r: (sr / n) as u8, g: (sg / n) as u8, b: (sb / n) as u8,
+            x: sx / n,
+            y: sy / n,
+            z: sz / n,
+            r: (sr / n) as u8,
+            g: (sg / n) as u8,
+            b: (sb / n) as u8,
             intensity: *mi,
         });
     }
@@ -123,7 +133,10 @@ pub fn demo_occupancy() -> OccupancyVolume {
 
     let occupied_count = densities.iter().filter(|&&d| d > 0.3).count();
     OccupancyVolume {
-        densities, nx, ny, nz,
+        densities,
+        nx,
+        ny,
+        nz,
         bounds: [0.0, 0.0, 0.0, 5.0, 5.0, 3.0],
         occupied_count,
     }
@@ -136,7 +149,15 @@ mod tests {
     fn cloud_with(name: &str, pts: &[(f32, f32, f32)]) -> PointCloud {
         let mut c = PointCloud::new(name);
         for &(x, y, z) in pts {
-            c.points.push(ColorPoint { x, y, z, r: 10, g: 20, b: 30, intensity: 0.5 });
+            c.points.push(ColorPoint {
+                x,
+                y,
+                z,
+                r: 10,
+                g: 20,
+                b: 30,
+                intensity: 0.5,
+            });
         }
         c
     }
@@ -146,18 +167,60 @@ mod tests {
         let a = cloud_with("a", &[(0.0, 0.0, 0.0)]);
         let b = cloud_with("b", &[(5.0, 5.0, 5.0)]);
         let fused = fuse_clouds(&[&a, &b], 0.1);
-        assert_eq!(fused.points.len(), 2, "two far-apart points should yield two voxels");
+        assert_eq!(
+            fused.points.len(),
+            2,
+            "two far-apart points should yield two voxels"
+        );
     }
 
     #[test]
     fn fuse_clouds_voxel_dedup() {
         // Points all within one voxel must collapse to a single averaged point.
-        let a = cloud_with("a", &[
-            (0.01, 0.02, 0.03),
-            (0.04, 0.01, 0.02),
-            (0.03, 0.03, 0.01),
-        ]);
+        let a = cloud_with(
+            "a",
+            &[(0.01, 0.02, 0.03), (0.04, 0.01, 0.02), (0.03, 0.03, 0.01)],
+        );
         let fused = fuse_clouds(&[&a], 0.5);
         assert_eq!(fused.points.len(), 1, "three close points → one voxel");
+    }
+
+    // ── degenerate-input robustness (no panic, sensible output) ────────────
+    //
+    // These pin that the voxel accumulators handle empty / single / all-
+    // coincident inputs without dividing by zero or panicking. The per-voxel
+    // count is always >= 1 (the entry is created on first insert), so the
+    // `/n` averaging is safe — but make that contract explicit so a future
+    // refactor cannot silently reintroduce a div-by-zero.
+
+    #[test]
+    fn fuse_clouds_empty_input_is_empty() {
+        let fused = fuse_clouds(&[], 0.1);
+        assert!(fused.points.is_empty(), "no clouds → no points");
+        let empty = PointCloud::new("empty");
+        let fused2 = fuse_clouds(&[&empty], 0.1);
+        assert!(fused2.points.is_empty(), "empty cloud → no points");
+    }
+
+    #[test]
+    fn fuse_clouds_single_point_is_finite() {
+        let a = cloud_with("a", &[(1.0, 2.0, 3.0)]);
+        let fused = fuse_clouds(&[&a], 0.1);
+        assert_eq!(fused.points.len(), 1);
+        let p = &fused.points[0];
+        assert!(
+            p.x.is_finite() && p.y.is_finite() && p.z.is_finite() && p.intensity.is_finite(),
+            "single-point voxel must average to a finite point"
+        );
+    }
+
+    #[test]
+    fn fuse_clouds_all_coincident_collapses_finite() {
+        // Many identical points → one voxel, finite averaged centroid.
+        let a = cloud_with("a", &[(0.5, 0.5, 0.5); 100]);
+        let fused = fuse_clouds(&[&a], 0.25);
+        assert_eq!(fused.points.len(), 1, "coincident points → one voxel");
+        let p = &fused.points[0];
+        assert!((p.x - 0.5).abs() < 1e-4 && p.x.is_finite());
     }
 }

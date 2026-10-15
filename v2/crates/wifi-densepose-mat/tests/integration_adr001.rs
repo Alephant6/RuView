@@ -10,10 +10,8 @@
 
 use std::sync::Arc;
 use wifi_densepose_mat::{
-    DisasterConfig, DisasterResponse, DisasterType,
-    DetectionPipeline, DetectionConfig,
-    EnsembleClassifier, EnsembleConfig,
-    InMemoryEventStore, EventStore,
+    DetectionConfig, DetectionPipeline, DisasterConfig, DisasterResponse, DisasterType,
+    EnsembleClassifier, EnsembleConfig, EventStore, InMemoryEventStore,
 };
 
 /// Generate deterministic CSI data simulating a breathing survivor.
@@ -67,14 +65,16 @@ fn test_detection_pipeline_accepts_deterministic_data() {
 #[test]
 fn test_ensemble_classifier_triage_logic() {
     use wifi_densepose_mat::domain::{
-        BreathingPattern, BreathingType, MovementProfile,
-        MovementType, HeartbeatSignature, SignalStrength,
-        VitalSignsReading, TriageStatus,
+        BreathingPattern, BreathingType, HeartbeatSignature, MovementProfile, MovementType,
+        SignalStrength, TriageStatus, VitalSignsReading,
     };
 
     let classifier = EnsembleClassifier::new(EnsembleConfig::default());
 
-    // Normal breathing + movement = Minor (Green)
+    // UNIFICATION (canonical TriageCalculator): Periodic movement is treated as
+    // MinimalMovement (likely breathing-correlated, not purposeful), so Normal
+    // breathing + Periodic → Delayed — and the ensemble gate now agrees with the
+    // survivor record. Purposeful (Gross + voluntary) movement is what yields Minor.
     let normal_breathing = VitalSignsReading::new(
         Some(BreathingPattern {
             rate_bpm: 16.0,
@@ -91,8 +91,34 @@ fn test_ensemble_classifier_triage_logic() {
         },
     );
     let result = classifier.classify(&normal_breathing);
-    assert_eq!(result.recommended_triage, TriageStatus::Minor);
+    assert_eq!(result.recommended_triage, TriageStatus::Delayed);
     assert!(result.breathing_detected);
+    // Gate triage must equal the survivor-record triage (single source of truth).
+    assert_eq!(
+        result.recommended_triage,
+        wifi_densepose_mat::domain::triage::TriageCalculator::calculate(&normal_breathing),
+    );
+
+    // Gross + voluntary movement = Responsive (walking wounded) = Minor.
+    let purposeful = VitalSignsReading::new(
+        Some(BreathingPattern {
+            rate_bpm: 16.0,
+            pattern_type: BreathingType::Normal,
+            amplitude: 0.5,
+            regularity: 0.9,
+        }),
+        None,
+        MovementProfile {
+            movement_type: MovementType::Gross,
+            intensity: 0.7,
+            frequency: 0.3,
+            is_voluntary: true,
+        },
+    );
+    assert_eq!(
+        classifier.classify(&purposeful).recommended_triage,
+        TriageStatus::Minor,
+    );
 
     // Agonal breathing = Immediate (Red)
     let agonal = VitalSignsReading::new(
@@ -108,7 +134,10 @@ fn test_ensemble_classifier_triage_logic() {
     let result = classifier.classify(&agonal);
     assert_eq!(result.recommended_triage, TriageStatus::Immediate);
 
-    // Normal breathing, no movement = Delayed (Yellow)
+    // UNIFICATION (canonical): Normal breathing with a pulse but NO detectable
+    // movement = unresponsive (not following commands) = Immediate per START.
+    // The old divergent ensemble returned Delayed here; the survivor record
+    // (TriageCalculator) said Immediate. They now agree on Immediate.
     let stable = VitalSignsReading::new(
         Some(BreathingPattern {
             rate_bpm: 14.0,
@@ -124,8 +153,12 @@ fn test_ensemble_classifier_triage_logic() {
         MovementProfile::default(),
     );
     let result = classifier.classify(&stable);
-    assert_eq!(result.recommended_triage, TriageStatus::Delayed);
+    assert_eq!(result.recommended_triage, TriageStatus::Immediate);
     assert!(result.heartbeat_detected);
+    assert_eq!(
+        result.recommended_triage,
+        wifi_densepose_mat::domain::triage::TriageCalculator::calculate(&stable),
+    );
 }
 
 #[test]
@@ -195,7 +228,15 @@ fn test_deterministic_signal_properties() {
 
     assert_eq!(a1.len(), a2.len());
     for i in 0..a1.len() {
-        assert!((a1[i] - a2[i]).abs() < 1e-15, "Amplitude mismatch at index {}", i);
-        assert!((p1[i] - p2[i]).abs() < 1e-15, "Phase mismatch at index {}", i);
+        assert!(
+            (a1[i] - a2[i]).abs() < 1e-15,
+            "Amplitude mismatch at index {}",
+            i
+        );
+        assert!(
+            (p1[i] - p2[i]).abs() < 1e-15,
+            "Phase mismatch at index {}",
+            i
+        );
     }
 }

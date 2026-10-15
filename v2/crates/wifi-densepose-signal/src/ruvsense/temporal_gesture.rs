@@ -14,11 +14,19 @@
 //! - ADR-030 Tier 6: Invisible Interaction Layer
 //! - ADR-032a Section 6.4: midstreamer-temporal-compare integration
 
-use midstreamer_temporal_compare::{
-    ComparisonAlgorithm, Sequence, TemporalComparator,
-};
+use midstreamer_temporal_compare::{ComparisonAlgorithm, Sequence, TemporalComparator};
 
 use super::gesture::{GestureConfig, GestureError, GestureResult, GestureTemplate};
+
+/// Minimum second-best distance (ADR-154 §7.4 — de-magicked) below which the
+/// relative-margin confidence `1 - best/second_best` would divide by a
+/// near-zero denominator; below this we fall back to the `max_distance`-relative
+/// confidence. Mirrors the same guard in `gesture.rs`.
+const CONFIDENCE_SECOND_BEST_EPSILON: f64 = 1e-10;
+
+/// Fixed-point scale used to quantize a frame's L2 norm to an i64 for the
+/// integer temporal comparator (norm·SCALE truncated). Empirical resolution.
+const NORM_QUANTIZATION_SCALE: f64 = 1000.0;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -99,10 +107,7 @@ pub struct TemporalGestureClassifier {
 impl TemporalGestureClassifier {
     /// Create a new temporal gesture classifier.
     pub fn new(config: TemporalGestureConfig) -> Self {
-        let comparator = TemporalComparator::new(
-            config.cache_capacity,
-            config.max_sequence_length,
-        );
+        let comparator = TemporalComparator::new(config.cache_capacity, config.max_sequence_length);
         Self {
             config,
             templates: Vec::new(),
@@ -112,10 +117,7 @@ impl TemporalGestureClassifier {
     }
 
     /// Register a gesture template.
-    pub fn add_template(
-        &mut self,
-        template: GestureTemplate,
-    ) -> Result<(), GestureError> {
+    pub fn add_template(&mut self, template: GestureTemplate) -> Result<(), GestureError> {
         if template.name.is_empty() {
             return Err(GestureError::InvalidTemplateName(
                 "Template name cannot be empty".into(),
@@ -181,9 +183,7 @@ impl TemporalGestureClassifier {
         let mut best_idx: Option<usize> = None;
 
         for (idx, template_seq) in self.template_sequences.iter().enumerate() {
-            let result = self
-                .comparator
-                .compare(&query_seq, template_seq, algo);
+            let result = self.comparator.compare(&query_seq, template_seq, algo);
             // Use distance from ComparisonResult (lower = better match)
             let distance = match result {
                 Ok(cr) => cr.distance,
@@ -202,7 +202,10 @@ impl TemporalGestureClassifier {
         let recognized = best_distance <= self.config.max_distance;
 
         // Confidence based on margin between best and second-best
-        let confidence = if recognized && second_best.is_finite() && second_best > 1e-10 {
+        let confidence = if recognized
+            && second_best.is_finite()
+            && second_best > CONFIDENCE_SECOND_BEST_EPSILON
+        {
             (1.0 - best_distance / second_best).clamp(0.0, 1.0)
         } else if recognized {
             (1.0 - best_distance / self.config.max_distance).clamp(0.0, 1.0)
@@ -254,13 +257,13 @@ impl TemporalGestureClassifier {
 
     /// Convert a feature sequence to a midstreamer `Sequence<i64>`.
     ///
-    /// Each frame's L2 norm is quantized to an i64 (multiplied by 1000)
-    /// for use with the generic comparator.
+    /// Each frame's L2 norm is quantized to an i64 (multiplied by
+    /// [`NORM_QUANTIZATION_SCALE`]) for use with the generic comparator.
     fn to_sequence(frames: &[Vec<f64>]) -> Sequence<i64> {
         let mut seq = Sequence::new();
         for (i, frame) in frames.iter().enumerate() {
             let norm = frame.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let quantized = (norm * 1000.0) as i64;
+            let quantized = (norm * NORM_QUANTIZATION_SCALE) as i64;
             seq.push(quantized, i as u64);
         }
         seq
@@ -283,8 +286,8 @@ impl std::fmt::Debug for TemporalGestureClassifier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::gesture::GestureType;
+    use super::*;
 
     fn make_template(
         name: &str,
@@ -385,7 +388,13 @@ mod tests {
     fn test_temporal_classify_too_short() {
         let mut classifier = TemporalGestureClassifier::new(small_config());
         classifier
-            .add_template(make_template("wave", GestureType::Wave, 10, 4, wave_pattern))
+            .add_template(make_template(
+                "wave",
+                GestureType::Wave,
+                10,
+                4,
+                wave_pattern,
+            ))
             .unwrap();
         let seq: Vec<Vec<f64>> = (0..3).map(|_| vec![0.0; 4]).collect();
         assert!(matches!(
@@ -407,17 +416,32 @@ mod tests {
         let result = classifier.classify(&seq, 1, 100_000).unwrap();
         assert!(result.recognized, "Exact match should be recognized");
         assert_eq!(result.gesture_type, Some(GestureType::Wave));
-        assert!(result.distance < 1e-6, "Exact match should have near-zero distance");
+        assert!(
+            result.distance < 1e-6,
+            "Exact match should have near-zero distance"
+        );
     }
 
     #[test]
     fn test_temporal_classify_best_of_two() {
         let mut classifier = TemporalGestureClassifier::new(small_config());
         classifier
-            .add_template(make_template("wave", GestureType::Wave, 10, 4, wave_pattern))
+            .add_template(make_template(
+                "wave",
+                GestureType::Wave,
+                10,
+                4,
+                wave_pattern,
+            ))
             .unwrap();
         classifier
-            .add_template(make_template("push", GestureType::Push, 10, 4, push_pattern))
+            .add_template(make_template(
+                "push",
+                GestureType::Push,
+                10,
+                4,
+                push_pattern,
+            ))
             .unwrap();
 
         let seq: Vec<Vec<f64>> = (0..10)
@@ -452,7 +476,13 @@ mod tests {
         };
         let mut classifier = TemporalGestureClassifier::new(config);
         classifier
-            .add_template(make_template("wave", GestureType::Wave, 10, 4, wave_pattern))
+            .add_template(make_template(
+                "wave",
+                GestureType::Wave,
+                10,
+                4,
+                wave_pattern,
+            ))
             .unwrap();
 
         let seq: Vec<Vec<f64>> = (0..10)
@@ -471,7 +501,13 @@ mod tests {
         };
         let mut classifier = TemporalGestureClassifier::new(config);
         classifier
-            .add_template(make_template("wave", GestureType::Wave, 10, 4, wave_pattern))
+            .add_template(make_template(
+                "wave",
+                GestureType::Wave,
+                10,
+                4,
+                wave_pattern,
+            ))
             .unwrap();
 
         let seq: Vec<Vec<f64>> = (0..10)
@@ -513,5 +549,15 @@ mod tests {
         let classifier = TemporalGestureClassifier::new(small_config());
         let dbg = format!("{:?}", classifier);
         assert!(dbg.contains("TemporalGestureClassifier"));
+    }
+
+    // -- ADR-154 §7.4: de-magic-constant pin test.
+
+    /// De-magicked confidence epsilon + quantization scale must equal the
+    /// prior inline literals.
+    #[test]
+    fn temporal_gesture_consts_unchanged_from_literals() {
+        assert_eq!(CONFIDENCE_SECOND_BEST_EPSILON, 1e-10);
+        assert_eq!(NORM_QUANTIZATION_SCALE, 1000.0);
     }
 }

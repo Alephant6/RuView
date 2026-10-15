@@ -182,6 +182,8 @@ pub struct RfTomographer {
     weight_matrix: Vec<Vec<(usize, f64)>>,
     /// Number of voxels.
     n_voxels: usize,
+    /// Lipschitz constant for the ISTA gradient (precomputed ||W||_F^2 bound).
+    lipschitz: f64,
 }
 
 impl RfTomographer {
@@ -222,10 +224,20 @@ impl RfTomographer {
             return Err(TomographyError::NoIntersections);
         }
 
+        // Lipschitz upper bound for the ISTA step size: ||W^T W|| <= ||W||_F^2.
+        // Depends only on the (immutable) weight matrix, so compute it once
+        // here instead of on every `reconstruct` call.
+        let frobenius_sq: f64 = weight_matrix
+            .iter()
+            .flat_map(|ws| ws.iter().map(|&(_, w)| w * w))
+            .sum();
+        let lipschitz = frobenius_sq.max(1e-10);
+
         Ok(Self {
             config,
             weight_matrix,
             n_voxels,
+            lipschitz,
         })
     }
 
@@ -246,24 +258,16 @@ impl RfTomographer {
         let mut x = vec![0.0_f64; self.n_voxels];
         let n_links = attenuations.len();
 
-        // Estimate step size: 1 / L where L is the Lipschitz constant of the
-        // gradient of ||Wx - y||^2, i.e. the spectral norm of W^T W.
-        // A safe upper bound is the Frobenius norm squared of W (sum of all
-        // squared entries), since ||W^T W|| <= ||W||_F^2.
-        let frobenius_sq: f64 = self
-            .weight_matrix
-            .iter()
-            .flat_map(|ws| ws.iter().map(|&(_, w)| w * w))
-            .sum();
-        let lipschitz = frobenius_sq.max(1e-10);
-        let step_size = 1.0 / lipschitz;
+        // Step size 1 / L, with L precomputed in `new` (||W||_F^2 upper bound).
+        let step_size = 1.0 / self.lipschitz;
 
         let mut residual = 0.0_f64;
         let mut iterations = 0;
+        let mut gradient = vec![0.0_f64; self.n_voxels];
 
         for iter in 0..self.config.max_iterations {
             // Compute gradient: W^T (Wx - y)
-            let mut gradient = vec![0.0_f64; self.n_voxels];
+            gradient.fill(0.0);
             residual = 0.0;
 
             for (link_idx, weights) in self.weight_matrix.iter().enumerate() {
@@ -402,28 +406,33 @@ fn compute_link_weights(link: &LinkGeometry, config: &TomographyConfig) -> Vec<(
         // Expand by Fresnel radius to check neighboring voxels.
         for diz in -expand_z..=expand_z {
             let iz = base_iz + diz;
-            if iz < 0 || iz >= config.nz as isize { continue; }
+            if iz < 0 || iz >= config.nz as isize {
+                continue;
+            }
             for diy in -expand_y..=expand_y {
                 let iy = base_iy + diy;
-                if iy < 0 || iy >= config.ny as isize { continue; }
+                if iy < 0 || iy >= config.ny as isize {
+                    continue;
+                }
                 for dix in -expand_x..=expand_x {
                     let ix = base_ix + dix;
-                    if ix < 0 || ix >= config.nx as isize { continue; }
+                    if ix < 0 || ix >= config.nx as isize {
+                        continue;
+                    }
 
-                    let idx = iz as usize * config.ny * config.nx
-                        + iy as usize * config.nx
-                        + ix as usize;
+                    let idx =
+                        iz as usize * config.ny * config.nx + iy as usize * config.nx + ix as usize;
 
-                    if visited[idx] { continue; }
+                    if visited[idx] {
+                        continue;
+                    }
 
                     let cx = config.bounds[0] + (ix as f64 + 0.5) * vx;
                     let cy = config.bounds[1] + (iy as f64 + 0.5) * vy;
                     let cz = config.bounds[2] + (iz as f64 + 0.5) * vz;
 
                     let dist = point_to_segment_distance(
-                        cx, cy, cz,
-                        link.tx.x, link.tx.y, link.tx.z,
-                        dx, dy, dz, link_dist,
+                        cx, cy, cz, link.tx.x, link.tx.y, link.tx.z, dx, dy, dz, link_dist,
                     );
 
                     if dist < fresnel_radius {
@@ -441,6 +450,7 @@ fn compute_link_weights(link: &LinkGeometry, config: &TomographyConfig) -> Vec<(
 
 /// Distance from point (px,py,pz) to line segment defined by start + t*dir
 /// where dir = (dx,dy,dz) and segment length = `seg_len`.
+#[allow(clippy::too_many_arguments)]
 fn point_to_segment_distance(
     px: f64,
     py: f64,

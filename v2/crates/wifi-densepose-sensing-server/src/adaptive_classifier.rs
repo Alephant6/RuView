@@ -27,9 +27,71 @@ const N_FEATURES: usize = 15;
 /// Default class names for backward compatibility with old saved models.
 const DEFAULT_CLASSES: &[&str] = &["absent", "present_still", "present_moving", "active"];
 
+/// Model version written by the trainer. Version 2 models consume the measured
+/// temporal `dominant_freq_hz` that recordings carry (ADR-356); stamping 1 here
+/// would make the server swap in the legacy subcarrier proxy at runtime.
+pub const TRAINED_MODEL_VERSION: u32 = 2;
+
+/// Subcarrier amplitudes kept per node in the broadcast `sensing_update`, and
+/// therefore in every recording. Runtime classification truncates to the same
+/// length so the subcarrier statistics match what training saw.
+pub const RECORDED_AMPLITUDE_LEN: usize = 56;
+
+/// Extract one feature vector per node from a recorded `sensing_update` line.
+///
+/// Runtime classification is per node, from that node's own features and
+/// amplitudes. Each broadcast carries a snapshot of every node, so a node only
+/// contributes when its amplitude vector changed since the previous line
+/// (`last_amps`), i.e. when it delivered a new frame. Stale nodes are skipped.
+/// Lines without `node_features` (older single-node recordings) fall back to
+/// the frame-level features and the first node.
+pub fn node_samples_from_frame(
+    frame: &serde_json::Value,
+    last_amps: &mut HashMap<u64, Vec<f64>>,
+) -> Vec<[f64; N_FEATURES]> {
+    let Some(per_node) = frame.get("node_features").and_then(|n| n.as_array()) else {
+        return vec![features_from_frame(frame)];
+    };
+    let nodes = frame
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut samples = Vec::new();
+    for entry in per_node {
+        if entry
+            .get("stale")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(node_id) = entry.get("node_id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let amps: Vec<f64> = nodes
+            .iter()
+            .find(|n| n.get("node_id").and_then(|v| v.as_u64()) == Some(node_id))
+            .and_then(|n| n.get("amplitude"))
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+            .unwrap_or_default();
+        if amps.is_empty() || last_amps.get(&node_id) == Some(&amps) {
+            continue;
+        }
+        let feat = entry.get("features").cloned().unwrap_or_default();
+        samples.push(features_from_runtime(&feat, &amps));
+        last_amps.insert(node_id, amps);
+    }
+    samples
+}
+
 /// Extract extended feature vector from a JSONL frame (features + raw amplitudes).
 pub fn features_from_frame(frame: &serde_json::Value) -> [f64; N_FEATURES] {
-    let feat = frame.get("features").cloned().unwrap_or(serde_json::Value::Null);
+    let feat = frame
+        .get("features")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let nodes = frame.get("nodes").and_then(|n| n.as_array());
     let amps: Vec<f64> = nodes
         .and_then(|ns| ns.first())
@@ -40,38 +102,134 @@ pub fn features_from_frame(frame: &serde_json::Value) -> [f64; N_FEATURES] {
 
     // Server-computed features (0-6).
     let variance = feat.get("variance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let mbp = feat.get("motion_band_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let bbp = feat.get("breathing_band_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let sp = feat.get("spectral_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let df = feat.get("dominant_freq_hz").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cp = feat.get("change_points").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let rssi = feat.get("mean_rssi").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let mbp = feat
+        .get("motion_band_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let bbp = feat
+        .get("breathing_band_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let sp = feat
+        .get("spectral_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let df = feat
+        .get("dominant_freq_hz")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cp = feat
+        .get("change_points")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let rssi = feat
+        .get("mean_rssi")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     // Subcarrier-derived features (7-14).
     let (amp_mean, amp_std, amp_skew, amp_kurt, amp_iqr, amp_entropy, amp_max, amp_range) =
         subcarrier_stats(&amps);
 
     [
-        variance, mbp, bbp, sp, df, cp, rssi,
-        amp_mean, amp_std, amp_skew, amp_kurt, amp_iqr, amp_entropy, amp_max, amp_range,
+        variance,
+        mbp,
+        bbp,
+        sp,
+        df,
+        cp,
+        rssi,
+        amp_mean,
+        amp_std,
+        amp_skew,
+        amp_kurt,
+        amp_iqr,
+        amp_entropy,
+        amp_max,
+        amp_range,
     ]
 }
 
 /// Also keep a simpler version for runtime (no JSONL, just FeatureInfo + amps).
 pub fn features_from_runtime(feat: &serde_json::Value, amps: &[f64]) -> [f64; N_FEATURES] {
     let variance = feat.get("variance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let mbp = feat.get("motion_band_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let bbp = feat.get("breathing_band_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let sp = feat.get("spectral_power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let df = feat.get("dominant_freq_hz").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let cp = feat.get("change_points").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let rssi = feat.get("mean_rssi").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let mbp = feat
+        .get("motion_band_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let bbp = feat
+        .get("breathing_band_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let sp = feat
+        .get("spectral_power")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let df = feat
+        .get("dominant_freq_hz")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let cp = feat
+        .get("change_points")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let rssi = feat
+        .get("mean_rssi")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let amps = &amps[..amps.len().min(RECORDED_AMPLITUDE_LEN)];
     let (amp_mean, amp_std, amp_skew, amp_kurt, amp_iqr, amp_entropy, amp_max, amp_range) =
         subcarrier_stats(amps);
     [
-        variance, mbp, bbp, sp, df, cp, rssi,
-        amp_mean, amp_std, amp_skew, amp_kurt, amp_iqr, amp_entropy, amp_max, amp_range,
+        variance,
+        mbp,
+        bbp,
+        sp,
+        df,
+        cp,
+        rssi,
+        amp_mean,
+        amp_std,
+        amp_skew,
+        amp_kurt,
+        amp_iqr,
+        amp_entropy,
+        amp_max,
+        amp_range,
     ]
+}
+
+/// Preserve the fifth feature's historical meaning for models trained before
+/// the server began measuring temporal frequency from a frame window.
+///
+/// Version 1 models learned a proxy equal to the strongest subcarrier index
+/// multiplied by 0.05. Version 2 and later models consume the measured
+/// temporal frequency in hertz. Keeping this translation at the model boundary
+/// prevents a server upgrade from silently changing an existing model's input
+/// distribution.
+pub fn compatible_dominant_frequency(
+    model_version: u32,
+    temporal_frequency_hz: f64,
+    amplitudes: &[f64],
+) -> f64 {
+    if model_version >= 2 {
+        return if temporal_frequency_hz.is_finite() {
+            temporal_frequency_hz.max(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    amplitudes
+        .iter()
+        .enumerate()
+        .filter(|(_, amplitude)| amplitude.is_finite())
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(index, _)| index as f64 * 0.05)
+        .unwrap_or(0.0)
 }
 
 /// Compute statistical features from raw subcarrier amplitudes.
@@ -91,19 +249,29 @@ fn subcarrier_stats(amps: &[f64]) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
 
     // IQR (inter-quartile range).
     let mut sorted = amps.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // partial_cmp returns None on NaN — fall back to Equal so a single NaN
+    // frame from real ESP32 hardware (silent DSP div-by-zero, empty buffer)
+    // can't panic the whole sensing server (#611). The same file already
+    // uses unwrap_or(Equal) at lines 149-150 and 155; this was an oversight.
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q1 = sorted[sorted.len() / 4];
     let q3 = sorted[3 * sorted.len() / 4];
     let iqr = q3 - q1;
 
     // Spectral entropy (normalised).
     let total_power: f64 = amps.iter().map(|a| a * a).sum::<f64>().max(1e-9);
-    let entropy: f64 = amps.iter()
+    let entropy: f64 = amps
+        .iter()
         .map(|a| {
             let p = (a * a) / total_power;
-            if p > 1e-12 { -p * p.ln() } else { 0.0 }
+            if p > 1e-12 {
+                -p * p.ln()
+            } else {
+                0.0
+            }
         })
-        .sum::<f64>() / n.ln().max(1e-9); // normalise to [0,1]
+        .sum::<f64>()
+        / n.ln().max(1e-9); // normalise to [0,1]
 
     let max_val = sorted.last().copied().unwrap_or(0.0);
     let range = max_val - sorted.first().copied().unwrap_or(0.0);
@@ -178,15 +346,17 @@ impl AdaptiveModel {
         }
 
         // Compute logits: w·x + b for each class.
-        let mut logits: Vec<f64> = vec![0.0; n_classes];
-        for c in 0..n_classes {
-            let w = &self.weights[c];
-            let mut z = w[N_FEATURES]; // bias
-            for i in 0..N_FEATURES {
-                z += w[i] * x[i];
-            }
-            logits[c] = z;
-        }
+        let logits: Vec<f64> = (0..n_classes)
+            .map(|c| {
+                let w = &self.weights[c];
+                w[N_FEATURES]
+                    + w[..N_FEATURES]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(&wi, &xi)| wi * xi)
+                        .sum::<f64>()
+            })
+            .collect();
 
         // Softmax.
         let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -196,9 +366,13 @@ impl AdaptiveModel {
             probs[c] = ((logits[c] - max_logit).exp()) / exp_sum;
         }
 
-        // Pick argmax.
-        let (best_c, best_p) = probs.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        // Pick argmax. Same NaN-panic class as #611: if any raw_feature is NaN
+        // it propagates through normalize → logits → softmax, then partial_cmp
+        // returns None and unwrap() panics the sensing server on every frame.
+        let (best_c, best_p) = probs
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         let label = if best_c < self.class_names.len() {
             self.class_names[best_c].clone()
@@ -210,16 +384,14 @@ impl AdaptiveModel {
 
     /// Save model to a JSON file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     /// Load model from a JSON file.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
-        serde_json::from_str(&json)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&json).map_err(std::io::Error::other)
     }
 }
 
@@ -237,14 +409,16 @@ fn load_recording(path: &Path, class_idx: usize) -> Vec<Sample> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    content.lines().filter_map(|line| {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        // Use extended features (server features + subcarrier stats).
-        Some(Sample {
-            features: features_from_frame(&v),
+    let mut last_amps = HashMap::new();
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .flat_map(|v| node_samples_from_frame(&v, &mut last_amps))
+        .map(|features| Sample {
+            features,
             class_idx,
         })
-    }).collect()
+        .collect()
 }
 
 /// Map a recording filename to a class name (String).
@@ -257,13 +431,23 @@ fn classify_recording_name(name: &str) -> Option<String> {
     // or the entire middle portion if no pattern matches.
 
     // Check common patterns first for backward compat
-    if lower.contains("empty") || lower.contains("absent") { return Some("absent".into()); }
-    if lower.contains("still") || lower.contains("sitting") || lower.contains("standing") { return Some("present_still".into()); }
-    if lower.contains("walking") || lower.contains("moving") { return Some("present_moving".into()); }
-    if lower.contains("active") || lower.contains("exercise") || lower.contains("running") { return Some("active".into()); }
+    if lower.contains("empty") || lower.contains("absent") {
+        return Some("absent".into());
+    }
+    if lower.contains("still") || lower.contains("sitting") || lower.contains("standing") {
+        return Some("present_still".into());
+    }
+    if lower.contains("walking") || lower.contains("moving") {
+        return Some("present_moving".into());
+    }
+    if lower.contains("active") || lower.contains("exercise") || lower.contains("running") {
+        return Some("active".into());
+    }
 
     // Fallback: extract class from filename structure train_<class>_*.jsonl
-    let stem = lower.trim_start_matches("train_").trim_end_matches(".jsonl");
+    let stem = lower
+        .trim_start_matches("train_")
+        .trim_end_matches(".jsonl");
     let class_name = stem.split('_').next().unwrap_or(stem);
     if !class_name.is_empty() {
         Some(class_name.to_string())
@@ -318,8 +502,12 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
     for (path, fname, class_name) in &file_classes {
         let class_idx = class_map[class_name];
         let loaded = load_recording(path, class_idx);
-        eprintln!("  Loaded {}: {} frames → class '{}'",
-                 fname, loaded.len(), class_name);
+        eprintln!(
+            "  Loaded {}: {} frames → class '{}'",
+            fname,
+            loaded.len(),
+            class_name
+        );
         samples.extend(loaded);
     }
 
@@ -328,15 +516,22 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
     }
 
     let n = samples.len();
-    eprintln!("Total training samples: {n} across {n_classes} classes: {:?}", class_names);
+    eprintln!(
+        "Total training samples: {n} across {n_classes} classes: {:?}",
+        class_names
+    );
 
     // ── Compute global normalisation stats ──
     let mut global_mean = [0.0f64; N_FEATURES];
     let mut global_var = [0.0f64; N_FEATURES];
     for s in &samples {
-        for i in 0..N_FEATURES { global_mean[i] += s.features[i]; }
+        for (m, &f) in global_mean.iter_mut().zip(s.features.iter()) {
+            *m += f;
+        }
     }
-    for i in 0..N_FEATURES { global_mean[i] /= n as f64; }
+    for m in global_mean.iter_mut() {
+        *m /= n as f64;
+    }
     for s in &samples {
         for i in 0..N_FEATURES {
             global_var[i] += (s.features[i] - global_mean[i]).powi(2);
@@ -378,13 +573,16 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
     }
 
     // ── Normalise all samples ──
-    let mut norm_samples: Vec<([f64; N_FEATURES], usize)> = samples.iter().map(|s| {
-        let mut x = [0.0; N_FEATURES];
-        for i in 0..N_FEATURES {
-            x[i] = (s.features[i] - global_mean[i]) / (global_std[i] + 1e-9);
-        }
-        (x, s.class_idx)
-    }).collect();
+    let mut norm_samples: Vec<([f64; N_FEATURES], usize)> = samples
+        .iter()
+        .map(|s| {
+            let mut x = [0.0; N_FEATURES];
+            for i in 0..N_FEATURES {
+                x[i] = (s.features[i] - global_mean[i]) / (global_std[i] + 1e-9);
+            }
+            (x, s.class_idx)
+        })
+        .collect();
 
     // ── Train logistic regression via mini-batch SGD ──
     let mut weights: Vec<Vec<f64>> = vec![vec![0.0f64; N_FEATURES + 1]; n_classes];
@@ -395,7 +593,9 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
     // Shuffle helper (simple LCG for determinism).
     let mut rng_state: u64 = 42;
     let mut rng_next = move || -> u64 {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng_state >> 33
     };
 
@@ -407,7 +607,6 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
         }
 
         let mut epoch_loss = 0.0f64;
-        let mut _batch_count = 0;
 
         for batch_start in (0..norm_samples.len()).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(norm_samples.len());
@@ -419,11 +618,13 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
             for (x, target) in batch {
                 // Forward: softmax.
                 let mut logits: Vec<f64> = vec![0.0; n_classes];
-                for c in 0..n_classes {
-                    logits[c] = weights[c][N_FEATURES]; // bias
-                    for i in 0..N_FEATURES {
-                        logits[c] += weights[c][i] * x[i];
-                    }
+                for (c, logit) in logits.iter_mut().enumerate() {
+                    *logit = weights[c][N_FEATURES]; // bias
+                    *logit += weights[c][..N_FEATURES]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(&w, &xi)| w * xi)
+                        .sum::<f64>();
                 }
                 let max_l = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let exp_sum: f64 = logits.iter().map(|z| (z - max_l).exp()).sum();
@@ -438,8 +639,8 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
                 // Gradient: prob - one_hot(target).
                 for c in 0..n_classes {
                     let delta = probs[c] - if c == *target { 1.0 } else { 0.0 };
-                    for i in 0..N_FEATURES {
-                        grad[c][i] += delta * x[i];
+                    for (g, &xi) in grad[c][..N_FEATURES].iter_mut().zip(x.iter()) {
+                        *g += delta * xi;
                     }
                     grad[c][N_FEATURES] += delta; // bias grad
                 }
@@ -453,7 +654,6 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
                     weights[c][i] -= current_lr * grad[c][i] / bs;
                 }
             }
-            _batch_count += 1;
         }
 
         if epoch % 50 == 0 || epoch == epochs - 1 {
@@ -463,44 +663,63 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
     }
 
     // ── Evaluate accuracy ──
+    let compute_logits = |x: &[f64]| -> Vec<f64> {
+        (0..n_classes)
+            .map(|c| {
+                weights[c][N_FEATURES]
+                    + weights[c][..N_FEATURES]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(&w, &xi)| w * xi)
+                        .sum::<f64>()
+            })
+            .collect()
+    };
     let mut correct = 0;
     for (x, target) in &norm_samples {
-        let mut logits: Vec<f64> = vec![0.0; n_classes];
-        for c in 0..n_classes {
-            logits[c] = weights[c][N_FEATURES];
-            for i in 0..N_FEATURES {
-                logits[c] += weights[c][i] * x[i];
-            }
+        let logits = compute_logits(x);
+        let pred = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap()
+            .0;
+        if pred == *target {
+            correct += 1;
         }
-        let pred = logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap().0;
-        if pred == *target { correct += 1; }
     }
     let accuracy = correct as f64 / n as f64;
-    eprintln!("Training accuracy: {correct}/{n} = {accuracy:.1}%");
+    // In-sample only: this is not an evaluation and must not be quoted as one.
+    eprintln!(
+        "Training accuracy (in-sample): {correct}/{n} = {:.1}%",
+        accuracy * 100.0
+    );
 
     // ── Per-class accuracy ──
     let mut class_correct = vec![0usize; n_classes];
     let mut class_total = vec![0usize; n_classes];
     for (x, target) in &norm_samples {
         class_total[*target] += 1;
-        let mut logits: Vec<f64> = vec![0.0; n_classes];
-        for c in 0..n_classes {
-            logits[c] = weights[c][N_FEATURES];
-            for i in 0..N_FEATURES {
-                logits[c] += weights[c][i] * x[i];
-            }
+        let logits = compute_logits(x);
+        let pred = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap()
+            .0;
+        if pred == *target {
+            class_correct[*target] += 1;
         }
-        let pred = logits.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap().0;
-        if pred == *target { class_correct[*target] += 1; }
     }
     for c in 0..n_classes {
         let tot = class_total[c].max(1);
-        eprintln!("  {}: {}/{} ({:.0}%)", class_names[c], class_correct[c], tot,
-                 class_correct[c] as f64 / tot as f64 * 100.0);
+        eprintln!(
+            "  {}: {}/{} ({:.0}%)",
+            class_names[c],
+            class_correct[c],
+            tot,
+            class_correct[c] as f64 / tot as f64 * 100.0
+        );
     }
 
     Ok(AdaptiveModel {
@@ -510,12 +729,114 @@ pub fn train_from_recordings(recordings_dir: &Path) -> Result<AdaptiveModel, Str
         global_std,
         trained_frames: n,
         training_accuracy: accuracy,
-        version: 1,
+        version: TRAINED_MODEL_VERSION,
         class_names,
     })
 }
 
 /// Default path for the saved adaptive model.
-pub fn model_path() -> PathBuf {
-    PathBuf::from("data/adaptive_model.json")
+pub fn model_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("adaptive_model.json")
+}
+
+#[cfg(test)]
+mod node_sample_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn node_features(node_id: u64, variance: f64, stale: bool) -> serde_json::Value {
+        json!({
+            "node_id": node_id,
+            "features": { "variance": variance, "mean_rssi": -50.0, "change_points": 3 },
+            "stale": stale,
+        })
+    }
+
+    fn node(node_id: u64, amplitude: &[f64]) -> serde_json::Value {
+        json!({ "node_id": node_id, "amplitude": amplitude })
+    }
+
+    #[test]
+    fn one_sample_per_node_using_that_nodes_features() {
+        let frame = json!({
+            "features": { "variance": 999.0 },
+            "nodes": [node(1, &[1.0, 2.0]), node(2, &[3.0, 4.0])],
+            "node_features": [node_features(1, 10.0, false), node_features(2, 20.0, false)],
+        });
+        let samples = node_samples_from_frame(&frame, &mut HashMap::new());
+        let mut variances: Vec<f64> = samples.iter().map(|s| s[0]).collect();
+        variances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(variances, vec![10.0, 20.0], "per-node, never the fused 999");
+    }
+
+    #[test]
+    fn repeated_snapshot_of_an_unchanged_node_is_not_resampled() {
+        let mut last = HashMap::new();
+        let first = json!({
+            "nodes": [node(1, &[1.0, 2.0]), node(2, &[3.0, 4.0])],
+            "node_features": [node_features(1, 10.0, false), node_features(2, 20.0, false)],
+        });
+        // Node 2 delivered a new frame; node 1's entry is the same snapshot.
+        let second = json!({
+            "nodes": [node(1, &[1.0, 2.0]), node(2, &[5.0, 6.0])],
+            "node_features": [node_features(1, 10.0, false), node_features(2, 21.0, false)],
+        });
+        assert_eq!(node_samples_from_frame(&first, &mut last).len(), 2);
+        let again = node_samples_from_frame(&second, &mut last);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0][0], 21.0);
+    }
+
+    #[test]
+    fn stale_and_amplitude_less_nodes_are_skipped() {
+        let frame = json!({
+            "nodes": [node(1, &[1.0, 2.0]), node(2, &[])],
+            "node_features": [node_features(1, 10.0, true), node_features(2, 20.0, false)],
+        });
+        assert!(node_samples_from_frame(&frame, &mut HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn recordings_without_node_features_fall_back_to_frame_level() {
+        let frame = json!({
+            "features": { "variance": 7.0 },
+            "nodes": [node(1, &[1.0, 2.0])],
+        });
+        let samples = node_samples_from_frame(&frame, &mut HashMap::new());
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0][0], 7.0);
+    }
+
+    #[test]
+    fn runtime_uses_the_same_amplitude_window_as_recordings() {
+        let mut long = vec![1.0; RECORDED_AMPLITUDE_LEN];
+        long.extend([100.0; 144]);
+        let short = vec![1.0; RECORDED_AMPLITUDE_LEN];
+        let feat = json!({});
+        assert_eq!(
+            features_from_runtime(&feat, &long),
+            features_from_runtime(&feat, &short)
+        );
+    }
+
+    // The trainer must stamp a version that consumes measured frequency.
+    const _: () = assert!(TRAINED_MODEL_VERSION >= 2);
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::compatible_dominant_frequency;
+
+    #[test]
+    fn version_one_keeps_legacy_subcarrier_proxy() {
+        let amplitudes = [1.0, 2.0, 8.0, 3.0];
+        assert_eq!(compatible_dominant_frequency(1, 1.25, &amplitudes), 0.10);
+    }
+
+    #[test]
+    fn version_two_uses_measured_temporal_frequency() {
+        let amplitudes = [1.0, 20.0, 2.0];
+        assert_eq!(compatible_dominant_frequency(2, 1.25, &amplitudes), 1.25);
+        assert_eq!(compatible_dominant_frequency(2, f64::NAN, &amplitudes), 0.0);
+    }
 }

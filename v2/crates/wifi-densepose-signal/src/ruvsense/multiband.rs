@@ -29,17 +29,46 @@ pub enum MultiBandError {
 
     /// Frequency list length does not match frame count.
     #[error("Frequency count ({freq_count}) does not match frame count ({frame_count})")]
-    FrequencyCountMismatch { freq_count: usize, frame_count: usize },
+    FrequencyCountMismatch {
+        freq_count: usize,
+        frame_count: usize,
+    },
 
     /// Duplicate frequency in channel list.
     #[error("Duplicate frequency {freq_mhz} MHz at index {idx}")]
     DuplicateFrequency { freq_mhz: u32, idx: usize },
 }
 
+/// What a frame's phase vector is evidence of (issue #1752).
+///
+/// Phase from two radios can only be combined when both were measured against
+/// one reference. Independent ESP32 nodes each run a free crystal and pick a
+/// random PLL phase at every reset, so their phases are unrelated even when
+/// their timestamps agree to the frame. Mesh time sync aligns frames, not RF
+/// phase, and does not by itself justify [`PhaseReference::Shared`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhaseReference {
+    /// No measured phase. The phase vector is a placeholder (for example the
+    /// amplitude-only sensing-server bridge) and must never be read as evidence.
+    #[default]
+    Unavailable,
+    /// Phase measured against this node's own oscillator. Meaningful within the
+    /// node, meaningless across nodes.
+    NodeLocal,
+    /// The source declares a shared clock or calibrated phase reference. Frames
+    /// carrying the same `id` may be combined coherently.
+    Shared {
+        /// Identifier of the shared reference (one per clock domain / array).
+        id: u32,
+    },
+}
+
 /// Fused multi-band CSI from one node at one time slot.
 ///
 /// Holds one canonical-56 row per channel, ordered by center frequency.
-/// The `coherence` field quantifies agreement across channels (0.0-1.0).
+/// The `coherence` field quantifies amplitude agreement across this node's
+/// channels (0.0-1.0). It says nothing about phase coherence with other
+/// nodes; that is carried by `phase_reference`.
 #[derive(Debug, Clone)]
 pub struct MultiBandCsiFrame {
     /// Originating node identifier (0-255).
@@ -52,6 +81,8 @@ pub struct MultiBandCsiFrame {
     pub frequencies_mhz: Vec<u32>,
     /// Cross-channel coherence score (0.0-1.0).
     pub coherence: f32,
+    /// What `channel_frames[*].phase` is evidence of (issue #1752).
+    pub phase_reference: PhaseReference,
 }
 
 /// Configuration for the multi-band fusion process.
@@ -97,11 +128,7 @@ impl MultiBandBuilder {
     }
 
     /// Add a channel observation at the given center frequency.
-    pub fn add_channel(
-        mut self,
-        frame: CanonicalCsiFrame,
-        freq_mhz: u32,
-    ) -> Self {
+    pub fn add_channel(mut self, frame: CanonicalCsiFrame, freq_mhz: u32) -> Self {
         self.frames.push(frame);
         self.frequencies.push(freq_mhz);
         self
@@ -152,8 +179,7 @@ impl MultiBandBuilder {
 
         let sorted_frames: Vec<CanonicalCsiFrame> =
             indices.iter().map(|&i| self.frames[i].clone()).collect();
-        let sorted_freqs: Vec<u32> =
-            indices.iter().map(|&i| self.frequencies[i]).collect();
+        let sorted_freqs: Vec<u32> = indices.iter().map(|&i| self.frequencies[i]).collect();
 
         self.frames = sorted_frames;
         self.frequencies = sorted_freqs;
@@ -167,6 +193,8 @@ impl MultiBandBuilder {
             channel_frames: self.frames,
             frequencies_mhz: self.frequencies,
             coherence,
+            // One node's own channels: measured phase, local reference only.
+            phase_reference: PhaseReference::NodeLocal,
         })
     }
 }
@@ -185,10 +213,7 @@ fn compute_cross_channel_coherence(frames: &[CanonicalCsiFrame]) -> f32 {
 
     for i in 0..frames.len() {
         for j in (i + 1)..frames.len() {
-            let corr = pearson_correlation_f32(
-                &frames[i].amplitude,
-                &frames[j].amplitude,
-            );
+            let corr = pearson_correlation_f32(&frames[i].amplitude, &frames[j].amplitude);
             total_corr += corr as f64;
             pair_count += 1;
         }
@@ -203,7 +228,15 @@ fn compute_cross_channel_coherence(frames: &[CanonicalCsiFrame]) -> f32 {
     ((mean_corr + 1.0) / 2.0).clamp(0.0, 1.0) as f32
 }
 
+/// Denominator guard for the Pearson correlation (ADR-154 §7.4 — de-magicked):
+/// a product of standard deviations below this is treated as a zero-variance
+/// (constant) input ⇒ correlation 0.0.
+const PEARSON_DENOMINATOR_EPSILON: f32 = 1e-12;
+
 /// Pearson correlation coefficient between two f32 slices.
+///
+/// Returns `0.0` for empty inputs or when either slice has (near-)zero
+/// variance (the denominator falls below [`PEARSON_DENOMINATOR_EPSILON`]).
 fn pearson_correlation_f32(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     if n == 0 {
@@ -227,7 +260,7 @@ fn pearson_correlation_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 
     let denom = (var_a * var_b).sqrt();
-    if denom < 1e-12 {
+    if denom < PEARSON_DENOMINATOR_EPSILON {
         return 0.0;
     }
 
@@ -328,7 +361,10 @@ mod tests {
             .add_channel(make_frame(56, 1.0), 2412)
             .add_channel(make_frame(30, 1.0), 2437)
             .build();
-        assert!(matches!(result, Err(MultiBandError::SubcarrierMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(MultiBandError::SubcarrierMismatch { .. })
+        ));
     }
 
     #[test]
@@ -337,7 +373,10 @@ mod tests {
             .add_channel(make_frame(56, 1.0), 2412)
             .add_channel(make_frame(56, 1.0), 2412)
             .build();
-        assert!(matches!(result, Err(MultiBandError::DuplicateFrequency { .. })));
+        assert!(matches!(
+            result,
+            Err(MultiBandError::DuplicateFrequency { .. })
+        ));
     }
 
     #[test]
@@ -406,6 +445,7 @@ mod tests {
             channel_frames: vec![],
             frequencies_mhz: vec![],
             coherence: 1.0,
+            phase_reference: PhaseReference::Unavailable,
         };
         assert!(mean_amplitude(&frame).is_empty());
     }
@@ -437,5 +477,25 @@ mod tests {
         assert_eq!(cfg.expected_channels, 3);
         assert_eq!(cfg.window_us, 200_000);
         assert!((cfg.min_coherence - 0.3).abs() < f32::EPSILON);
+    }
+
+    // -- ADR-154 §7.4: de-magic-constant + boundary characterization tests.
+
+    /// De-magicked denominator epsilon must equal the prior literal.
+    #[test]
+    fn pearson_epsilon_unchanged_from_literal() {
+        assert_eq!(PEARSON_DENOMINATOR_EPSILON, 1e-12_f32);
+    }
+
+    /// A constant (zero-variance) input makes the denominator fall below the
+    /// epsilon ⇒ correlation 0.0. Previously untested (existing tests use
+    /// non-constant inputs).
+    #[test]
+    fn pearson_correlation_zero_variance() {
+        let constant = vec![3.0_f32; 5];
+        let varying = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(pearson_correlation_f32(&constant, &varying), 0.0);
+        assert_eq!(pearson_correlation_f32(&varying, &constant), 0.0);
+        assert_eq!(pearson_correlation_f32(&constant, &constant), 0.0);
     }
 }

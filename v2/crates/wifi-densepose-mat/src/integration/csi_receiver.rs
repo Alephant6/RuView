@@ -3,6 +3,7 @@
 //! This module provides receivers for:
 //! - UDP packets (network streaming from remote sensors)
 //! - Serial port (ESP32 and similar embedded devices)
+#![allow(missing_docs)]
 //! - PCAP files (offline analysis and replay)
 //!
 //! # Example
@@ -20,10 +21,10 @@
 //! }
 //! ```
 
-use super::AdapterError;
 use super::hardware_adapter::{
     Bandwidth, CsiMetadata, CsiReadings, DeviceType, FrameControlType, SensorCsiReading,
 };
+use super::AdapterError;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 use std::io::{BufReader, Read};
@@ -268,7 +269,11 @@ impl UdpCsiReceiver {
     pub async fn new(config: ReceiverConfig) -> Result<Self, AdapterError> {
         let udp_config = match &config.source {
             CsiSource::Udp(c) => c,
-            _ => return Err(AdapterError::Config("Invalid config for UDP receiver".into())),
+            _ => {
+                return Err(AdapterError::Config(
+                    "Invalid config for UDP receiver".into(),
+                ))
+            }
         };
 
         let addr = format!("{}:{}", udp_config.bind_address, udp_config.port);
@@ -328,7 +333,10 @@ impl UdpCsiReceiver {
                     }
                 }
             }
-            Ok(Err(e)) => Err(AdapterError::Hardware(format!("Socket receive error: {}", e))),
+            Ok(Err(e)) => Err(AdapterError::Hardware(format!(
+                "Socket receive error: {}",
+                e
+            ))),
             Err(_) => Ok(None), // Timeout
         }
     }
@@ -347,6 +355,7 @@ impl UdpCsiReceiver {
 /// Serial CSI receiver
 pub struct SerialCsiReceiver {
     config: ReceiverConfig,
+    #[allow(dead_code)]
     port_path: String,
     buffer: VecDeque<u8>,
     parser: CsiParser,
@@ -359,7 +368,11 @@ impl SerialCsiReceiver {
     pub fn new(config: ReceiverConfig) -> Result<Self, AdapterError> {
         let serial_config = match &config.source {
             CsiSource::Serial(c) => c,
-            _ => return Err(AdapterError::Config("Invalid config for serial receiver".into())),
+            _ => {
+                return Err(AdapterError::Config(
+                    "Invalid config for serial receiver".into(),
+                ))
+            }
         };
 
         // Verify port exists
@@ -517,7 +530,11 @@ impl PcapCsiReader {
     pub fn new(config: ReceiverConfig) -> Result<Self, AdapterError> {
         let pcap_config = match &config.source {
             CsiSource::Pcap(c) => c,
-            _ => return Err(AdapterError::Config("Invalid config for PCAP reader".into())),
+            _ => {
+                return Err(AdapterError::Config(
+                    "Invalid config for PCAP reader".into(),
+                ))
+            }
         };
 
         if !Path::new(&pcap_config.file_path).exists() {
@@ -656,9 +673,9 @@ impl PcapCsiReader {
 
         // Read packet data
         let mut data = vec![0u8; incl_len as usize];
-        reader.read_exact(&mut data).map_err(|e| {
-            AdapterError::Hardware(format!("Failed to read packet data: {}", e))
-        })?;
+        reader
+            .read_exact(&mut data)
+            .map_err(|e| AdapterError::Hardware(format!("Failed to read packet data: {}", e)))?;
 
         // Convert timestamp
         let timestamp = chrono::DateTime::from_timestamp(ts_sec as i64, ts_usec * 1000)
@@ -770,6 +787,7 @@ impl PcapCsiReader {
 }
 
 /// PCAP global header structure
+#[allow(dead_code)]
 struct PcapGlobalHeader {
     magic: u32,
     version_major: u16,
@@ -807,7 +825,9 @@ impl CsiParser {
             CsiPacketFormat::PicoScenes => self.parse_picoscenes(data),
             CsiPacketFormat::JsonCsi => self.parse_json(data),
             CsiPacketFormat::RawBinary => self.parse_raw_binary(data),
-            CsiPacketFormat::Auto => Err(AdapterError::DataFormat("Unable to detect format".into())),
+            CsiPacketFormat::Auto => {
+                Err(AdapterError::DataFormat("Unable to detect format".into()))
+            }
         }
     }
 
@@ -915,7 +935,9 @@ impl CsiParser {
     fn parse_intel_5300(&self, data: &[u8]) -> Result<CsiPacket, AdapterError> {
         // Intel 5300 BFEE structure (from Linux CSI Tool)
         if data.len() < 25 {
-            return Err(AdapterError::DataFormat("Intel 5300 packet too short".into()));
+            return Err(AdapterError::DataFormat(
+                "Intel 5300 packet too short".into(),
+            ));
         }
 
         // Parse header
@@ -1105,14 +1127,24 @@ impl CsiParser {
     fn parse_picoscenes(&self, data: &[u8]) -> Result<CsiPacket, AdapterError> {
         // PicoScenes has a complex structure with multiple segments
         if data.len() < 100 {
-            return Err(AdapterError::DataFormat("PicoScenes packet too short".into()));
+            return Err(AdapterError::DataFormat(
+                "PicoScenes packet too short".into(),
+            ));
         }
 
-        // PicoScenes CSI segment parsing is not yet implemented.
-        // The format requires parsing DeviceType, RxSBasic, CSI, and MVMExtra segments.
-        // See https://ps.zpj.io/packet-format.html for the full specification.
-        Err(AdapterError::DataFormat(
-            "PicoScenes CSI parser not yet implemented. Packet received but segment parsing (DeviceType, RxSBasic, CSI, MVMExtra) is required. See https://ps.zpj.io/packet-format.html".into()
+        // HONEST gating: the PicoScenes container is a multi-segment binary
+        // format (DeviceType, RxSBasic, CSI, MVMExtra, ...) that varies by the
+        // capturing NIC's PicoScenes plugin; parsing it correctly requires the
+        // matching hardware/plugin to validate against, which is not available
+        // here. Rather than emit a wrong/fabricated decode, return a typed
+        // UnsupportedAdapter error. The header is still validated above so an
+        // obviously-too-short buffer is rejected as a format error first.
+        // Spec: https://ps.zpj.io/packet-format.html
+        Err(AdapterError::UnsupportedAdapter(
+            "PicoScenes CSI container parsing is not supported in this build (multi-segment, \
+             NIC/plugin-specific; needs matching hardware to validate). See \
+             https://ps.zpj.io/packet-format.html"
+                .into(),
         ))
     }
 
@@ -1124,34 +1156,20 @@ impl CsiParser {
         let json: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| AdapterError::DataFormat(format!("Invalid JSON: {}", e)))?;
 
-        let rssi = json
-            .get("rssi")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-50) as i8;
+        let rssi = json.get("rssi").and_then(|v| v.as_i64()).unwrap_or(-50) as i8;
 
-        let channel = json
-            .get("channel")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(6) as u8;
+        let channel = json.get("channel").and_then(|v| v.as_u64()).unwrap_or(6) as u8;
 
         let amplitudes: Vec<f64> = json
             .get("amplitudes")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_f64())
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
             .unwrap_or_default();
 
         let phases: Vec<f64> = json
             .get("phases")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_f64())
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
             .unwrap_or_default();
 
         let source_id = json
@@ -1275,6 +1293,9 @@ impl From<CsiPacket> for CsiReadings {
                 rssi: Some(packet.rssi as f64),
                 noise_floor: Some(packet.noise_floor as f64),
                 fc_type: FrameControlType::Data,
+                // Narrowband receiver formats predate wideband provenance
+                // metadata; FeitCSI ingest attaches it in feitcsi.rs.
+                wideband: None,
             },
         }
     }
@@ -1343,9 +1364,11 @@ mod tests {
 
     #[test]
     fn test_receiver_stats() {
-        let mut stats = ReceiverStats::default();
-        stats.packets_received = 100;
-        stats.packets_parsed = 95;
+        let mut stats = ReceiverStats {
+            packets_received: 100,
+            packets_parsed: 95,
+            ..ReceiverStats::default()
+        };
 
         assert!((stats.success_rate() - 0.95).abs() < 0.001);
 

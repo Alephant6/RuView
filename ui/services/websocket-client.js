@@ -1,9 +1,20 @@
+import { withWsTicket } from './ws-ticket.js';
 // WebSocket Client for Three.js Visualization - WiFi DensePose
-// Connects to ws://localhost:8000/ws/pose and manages real-time data flow
+// Default endpoint is `/ws/sensing` on the same host the page was served from.
+// Callers (e.g. viz.html) usually pass an explicit `url` derived from
+// `buildSensingWsUrl()` so HTTP/WS port pairings are handled centrally.
+
+function _defaultWsUrl() {
+  if (typeof window === 'undefined' || !window.location) {
+    return 'ws://localhost:8765/ws/sensing';
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/sensing`;
+}
 
 export class WebSocketClient {
   constructor(options = {}) {
-    this.url = options.url || 'ws://localhost:8000/ws/pose';
+    this.url = options.url || _defaultWsUrl();
     this.ws = null;
     this.state = 'disconnected'; // disconnected, connecting, connected, error
     this.isRealData = false;
@@ -37,7 +48,9 @@ export class WebSocketClient {
   }
 
   // Attempt to connect
-  connect() {
+  // async: `/ws/*` is gated (ADR-272) and a browser cannot set an
+  // Authorization header on an upgrade, so mint a single-use ticket first.
+  async connect() {
     if (this.state === 'connecting' || this.state === 'connected') {
       console.warn('[WS-VIZ] Already connected or connecting');
       return;
@@ -46,8 +59,12 @@ export class WebSocketClient {
     this._setState('connecting');
     console.log(`[WS-VIZ] Connecting to ${this.url}`);
 
+    // Per attempt, never cached — a ticket is single-use and short-lived.
+    let url = this.url;
+    try { url = await withWsTicket(this.url); } catch { /* auth off or pre-ADR-272 server */ }
+
     try {
-      this.ws = new WebSocket(this.url);
+      this.ws = new WebSocket(url);
       this.ws.binaryType = 'arraybuffer';
 
       this.ws.onopen = () => this._handleOpen();
@@ -225,7 +242,7 @@ export class WebSocketClient {
     console.log(`[WS-VIZ] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
-      this.connect();
+      void this.connect();
     }, delay);
   }
 

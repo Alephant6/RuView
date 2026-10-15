@@ -26,6 +26,7 @@
  */
 
 #include "mmwave_sensor.h"
+#include "mmwave_detect.h"
 
 #include <string.h>
 #include <math.h>
@@ -109,7 +110,7 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
 
     switch (type) {
     case MR60_TYPE_BREATHING:
-        if (len >= 4) {
+        if (len >= sizeof(float)) {
             /* Breathing rate as float32 (little-endian in payload). */
             float br;
             memcpy(&br, data, sizeof(float));
@@ -120,7 +121,7 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
         break;
 
     case MR60_TYPE_HEARTRATE:
-        if (len >= 4) {
+        if (len >= sizeof(float)) {
             float hr;
             memcpy(&hr, data, sizeof(float));
             if (hr >= 0.0f && hr <= 250.0f) {
@@ -130,13 +131,13 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
         break;
 
     case MR60_TYPE_DISTANCE:
-        if (len >= 8) {
+        if (len >= sizeof(uint32_t) + sizeof(float)) {
             /* Bytes 0-3: range flag (uint32 LE). 0 = no valid distance. */
             uint32_t range_flag;
             memcpy(&range_flag, data, sizeof(uint32_t));
-            if (range_flag != 0 && len >= 8) {
+            if (range_flag != 0) {
                 float dist;
-                memcpy(&dist, &data[4], sizeof(float));
+                memcpy(&dist, &data[sizeof(uint32_t)], sizeof(float));
                 s_state.distance_cm = dist;
             }
         }
@@ -387,14 +388,26 @@ static mmwave_type_t probe_at_baud(uint32_t baud)
         if (len <= 0) continue;
 
         for (int i = 0; i < len; i++) {
-            /* MR60BHA2: SOF = 0x01, followed by valid-looking frame_id bytes */
-            if (buf[i] == MR60_SOF && baud == MMWAVE_MR60_BAUD) {
-                mr60_sof_seen++;
+            /* MR60BHA2: require a *validated* 8-byte header — SOF (0x01) + a valid
+             * header checksum (over bytes 0..6) + a known frame type (0x0A__ or
+             * 0x0F09) — NOT a bare 0x01 byte. A floating UART1 with no sensor reads
+             * noise full of 0x01s, which the old `buf[i] == MR60_SOF` check mistook
+             * for a real sensor (false "Detected MR60BHA2", #1107). */
+            if (buf[i] == MR60_SOF && baud == MMWAVE_MR60_BAUD && i + 7 < len) {
+                const uint8_t *h = &buf[i];
+                if (mr60_calc_checksum(h, 7) == h[7]) {
+                    uint16_t type = ((uint16_t)h[5] << 8) | h[6];
+                    if ((type >> 8) == 0x0A || type == 0x0F09) {
+                        mr60_sof_seen++;
+                    }
+                }
             }
-            /* LD2410: 4-byte header 0xF4F3F2F1 */
-            if (i + 3 < len && buf[i] == 0xF4 && buf[i+1] == 0xF3
-                && buf[i+2] == 0xF2 && buf[i+3] == 0xF1
-                && baud == MMWAVE_LD2410_BAUD) {
+            /* LD2410: require a *full validated* report frame, not just the
+             * 4-byte head. A floating UART1 at 256000 baud can emit the head
+             * pattern 0xF4F3F2F1 from line noise (#1135 bug #2). The shared
+             * predicate (host-unit-tested in mmwave_detect.h) demands a sane
+             * intra-frame length AND the matching tail 0xF8F7F6F5. */
+            if (baud == MMWAVE_LD2410_BAUD && mmwave_ld2410_valid_at(buf, i, len)) {
                 ld2410_header_seen++;
             }
         }
@@ -403,9 +416,8 @@ static mmwave_type_t probe_at_baud(uint32_t baud)
         if (ld2410_header_seen >= 2) return MMWAVE_TYPE_LD2410;
     }
 
-    if (mr60_sof_seen > 0) return MMWAVE_TYPE_MR60BHA2;
-    if (ld2410_header_seen > 0) return MMWAVE_TYPE_LD2410;
-
+    /* No weak single-hit fallback: line noise can produce a stray match, so a real
+     * sensor must clear the ≥3 (MR60) / ≥2 (LD2410) validated-frame thresholds. */
     return MMWAVE_TYPE_NONE;
 }
 
@@ -492,8 +504,34 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
     return ESP_OK;
 
 #else
+    /* Default probe pins must never collide with the UART0 console. On the
+     * ESP32-C6 the console is TX=GPIO16 / RX=GPIO17, so the legacy 17/18 pair
+     * routed UART1 TX onto the console RX line and silently killed serial
+     * input (USB onboarding, monitor commands) even when no sensor was found,
+     * because uart_driver_delete() does not undo the GPIO matrix routing. */
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+    if (uart_tx_pin < 0) uart_tx_pin = 4;
+    if (uart_rx_pin < 0) uart_rx_pin = 5;
+#else
     if (uart_tx_pin < 0) uart_tx_pin = 17;
     if (uart_rx_pin < 0) uart_rx_pin = 18;
+#endif
+#if defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
+    const int console_tx = CONFIG_ESP_CONSOLE_UART_TX_GPIO;
+    const int console_rx = CONFIG_ESP_CONSOLE_UART_RX_GPIO;
+#elif defined(CONFIG_IDF_TARGET_ESP32C6)
+    const int console_tx = 16, console_rx = 17;   /* U0TXD / U0RXD IOMUX pins */
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+    const int console_tx = 43, console_rx = 44;
+#else
+    const int console_tx = 1, console_rx = 3;
+#endif
+    if (uart_tx_pin == console_tx || uart_tx_pin == console_rx ||
+        uart_rx_pin == console_tx || uart_rx_pin == console_rx) {
+        ESP_LOGW(TAG, "mmWave probe pins (TX=%d, RX=%d) overlap the console UART (TX=%d, RX=%d); skipping probe",
+                 uart_tx_pin, uart_rx_pin, console_tx, console_rx);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     /* Install UART driver at MR60 baud (will be changed during probe). */
     uart_config_t uart_config = {

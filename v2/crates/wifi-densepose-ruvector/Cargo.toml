@@ -1,6 +1,6 @@
 [package]
 name = "wifi-densepose-ruvector"
-version.workspace = true
+version = "0.3.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -38,7 +38,16 @@ criterion = { workspace = true }
 [[bench]]
 name = "crv_bench"
 harness = false
+required-features = ["crv"]
 
 [[bench]]
 name = "sketch_bench"
+harness = false
+
+[[bench]]
+name = "fusion_bench"
+harness = false
+
+[[bench]]
+name = "ann_bench"
 harness = false

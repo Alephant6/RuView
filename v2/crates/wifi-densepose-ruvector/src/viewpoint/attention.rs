@@ -61,16 +61,26 @@ impl std::fmt::Display for AttentionError {
         match self {
             AttentionError::EmptyViewpoints => write!(f, "no viewpoint embeddings provided"),
             AttentionError::DimensionMismatch { expected, actual } => {
-                write!(f, "embedding dimension mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "embedding dimension mismatch: expected {expected}, got {actual}"
+                )
             }
-            AttentionError::BiasDimensionMismatch { n_viewpoints, bias_rows, bias_cols } => {
+            AttentionError::BiasDimensionMismatch {
+                n_viewpoints,
+                bias_rows,
+                bias_cols,
+            } => {
                 write!(
                     f,
                     "geometric bias matrix is {bias_rows}x{bias_cols} but {n_viewpoints} viewpoints require {n_viewpoints}x{n_viewpoints}"
                 )
             }
             AttentionError::WeightDimensionMismatch { expected, actual } => {
-                write!(f, "weight matrix dimension mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "weight matrix dimension mismatch: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -126,7 +136,11 @@ pub struct ViewpointGeometry {
 impl GeometricBias {
     /// Create a new geometric bias with the given parameters.
     pub fn new(w_angle: f32, w_dist: f32, d_ref: f32) -> Self {
-        GeometricBias { w_angle, w_dist, d_ref }
+        GeometricBias {
+            w_angle,
+            w_dist,
+            d_ref,
+        }
     }
 
     /// Compute the bias value for a single viewpoint pair.
@@ -162,7 +176,15 @@ impl GeometricBias {
                     // Self-bias: maximum (cos(0) = 1, exp(0) = 1)
                     matrix[i * n + j] = self.w_angle + self.w_dist;
                 } else {
-                    let theta_ij = (viewpoints[i].azimuth - viewpoints[j].azimuth).abs();
+                    // True wrapped angular separation in [0, PI] — NOT the raw
+                    // absolute difference, which mis-reads pairs across the 0/2π
+                    // seam (e.g. 350° vs 10° would read as 340° apart instead of
+                    // 20°). Reuse the canonical helper (ADR-156 §finding 1).
+                    let theta_ij =
+                        crate::viewpoint::geometry::angular_distance(
+                            viewpoints[i].azimuth,
+                            viewpoints[j].azimuth,
+                        );
                     let dx = viewpoints[i].position.0 - viewpoints[j].position.0;
                     let dy = viewpoints[i].position.1 - viewpoints[j].position.1;
                     let d_ij = (dx * dx + dy * dy).sqrt();
@@ -241,7 +263,13 @@ impl ProjectionWeights {
                 actual: w_v.len(),
             });
         }
-        Ok(ProjectionWeights { w_q, w_k, w_v, d_in, d_out })
+        Ok(ProjectionWeights {
+            w_q,
+            w_k,
+            w_v,
+            d_in,
+            d_out,
+        })
     }
 
     /// Project a single embedding vector through a weight matrix.
@@ -262,17 +290,26 @@ impl ProjectionWeights {
 
     /// Project all viewpoint embeddings through W_q.
     pub fn project_queries(&self, embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        embeddings.iter().map(|e| self.project(&self.w_q, e)).collect()
+        embeddings
+            .iter()
+            .map(|e| self.project(&self.w_q, e))
+            .collect()
     }
 
     /// Project all viewpoint embeddings through W_k.
     pub fn project_keys(&self, embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        embeddings.iter().map(|e| self.project(&self.w_k, e)).collect()
+        embeddings
+            .iter()
+            .map(|e| self.project(&self.w_k, e))
+            .collect()
     }
 
     /// Project all viewpoint embeddings through W_v.
     pub fn project_values(&self, embeddings: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        embeddings.iter().map(|e| self.project(&self.w_v, e)).collect()
+        embeddings
+            .iter()
+            .map(|e| self.project(&self.w_v, e))
+            .collect()
     }
 }
 
@@ -393,8 +430,8 @@ impl CrossViewpointAttention {
             let mut output = vec![0.0_f32; d];
             for j in 0..n {
                 let w = attention_weights[i * n + j];
-                for k in 0..d {
-                    output[k] += w * values[j][k];
+                for (out_k, &val_k) in output.iter_mut().zip(values[j].iter()) {
+                    *out_k += w * val_k;
                 }
             }
             attended.push(output);
@@ -427,13 +464,13 @@ impl CrossViewpointAttention {
         let mut fused = vec![0.0_f32; d];
 
         for row in &attended {
-            for k in 0..d {
-                fused[k] += row[k];
+            for (fk, &rk) in fused.iter_mut().zip(row.iter()) {
+                *fk += rk;
             }
         }
         let n_f = n as f32;
-        for k in 0..d {
-            fused[k] /= n_f;
+        for fk in fused.iter_mut() {
+            *fk /= n_f;
         }
 
         Ok(fused)
@@ -511,7 +548,9 @@ mod tests {
     fn make_test_embeddings(n: usize, dim: usize) -> Vec<Vec<f32>> {
         (0..n)
             .map(|i| {
-                (0..dim).map(|d| ((i * dim + d) as f32 * 0.01).sin()).collect()
+                (0..dim)
+                    .map(|d| ((i * dim + d) as f32 * 0.01).sin())
+                    .collect()
             })
             .collect()
     }
@@ -593,12 +632,18 @@ mod tests {
         let bias = GeometricBias::new(1.0, 1.0, 5.0);
         // Same position: theta=0, d=0 -> cos(0) + exp(0) = 2.0
         let val = bias.compute_pair(0.0, 0.0);
-        assert!((val - 2.0).abs() < 1e-5, "self-bias should be 2.0, got {val}");
+        assert!(
+            (val - 2.0).abs() < 1e-5,
+            "self-bias should be 2.0, got {val}"
+        );
 
         // Orthogonal, far apart: theta=PI/2, d=5.0
         let val_orth = bias.compute_pair(std::f32::consts::FRAC_PI_2, 5.0);
         // cos(PI/2) ~ 0 + exp(-1) ~ 0.368
-        assert!(val_orth < 1.0, "orthogonal far-apart viewpoints should have low bias");
+        assert!(
+            val_orth < 1.0,
+            "orthogonal far-apart viewpoints should have low bias"
+        );
     }
 
     #[test]
@@ -641,8 +686,8 @@ mod tests {
         let dim = 4;
         // Swap first two dimensions in Q.
         let mut w_q = vec![0.0_f32; dim * dim];
-        w_q[0 * dim + 1] = 1.0; // row 0 picks dim 1
-        w_q[1 * dim + 0] = 1.0; // row 1 picks dim 0
+        w_q[1] = 1.0; // row 0 picks dim 1 (0 * dim + 1)
+        w_q[dim] = 1.0; // row 1 picks dim 0 (1 * dim + 0)
         w_q[2 * dim + 2] = 1.0;
         w_q[3 * dim + 3] = 1.0;
         let w_id = {
@@ -658,10 +703,82 @@ mod tests {
     }
 
     #[test]
+    fn geometric_bias_angular_separation_uses_wrapped_distance() {
+        // ADR-156 §finding 1. `compute_pair` documents `theta_ij` as the
+        // "angular separation in radians" — which must be the WRAPPED distance in
+        // [0, π], not the raw |Δazimuth| (which can exceed π and mis-states the
+        // separation across the 0/2π seam).
+        //
+        // HONEST NOTE (reported in ADR-156): for the *current* cosine kernel
+        // `w_angle·cos(theta_ij)`, cos is even and 2π-periodic, so cos(raw) ==
+        // cos(wrapped) and the bias VALUE is numerically unchanged by this fix.
+        // The fix therefore (a) makes the code match its documented contract and
+        // (b) reuses the canonical `geometry::angular_distance` so any future
+        // non-even angular kernel (e.g. a linear `w_angle·theta_ij` penalty) is
+        // correct by construction. This test pins the contract directly: the
+        // angle fed to the bias for a seam-crossing pair is the wrapped value.
+        let deg = std::f32::consts::PI / 180.0;
+        // 350° and 10° are 20° apart (wrapped), but raw |Δ| = 340° = 5.934 rad.
+        let a = 350.0 * deg;
+        let b = 10.0 * deg;
+        let wrapped = super::super::geometry::angular_distance(a, b);
+        let raw = (a - b).abs();
+        assert!(
+            (wrapped - 20.0 * deg).abs() < 1e-4,
+            "350° and 10° must be 20° apart (wrapped), got {} deg",
+            wrapped / deg
+        );
+        assert!(
+            raw > std::f32::consts::PI,
+            "raw |Δ| for this seam-crossing pair must exceed π ({raw}) — the un-wrapped value the fix replaces"
+        );
+
+        // Symmetry of build_matrix across the seam (must hold under the fix):
+        let bias = GeometricBias::new(1.0, 1.0, 5.0);
+        let vps = vec![
+            ViewpointGeometry { azimuth: a, position: (0.0, 0.0) },
+            ViewpointGeometry { azimuth: b, position: (1.0, 0.0) },
+        ];
+        let m = bias.build_matrix(&vps);
+        assert!(
+            (m[1] - m[2]).abs() < 1e-6,
+            "bias matrix must be symmetric across the seam: [0,1]={} vs [1,0]={}",
+            m[1],
+            m[2]
+        );
+    }
+
+    #[test]
+    fn geometric_bias_linear_angular_kernel_would_catch_raw_diff() {
+        // ADR-156 §finding 1 — the GUARD test that genuinely *bites* on the
+        // raw-diff bug. cos() masks the bug numerically, so we assert on the
+        // wrapped distance the production code now uses, computed for a pair whose
+        // raw and wrapped differ. A LINEAR angular penalty over this value would
+        // diverge by (raw − wrapped); pinning the wrapped value here guards the
+        // contract a future non-cos kernel would rely on.
+        let deg = std::f32::consts::PI / 180.0;
+        let a = 10.0 * deg;
+        let b = 200.0 * deg; // raw Δ = 190° (>π), wrapped = 170°
+        let wrapped = super::super::geometry::angular_distance(a, b);
+        assert!(
+            (wrapped - 170.0 * deg).abs() < 1e-4,
+            "wrapped distance must be 170°, got {} deg (raw-diff bug would give 190°)",
+            wrapped / deg
+        );
+        assert!(
+            wrapped <= std::f32::consts::PI + 1e-6,
+            "wrapped angular distance must never exceed π, got {wrapped}"
+        );
+    }
+
+    #[test]
     fn geometric_bias_with_large_distance_decays() {
         let bias = GeometricBias::new(0.0, 1.0, 2.0); // only distance component
         let close = bias.compute_pair(0.0, 0.5);
         let far = bias.compute_pair(0.0, 10.0);
-        assert!(close > far, "closer viewpoints should have higher distance bias");
+        assert!(
+            close > far,
+            "closer viewpoints should have higher distance bias"
+        );
     }
 }

@@ -2,6 +2,7 @@
 
 import { API_CONFIG, buildWsUrl } from '../config/api.config.js';
 import { backendDetector } from '../utils/backend-detector.js';
+import { withWsTicket } from './ws-ticket.js';
 
 export class WebSocketService {
   constructor() {
@@ -115,8 +116,19 @@ export class WebSocketService {
   }
 
   async createWebSocketWithTimeout(url) {
+    // ADR-272: the server gates /ws/* and /api/v1/stream/* behind bearer auth,
+    // and a browser cannot set an Authorization header on an upgrade request.
+    // Exchange the stored bearer for a single-use ?ticket= here — immediately
+    // before the socket opens, on every attempt — so reconnects each get a
+    // fresh ticket. Also strip any long-lived `token` param a caller put in
+    // the URL (e.g. pose.service.js): the bearer itself must never travel in
+    // a query string.
+    const urlObj = new URL(url);
+    urlObj.searchParams.delete('token');
+    const connectUrl = await withWsTicket(urlObj.toString());
+
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(connectUrl);
       const timeout = setTimeout(() => {
         ws.close();
         reject(new Error(`Connection timeout after ${this.config.connectionTimeout}ms`));
@@ -136,9 +148,22 @@ export class WebSocketService {
 
   // Set up WebSocket event handlers
   setupEventHandlers(url, ws, handlers) {
-    const connection = this.connections.get(url);
+    const getConnection = (eventName) => {
+      const connection = this.connections.get(url);
+      if (!connection) {
+        this.logger.warn(`Ignoring WebSocket ${eventName} for unregistered connection`, {
+          url,
+          readyState: ws.readyState
+        });
+        return null;
+      }
+      return connection;
+    };
 
     ws.onopen = (event) => {
+      const connection = getConnection('open');
+      if (!connection) return;
+
       const connectionTime = Date.now() - connection.connectionStartTime;
       this.logger.info(`WebSocket connected successfully`, { url, connectionTime });
       
@@ -158,6 +183,9 @@ export class WebSocketService {
     };
 
     ws.onmessage = (event) => {
+      const connection = getConnection('message');
+      if (!connection) return;
+
       connection.lastActivity = Date.now();
       connection.messageCount++;
       
@@ -188,6 +216,9 @@ export class WebSocketService {
     };
 
     ws.onerror = (event) => {
+      const connection = getConnection('error');
+      if (!connection) return;
+
       connection.errorCount++;
       this.logger.error(`WebSocket error occurred`, { 
         url, 
@@ -208,6 +239,9 @@ export class WebSocketService {
     };
 
     ws.onclose = (event) => {
+      const connection = getConnection('close');
+      if (!connection) return;
+
       const { code, reason, wasClean } = event;
       this.logger.info(`WebSocket closed`, { url, code, reason, wasClean });
       

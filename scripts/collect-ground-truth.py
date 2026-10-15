@@ -6,9 +6,19 @@ synchronizes with ESP32 CSI recording from the sensing server.
 
 Output: JSONL file in data/ground-truth/ with per-frame 17-keypoint COCO poses.
 
+With --calibration <bundle.json> (produced by scripts/calibrate-camera-room.py,
+ADR-152 S2.1.3), every record is additionally stamped with room-frame bearing
+rays for each keypoint, the calibration_id, and the transceiver geometry --
+the PerceptAlign-style defense against coordinate overfitting. Raw image
+coordinates are always kept; without depth the room-frame representation is
+a projective alignment (rays, not 3D points) -- see scripts/calibration_lib.py.
+Without --calibration the output is byte-identical to the original ADR-079
+format.
+
 Usage:
     python scripts/collect-ground-truth.py --preview --duration 60
     python scripts/collect-ground-truth.py --server http://192.168.1.10:3000
+    python scripts/collect-ground-truth.py --calibration data/calibration/camera-room.json
 """
 
 from __future__ import annotations
@@ -103,21 +113,62 @@ def ensure_model(cache_dir: Path) -> Path:
     return model_path
 
 
-def post_json(url: str, payload: dict | None = None, timeout: float = 5.0) -> bool:
-    """POST JSON to a URL. Returns True on success, False on failure."""
+def load_api_token(token_file: str | None) -> str | None:
+    """Bearer token for the sensing server: --token-file, else RUVIEW_API_TOKEN."""
+    if token_file:
+        try:
+            return Path(token_file).read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"ERROR: cannot read --token-file {token_file!r}: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    return os.environ.get("RUVIEW_API_TOKEN", "").strip() or None
+
+
+def post_json(
+    url: str,
+    payload: dict | None = None,
+    token: str | None = None,
+    timeout: float = 5.0,
+) -> bool:
+    """POST JSON to a sensing-server endpoint.
+
+    Returns True only when the server accepted the request. The recording
+    endpoints answer HTTP 200 with ``{"success": false, "error": ...}`` for
+    refusals such as "recording already in progress", so the body is checked.
+    """
     data = json.dumps(payload or {}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+            raw = resp.read() or b"{}"
     except Exception as exc:
         print(f"WARNING: POST {url} failed: {exc}", file=sys.stderr)
         return False
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        print(
+            f"WARNING: POST {url} returned a non-JSON body: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    if not isinstance(body, dict):
+        print(
+            f"WARNING: POST {url} returned unexpected JSON "
+            f"({type(body).__name__}), expected an object",
+            file=sys.stderr,
+        )
+        return False
+    if body.get("success") is False:
+        print(f"WARNING: POST {url} refused: {body.get('error')}", file=sys.stderr)
+        return False
+    return True
 
 
 def draw_skeleton(frame: np.ndarray, keypoints: list[list[float]], w: int, h: int):
@@ -168,7 +219,35 @@ def main():
         default="data/ground-truth",
         help="Output directory (default: data/ground-truth)",
     )
+    parser.add_argument(
+        "--calibration",
+        default=None,
+        help="Camera-room calibration bundle JSON from scripts/calibrate-camera-room.py "
+        "(ADR-152 S2.1.3); adds room-frame keypoint rays + transceiver geometry "
+        "to every record",
+    )
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help="File holding the sensing-server API bearer token "
+        "(default: the RUVIEW_API_TOKEN environment variable)",
+    )
+    parser.add_argument(
+        "--allow-no-csi",
+        action="store_true",
+        help="Keep capturing camera keypoints even if the CSI recording cannot "
+        "be started (the output is then unpaired and useless for training)",
+    )
     args = parser.parse_args()
+    api_token = load_api_token(args.token_file)
+
+    if not args.calibration:
+        print(
+            "WARNING: no --calibration bundle; labels stay in raw camera coordinates "
+            "and are layout-brittle (coordinate overfitting, ADR-152 S2.1.3) -- run "
+            "scripts/calibrate-camera-room.py first.",
+            file=sys.stderr,
+        )
 
     # --- Resolve paths relative to repo root ---
     repo_root = Path(__file__).resolve().parent.parent
@@ -193,6 +272,25 @@ def main():
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Camera opened: {frame_w}x{frame_h}")
 
+    # --- Load calibration bundle (ADR-152 S2.1.3) ---
+    calib_ctx = None
+    if args.calibration:
+        # Lazy import keeps the no-calibration path identical to the original.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import calibration_lib
+
+        try:
+            calib_ctx = calibration_lib.load_calibration_context(
+                Path(args.calibration), frame_w, frame_h
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"ERROR: Cannot load calibration bundle {args.calibration}: {exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        n_nodes = len(calib_ctx.transceiver_geometry.get("nodes", []))
+        print(f"Calibration: {calib_ctx.calibration_id[:23]}... "
+              f"({n_nodes} transceiver node(s)); emitting room-frame keypoint rays")
+
     # --- Create PoseLandmarker ---
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(model_path)),
@@ -204,24 +302,35 @@ def main():
     )
     landmarker = PoseLandmarker.create_from_options(options)
 
-    # --- Output file ---
+    # --- Start CSI recording (named after the keypoints file so they pair) ---
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    recording_id = f"gt_{timestamp_str}"
+    recording_url_start = f"{args.server}/api/v1/recording/start"
+    recording_url_stop = f"{args.server}/api/v1/recording/stop"
+    csi_started = post_json(recording_url_start, {"id": recording_id}, api_token)
+    if csi_started:
+        print(f"CSI recording '{recording_id}' started on sensing server.")
+    elif args.allow_no_csi:
+        print(
+            "WARNING: Could not start CSI recording; capturing unpaired "
+            "camera keypoints (--allow-no-csi).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "ERROR: Could not start CSI recording, so keypoints would have no "
+            "CSI to pair with. Check the server URL and RUVIEW_API_TOKEN / "
+            "--token-file, or pass --allow-no-csi.",
+            file=sys.stderr,
+        )
+        cap.release()
+        landmarker.close()
+        sys.exit(1)
+
+    # --- Output file ---
     out_path = output_dir / f"keypoints_{timestamp_str}.jsonl"
     out_file = open(out_path, "w", encoding="utf-8")
     print(f"Output: {out_path}")
-
-    # --- Start CSI recording ---
-    recording_url_start = f"{args.server}/api/v1/recording/start"
-    recording_url_stop = f"{args.server}/api/v1/recording/stop"
-    csi_started = post_json(recording_url_start)
-    if csi_started:
-        print("CSI recording started on sensing server.")
-    else:
-        print(
-            "WARNING: Could not start CSI recording. "
-            "Camera keypoints will still be captured.",
-            file=sys.stderr,
-        )
 
     # --- Graceful shutdown ---
     shutdown_requested = False
@@ -287,6 +396,10 @@ def main():
                 "n_visible": n_visible,
                 "n_persons": n_persons,
             }
+            if calib_ctx is not None:
+                # Adds keypoints_room (bearing rays), camera_origin_room,
+                # calibration_id, transceiver_geometry (ADR-152 S2.1.3).
+                record = calibration_lib.augment_record(record, calib_ctx)
             out_file.write(json.dumps(record) + "\n")
             frame_count += 1
             total_confidence += confidence
@@ -321,7 +434,7 @@ def main():
 
         # Stop CSI recording
         if csi_started:
-            if post_json(recording_url_stop):
+            if post_json(recording_url_stop, token=api_token):
                 print("CSI recording stopped.")
             else:
                 print("WARNING: Failed to stop CSI recording.", file=sys.stderr)

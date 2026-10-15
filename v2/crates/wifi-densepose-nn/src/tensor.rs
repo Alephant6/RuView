@@ -4,10 +4,38 @@
 //! different backends (ONNX, tch, Candle).
 
 use crate::error::{NnError, NnResult};
-use ndarray::{Array1, Array2, Array3, Array4, ArrayD};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayD, ArrayViewMutD, Axis};
 // num_traits is available if needed for advanced tensor operations
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// Apply a numerically-stable softmax in place to every 1-D lane of `view`
+/// taken along `axis`. Each lane is shifted by its own max before
+/// exponentiation, then divided by its own sum, so every lane sums to 1.0
+/// independently — the per-pixel / per-class normalization densepose needs.
+///
+/// `axis` MUST be validated as in-range by the caller.
+fn softmax_inplace_along_axis(mut view: ArrayViewMutD<'_, f32>, axis: usize) {
+    for mut lane in view.lanes_mut(Axis(axis)) {
+        let max = lane.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // An all-`-inf` (or empty) lane has no finite max; leave it untouched
+        // to avoid producing NaNs from `exp(-inf - -inf)`.
+        if !max.is_finite() {
+            continue;
+        }
+        let mut sum = 0.0f32;
+        for v in lane.iter_mut() {
+            let e = (*v - max).exp();
+            *v = e;
+            sum += e;
+        }
+        if sum > 0.0 {
+            for v in lane.iter_mut() {
+                *v /= sum;
+            }
+        }
+    }
+}
 
 /// Shape of a tensor
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -49,7 +77,10 @@ impl TensorShape {
         let max_dims = self.ndim().max(other.ndim());
         for i in 0..max_dims {
             let d1 = self.0.get(self.ndim().saturating_sub(i + 1)).unwrap_or(&1);
-            let d2 = other.0.get(other.ndim().saturating_sub(i + 1)).unwrap_or(&1);
+            let d2 = other
+                .0
+                .get(other.ndim().saturating_sub(i + 1))
+                .unwrap_or(&1);
             if *d1 != *d2 && *d1 != 1 && *d2 != 1 {
                 return false;
             }
@@ -217,12 +248,24 @@ impl Tensor {
     /// Get the underlying data as a slice
     pub fn as_slice(&self) -> NnResult<&[f32]> {
         match self {
-            Tensor::Float1D(a) => a.as_slice().ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
-            Tensor::Float2D(a) => a.as_slice().ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
-            Tensor::Float3D(a) => a.as_slice().ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
-            Tensor::Float4D(a) => a.as_slice().ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
-            Tensor::FloatND(a) => a.as_slice().ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
-            _ => Err(NnError::tensor_op("Cannot get float slice from integer tensor")),
+            Tensor::Float1D(a) => a
+                .as_slice()
+                .ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
+            Tensor::Float2D(a) => a
+                .as_slice()
+                .ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
+            Tensor::Float3D(a) => a
+                .as_slice()
+                .ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
+            Tensor::Float4D(a) => a
+                .as_slice()
+                .ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
+            Tensor::FloatND(a) => a
+                .as_slice()
+                .ok_or_else(|| NnError::tensor_op("Non-contiguous array")),
+            _ => Err(NnError::tensor_op(
+                "Cannot get float slice from integer tensor",
+            )),
         }
     }
 
@@ -234,7 +277,9 @@ impl Tensor {
             Tensor::Float3D(a) => Ok(a.iter().copied().collect()),
             Tensor::Float4D(a) => Ok(a.iter().copied().collect()),
             Tensor::FloatND(a) => Ok(a.iter().copied().collect()),
-            _ => Err(NnError::tensor_op("Cannot convert integer tensor to float vec")),
+            _ => Err(NnError::tensor_op(
+                "Cannot convert integer tensor to float vec",
+            )),
         }
     }
 
@@ -243,7 +288,9 @@ impl Tensor {
         match self {
             Tensor::Float4D(a) => Ok(Tensor::Float4D(a.mapv(|x| x.max(0.0)))),
             Tensor::FloatND(a) => Ok(Tensor::FloatND(a.mapv(|x| x.max(0.0)))),
-            _ => Err(NnError::tensor_op("ReLU not supported for this tensor type")),
+            _ => Err(NnError::tensor_op(
+                "ReLU not supported for this tensor type",
+            )),
         }
     }
 
@@ -252,7 +299,9 @@ impl Tensor {
         match self {
             Tensor::Float4D(a) => Ok(Tensor::Float4D(a.mapv(|x| 1.0 / (1.0 + (-x).exp())))),
             Tensor::FloatND(a) => Ok(Tensor::FloatND(a.mapv(|x| 1.0 / (1.0 + (-x).exp())))),
-            _ => Err(NnError::tensor_op("Sigmoid not supported for this tensor type")),
+            _ => Err(NnError::tensor_op(
+                "Sigmoid not supported for this tensor type",
+            )),
         }
     }
 
@@ -261,20 +310,49 @@ impl Tensor {
         match self {
             Tensor::Float4D(a) => Ok(Tensor::Float4D(a.mapv(|x| x.tanh()))),
             Tensor::FloatND(a) => Ok(Tensor::FloatND(a.mapv(|x| x.tanh()))),
-            _ => Err(NnError::tensor_op("Tanh not supported for this tensor type")),
+            _ => Err(NnError::tensor_op(
+                "Tanh not supported for this tensor type",
+            )),
         }
     }
 
-    /// Apply softmax along axis
+    /// Apply softmax along the given `axis`.
+    ///
+    /// Each 1-D lane along `axis` is normalized independently so it sums to
+    /// 1.0. This is the correct semantics for per-pixel / per-class probability
+    /// maps (e.g. DensePose body-part logits over the channel axis). A
+    /// numerically-stable max-shift is applied per lane.
+    ///
+    /// # Errors
+    /// Returns [`NnError`] if `axis` is out of range for the tensor's rank, or
+    /// if the tensor type is unsupported.
     pub fn softmax(&self, axis: usize) -> NnResult<Tensor> {
         match self {
             Tensor::Float4D(a) => {
-                let max = a.fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
-                let exp = a.mapv(|x| (x - max).exp());
-                let sum = exp.sum();
-                Ok(Tensor::Float4D(exp / sum))
+                if axis >= a.ndim() {
+                    return Err(NnError::tensor_op(format!(
+                        "softmax axis {axis} out of range for {}-D tensor",
+                        a.ndim()
+                    )));
+                }
+                let mut out = a.clone();
+                softmax_inplace_along_axis(out.view_mut().into_dyn(), axis);
+                Ok(Tensor::Float4D(out))
             }
-            _ => Err(NnError::tensor_op("Softmax not supported for this tensor type")),
+            Tensor::FloatND(a) => {
+                if axis >= a.ndim() {
+                    return Err(NnError::tensor_op(format!(
+                        "softmax axis {axis} out of range for {}-D tensor",
+                        a.ndim()
+                    )));
+                }
+                let mut out = a.clone();
+                softmax_inplace_along_axis(out.view_mut(), axis);
+                Ok(Tensor::FloatND(out))
+            }
+            _ => Err(NnError::tensor_op(
+                "Softmax not supported for this tensor type",
+            )),
         }
     }
 
@@ -285,13 +363,17 @@ impl Tensor {
                 let result = a.map_axis(ndarray::Axis(axis), |row| {
                     row.iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(i, _)| i as i64)
                         .unwrap_or(0)
                 });
                 Ok(Tensor::IntND(result.into_dyn()))
             }
-            _ => Err(NnError::tensor_op("Argmax not supported for this tensor type")),
+            _ => Err(NnError::tensor_op(
+                "Argmax not supported for this tensor type",
+            )),
         }
     }
 
@@ -300,7 +382,9 @@ impl Tensor {
         match self {
             Tensor::Float4D(a) => Ok(a.mean().unwrap_or(0.0)),
             Tensor::FloatND(a) => Ok(a.mean().unwrap_or(0.0)),
-            _ => Err(NnError::tensor_op("Mean not supported for this tensor type")),
+            _ => Err(NnError::tensor_op(
+                "Mean not supported for this tensor type",
+            )),
         }
     }
 
@@ -315,7 +399,7 @@ impl Tensor {
         let first_shape = tensors[0].shape();
         for (i, t) in tensors.iter().enumerate().skip(1) {
             if t.shape() != first_shape {
-                return Err(NnError::tensor_op(&format!(
+                return Err(NnError::tensor_op(format!(
                     "Shape mismatch at index {i}: expected {first_shape}, got {}",
                     t.shape()
                 )));
@@ -328,11 +412,8 @@ impl Tensor {
         }
         let mut new_dims = vec![tensors.len()];
         new_dims.extend_from_slice(first_shape.dims());
-        let arr = ndarray::ArrayD::from_shape_vec(
-            ndarray::IxDyn(&new_dims),
-            all_data,
-        )
-        .map_err(|e| NnError::tensor_op(&format!("Stack reshape failed: {e}")))?;
+        let arr = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&new_dims), all_data)
+            .map_err(|e| NnError::tensor_op(format!("Stack reshape failed: {e}")))?;
         Ok(Tensor::FloatND(arr))
     }
 
@@ -344,9 +425,11 @@ impl Tensor {
             return Err(NnError::tensor_op("Cannot split into 0 pieces"));
         }
         let shape = self.shape();
-        let batch = shape.dim(0).ok_or_else(|| NnError::tensor_op("Tensor has no dimensions"))?;
+        let batch = shape
+            .dim(0)
+            .ok_or_else(|| NnError::tensor_op("Tensor has no dimensions"))?;
         if batch % n != 0 {
-            return Err(NnError::tensor_op(&format!(
+            return Err(NnError::tensor_op(format!(
                 "Batch dim {batch} not divisible by {n}"
             )));
         }
@@ -366,7 +449,7 @@ impl Tensor {
                 ndarray::IxDyn(&sub_dims),
                 data[start..end].to_vec(),
             )
-            .map_err(|e| NnError::tensor_op(&format!("Split reshape failed: {e}")))?;
+            .map_err(|e| NnError::tensor_op(format!("Split reshape failed: {e}")))?;
             result.push(Tensor::FloatND(arr));
         }
         Ok(result)
@@ -462,7 +545,7 @@ mod tests {
     fn test_tensor_shape() {
         let shape = TensorShape::new(vec![1, 3, 224, 224]);
         assert_eq!(shape.ndim(), 4);
-        assert_eq!(shape.numel(), 1 * 3 * 224 * 224);
+        assert_eq!(shape.numel(), 3 * 224 * 224);
         assert_eq!(shape.dim(0), Some(1));
         assert_eq!(shape.dim(1), Some(3));
     }
@@ -485,6 +568,67 @@ mod tests {
         let sigmoid = tensor.sigmoid().unwrap();
         assert!(sigmoid.min().unwrap() > 0.0);
         assert!(sigmoid.max().unwrap() < 1.0);
+    }
+
+    // ADR-155 §Tier-2: softmax(axis) must normalize along the GIVEN axis
+    // (per-lane sum == 1), not over the whole tensor.
+    #[test]
+    fn test_softmax_axis_sums_to_one_per_lane() {
+        // 2x3x1x1 tensor; softmax along axis 1 (the size-3 axis).
+        let arr =
+            Array4::from_shape_vec([2, 3, 1, 1], vec![1.0f32, 2.0, 3.0, -1.0, 0.0, 1.0]).unwrap();
+        let t = Tensor::Float4D(arr);
+        let sm = t.softmax(1).unwrap();
+        let out = sm.as_array4().unwrap();
+        // Each lane along axis 1 must sum to 1.0.
+        for b in 0..2 {
+            let lane_sum: f32 = (0..3).map(|c| out[[b, c, 0, 0]]).sum();
+            assert!((lane_sum - 1.0).abs() < 1e-6, "lane {b} sum = {lane_sum}");
+        }
+        // Probabilities must be ordered like the logits within a lane.
+        assert!(out[[0, 0, 0, 0]] < out[[0, 1, 0, 0]]);
+        assert!(out[[0, 1, 0, 0]] < out[[0, 2, 0, 0]]);
+    }
+
+    // ADR-155 §Tier-2: softmax along different axes must give different
+    // results — the old global-softmax bug ignored the axis entirely.
+    #[test]
+    fn test_softmax_axis_choice_matters() {
+        let arr = Array4::from_shape_vec([1, 2, 2, 1], vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let t = Tensor::Float4D(arr);
+        let along1 = t.softmax(1).unwrap();
+        let along2 = t.softmax(2).unwrap();
+        let a1 = along1.as_array4().unwrap();
+        let a2 = along2.as_array4().unwrap();
+        // The two normalizations partition the values differently, so at least
+        // one element must differ.
+        let mut differs = false;
+        for h in 0..2 {
+            if (a1[[0, 0, h, 0]] - a2[[0, 0, h, 0]]).abs() > 1e-6 {
+                differs = true;
+            }
+        }
+        assert!(differs, "softmax along axis 1 must differ from axis 2");
+    }
+
+    // ADR-155 §Tier-2: known-value check on a tiny tensor.
+    #[test]
+    fn test_softmax_known_values() {
+        // Lane [0, ln(3)] along axis 1 → softmax = [1/4, 3/4].
+        let arr = Array4::from_shape_vec([1, 2, 1, 1], vec![0.0f32, 3.0f32.ln()]).unwrap();
+        let t = Tensor::Float4D(arr);
+        let out = t.softmax(1).unwrap();
+        let a = out.as_array4().unwrap();
+        assert!((a[[0, 0, 0, 0]] - 0.25).abs() < 1e-6);
+        assert!((a[[0, 1, 0, 0]] - 0.75).abs() < 1e-6);
+    }
+
+    // ADR-155 §Tier-2: out-of-range axis must return an error, never panic.
+    #[test]
+    fn test_softmax_axis_out_of_range_errors() {
+        let t = Tensor::zeros_4d([1, 2, 2, 2]);
+        assert!(t.softmax(4).is_err());
+        assert!(t.softmax(99).is_err());
     }
 
     #[test]

@@ -38,8 +38,17 @@ impl PointCloud {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add(&mut self, x: f32, y: f32, z: f32, r: u8, g: u8, b: u8, intensity: f32) {
-        self.points.push(ColorPoint { x, y, z, r, g, b, intensity });
+        self.points.push(ColorPoint {
+            x,
+            y,
+            z,
+            r,
+            g,
+            b,
+            intensity,
+        });
     }
 
     pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
@@ -49,8 +58,12 @@ impl PointCloud {
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
         for p in &self.points {
-            min[0] = min[0].min(p.x); min[1] = min[1].min(p.y); min[2] = min[2].min(p.z);
-            max[0] = max[0].max(p.x); max[1] = max[1].max(p.y); max[2] = max[2].max(p.z);
+            min[0] = min[0].min(p.x);
+            min[1] = min[1].min(p.y);
+            min[2] = min[2].min(p.z);
+            max[0] = max[0].max(p.x);
+            max[1] = max[1].max(p.y);
+            max[2] = max[2].max(p.z);
         }
         (min, max)
     }
@@ -74,7 +87,11 @@ pub fn write_ply(cloud: &PointCloud, path: &str) -> anyhow::Result<()> {
     writeln!(f, "property float intensity")?;
     writeln!(f, "end_header")?;
     for p in &cloud.points {
-        writeln!(f, "{:.4} {:.4} {:.4} {} {} {} {:.4}", p.x, p.y, p.z, p.r, p.g, p.b, p.intensity)?;
+        writeln!(
+            f,
+            "{:.4} {:.4} {:.4} {} {} {} {:.4}",
+            p.x, p.y, p.z, p.r, p.g, p.b, p.intensity
+        )?;
     }
     Ok(())
 }
@@ -90,8 +107,9 @@ pub struct GaussianSplat {
 
 pub fn to_gaussian_splats(cloud: &PointCloud) -> Vec<GaussianSplat> {
     // Cluster points into voxels and create one Gaussian per cluster
-    let voxel_size = 0.08;  // smaller voxels = more detail = visible movement
-    let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<&ColorPoint>> = std::collections::HashMap::new();
+    let voxel_size = 0.08; // smaller voxels = more detail = visible movement
+    let mut cells: std::collections::HashMap<(i32, i32, i32), Vec<&ColorPoint>> =
+        std::collections::HashMap::new();
 
     for p in &cloud.points {
         let key = (
@@ -102,25 +120,90 @@ pub fn to_gaussian_splats(cloud: &PointCloud) -> Vec<GaussianSplat> {
         cells.entry(key).or_default().push(p);
     }
 
-    cells.values().map(|pts| {
-        let n = pts.len() as f32;
-        let cx = pts.iter().map(|p| p.x).sum::<f32>() / n;
-        let cy = pts.iter().map(|p| p.y).sum::<f32>() / n;
-        let cz = pts.iter().map(|p| p.z).sum::<f32>() / n;
-        let cr = pts.iter().map(|p| p.r as f32).sum::<f32>() / n / 255.0;
-        let cg = pts.iter().map(|p| p.g as f32).sum::<f32>() / n / 255.0;
-        let cb = pts.iter().map(|p| p.b as f32).sum::<f32>() / n / 255.0;
+    cells
+        .values()
+        .map(|pts| {
+            let n = pts.len() as f32;
 
-        // Scale based on point spread
-        let sx = pts.iter().map(|p| (p.x - cx).abs()).sum::<f32>() / n + 0.01;
-        let sy = pts.iter().map(|p| (p.y - cy).abs()).sum::<f32>() / n + 0.01;
-        let sz = pts.iter().map(|p| (p.z - cz).abs()).sum::<f32>() / n + 0.01;
+            // Pass 1 — single fused accumulation of all six sums (position +
+            // colour). Replaces six separate `.iter().sum()` passes; identical
+            // f32 accumulation order, so the result is bit-for-bit unchanged.
+            let (mut sum_x, mut sum_y, mut sum_z) = (0.0f32, 0.0f32, 0.0f32);
+            let (mut sum_r, mut sum_g, mut sum_b) = (0.0f32, 0.0f32, 0.0f32);
+            for p in pts {
+                sum_x += p.x;
+                sum_y += p.y;
+                sum_z += p.z;
+                sum_r += p.r as f32;
+                sum_g += p.g as f32;
+                sum_b += p.b as f32;
+            }
+            let cx = sum_x / n;
+            let cy = sum_y / n;
+            let cz = sum_z / n;
+            let cr = sum_r / n / 255.0;
+            let cg = sum_g / n / 255.0;
+            let cb = sum_b / n / 255.0;
 
-        GaussianSplat {
-            center: [cx, cy, cz],
-            color: [cr, cg, cb],
-            opacity: (n / 10.0).min(1.0),
-            scale: [sx, sy, sz],
+            // Pass 2 — spread (mean absolute deviation) needs the centroid, so
+            // it is a second fused pass instead of three separate ones.
+            let (mut dev_x, mut dev_y, mut dev_z) = (0.0f32, 0.0f32, 0.0f32);
+            for p in pts {
+                dev_x += (p.x - cx).abs();
+                dev_y += (p.y - cy).abs();
+                dev_z += (p.z - cz).abs();
+            }
+            let sx = dev_x / n + 0.01;
+            let sy = dev_y / n + 0.01;
+            let sz = dev_z / n + 0.01;
+
+            GaussianSplat {
+                center: [cx, cy, cz],
+                color: [cr, cg, cb],
+                opacity: (n / 10.0).min(1.0),
+                scale: [sx, sy, sz],
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_cloud_has_no_splats() {
+        let cloud = PointCloud::new("test");
+        assert!(to_gaussian_splats(&cloud).is_empty());
+    }
+
+    #[test]
+    fn single_voxel_centroid_and_scale_are_correct() {
+        // Two points inside the same 0.08 m voxel: (0.01,0.01,0.01) and
+        // (0.03,0.03,0.03). Centroid = 0.02 each axis; mean-abs-dev = 0.01;
+        // scale = 0.01 + 0.01 = 0.02. Colours: r=0 and r=255 → mean 127.5/255.
+        let mut cloud = PointCloud::new("test");
+        cloud.add(0.01, 0.01, 0.01, 0, 0, 0, 1.0);
+        cloud.add(0.03, 0.03, 0.03, 255, 255, 255, 1.0);
+
+        let splats = to_gaussian_splats(&cloud);
+        assert_eq!(splats.len(), 1, "both points fall in one voxel");
+        let s = &splats[0];
+        for axis in 0..3 {
+            assert!((s.center[axis] - 0.02).abs() < 1e-5, "center[{axis}]={}", s.center[axis]);
+            assert!((s.scale[axis] - 0.02).abs() < 1e-5, "scale[{axis}]={}", s.scale[axis]);
+            assert!((s.color[axis] - 127.5 / 255.0).abs() < 1e-5, "color[{axis}]");
         }
-    }).collect()
+        // opacity = n/10 = 0.2
+        assert!((s.opacity - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn distinct_voxels_yield_distinct_splats() {
+        // Two points far apart → two separate voxels → two splats.
+        let mut cloud = PointCloud::new("test");
+        cloud.add(0.0, 0.0, 0.0, 10, 20, 30, 1.0);
+        cloud.add(1.0, 1.0, 1.0, 40, 50, 60, 1.0);
+        assert_eq!(to_gaussian_splats(&cloud).len(), 2);
+    }
 }

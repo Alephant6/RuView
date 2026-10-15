@@ -17,7 +17,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use ndarray::Array4;
 use wifi_densepose_train::{
     config::TrainingConfig,
-    dataset::{CsiDataset, SyntheticCsiDataset, SyntheticConfig},
+    dataset::{CsiDataset, SyntheticConfig, SyntheticCsiDataset},
     subcarrier::{compute_interp_weights, interpolate_subcarriers},
 };
 
@@ -57,26 +57,27 @@ fn bench_interp_scaling(c: &mut Criterion) {
 
     for src_sc in [56_usize, 114, 256, 512] {
         let arr = Array4::<f32>::from_shape_fn(
-            (cfg.window_frames, cfg.num_antennas_tx, cfg.num_antennas_rx, src_sc),
+            (
+                cfg.window_frames,
+                cfg.num_antennas_tx,
+                cfg.num_antennas_rx,
+                src_sc,
+            ),
             |(t, tx, rx, k)| (t + tx + rx + k) as f32 * 0.001,
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("src_sc", src_sc),
-            &src_sc,
-            |b, &sc| {
-                if sc == 56 {
-                    // Identity case: the function just clones the array.
-                    b.iter(|| {
-                        let _ = arr.clone();
-                    });
-                } else {
-                    b.iter(|| {
-                        let _ = interpolate_subcarriers(black_box(&arr), black_box(56));
-                    });
-                }
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("src_sc", src_sc), &src_sc, |b, &sc| {
+            if sc == 56 {
+                // Identity case: the function just clones the array.
+                b.iter(|| {
+                    let _ = arr.clone();
+                });
+            } else {
+                b.iter(|| {
+                    let _ = interpolate_subcarriers(black_box(&arr), black_box(56));
+                });
+            }
+        });
     }
 
     group.finish();
@@ -148,7 +149,16 @@ fn bench_config_validate(c: &mut Criterion) {
 // PCK computation benchmark (pure Rust, no tch dependency)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Inline PCK@threshold computation for a single (pred, gt) sample.
+/// Inline raw-threshold PCK for a single (pred, gt) sample — **BENCH FIXTURE
+/// ONLY**.
+///
+/// DO NOT USE for reported metrics (ADR-155 §Tier-1.1). This is a deliberately
+/// trivial `dist ≤ threshold` kernel chosen to exercise the hot loop without a
+/// torso-normalization step; it is NOT the canonical metric. The single source
+/// of truth for any reported PCK is
+/// `wifi_densepose_train::metrics::pck_canonical` (torso-normalized, COCO
+/// convention). This local copy exists only so the bench can run without the
+/// tch-gated `metrics` module.
 #[inline(always)]
 fn compute_pck(pred: &[[f32; 2]], gt: &[[f32; 2]], threshold: f32) -> f32 {
     let n = pred.len();
@@ -167,6 +177,8 @@ fn compute_pck(pred: &[[f32; 2]], gt: &[[f32; 2]], threshold: f32) -> f32 {
     correct as f32 / n as f32
 }
 
+type JointSample = (Vec<[f32; 2]>, Vec<[f32; 2]>);
+
 /// Benchmark PCK computation over 100 deterministic samples.
 fn bench_pck_100_samples(c: &mut Criterion) {
     let num_samples = 100_usize;
@@ -174,7 +186,7 @@ fn bench_pck_100_samples(c: &mut Criterion) {
     let threshold = 0.05_f32;
 
     // Build deterministic fixed pred/gt pairs using sines for variety.
-    let samples: Vec<(Vec<[f32; 2]>, Vec<[f32; 2]>)> = (0..num_samples)
+    let samples: Vec<JointSample> = (0..num_samples)
         .map(|i| {
             let pred: Vec<[f32; 2]> = (0..num_joints)
                 .map(|j| {

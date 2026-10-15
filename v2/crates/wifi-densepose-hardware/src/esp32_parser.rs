@@ -16,7 +16,8 @@
 //! 12      4     Sequence number (LE u32)
 //! 16      1     RSSI (i8)
 //! 17      1     Noise floor (i8)
-//! 18      2     Reserved
+//! 18      1     PPDU type (ADR-110: 0=HT/legacy, 1=HE-SU, 2=HE-MU, 3=HE-TB)
+//! 19      1     Flags (ADR-110: bit0 bw40, bit2 STBC, bit3 LDPC, bit4 15.4-sync)
 //! 20      N*2   I/Q pairs (n_antennas * n_subcarriers * 2 bytes)
 //! ```
 //!
@@ -31,7 +32,9 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::Utc;
 use std::io::Cursor;
 
-use crate::csi_frame::{AntennaConfig, Bandwidth, CsiFrame, CsiMetadata, SubcarrierData};
+use crate::csi_frame::{
+    Adr018Flags, AntennaConfig, Bandwidth, CsiFrame, CsiMetadata, PpduType, SubcarrierData,
+};
 use crate::error::ParseError;
 
 /// ESP32 CSI binary frame magic number (ADR-018).
@@ -76,8 +79,13 @@ pub fn ruview_sibling_packet_name(magic: u32) -> Option<&'static str> {
 /// ADR-018 header size in bytes (before I/Q data).
 const HEADER_SIZE: usize = 20;
 
-/// Maximum valid subcarrier count for ESP32 (80 MHz bandwidth).
-const MAX_SUBCARRIERS: usize = 256;
+/// Maximum I/Q pairs in one frame (all antennas together). The firmware
+/// serializes into `CSI_MAX_FRAME_SIZE = CSI_HEADER_SIZE + 4 * 256 * 2`
+/// (`firmware/esp32-csi-node/main/csi_collector.h`) and drops anything larger,
+/// so a frame never carries more than 2048 I/Q bytes = 1024 pairs. Real
+/// ESP32-S3 frames carry up to 306 subcarriers on one antenna (merged
+/// LLTF/HT-LTF buffers), which the old 256-subcarrier cap rejected.
+const MAX_IQ_PAIRS: usize = 1024;
 
 /// Maximum antenna count for ESP32.
 const MAX_ANTENNAS: u8 = 4;
@@ -113,10 +121,9 @@ impl Esp32CsiParser {
         let mut cursor = Cursor::new(data);
 
         // Magic (offset 0, 4 bytes)
-        let magic = cursor.read_u32::<LittleEndian>().map_err(|_| ParseError::InsufficientData {
-            needed: 4,
-            got: 0,
-        })?;
+        let magic = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|_| ParseError::InsufficientData { needed: 4, got: 0 })?;
 
         if magic != ESP32_CSI_MAGIC {
             return Err(ParseError::InvalidMagic {
@@ -142,29 +149,38 @@ impl Esp32CsiParser {
         }
 
         // Number of subcarriers (offset 6, 2 bytes LE)
-        let n_subcarriers = cursor.read_u16::<LittleEndian>().map_err(|_| ParseError::ByteError {
-            offset: 6,
-            message: "Failed to read subcarrier count".into(),
-        })? as usize;
+        let n_subcarriers =
+            cursor
+                .read_u16::<LittleEndian>()
+                .map_err(|_| ParseError::ByteError {
+                    offset: 6,
+                    message: "Failed to read subcarrier count".into(),
+                })? as usize;
 
-        if n_subcarriers > MAX_SUBCARRIERS {
+        let max_subcarriers = MAX_IQ_PAIRS / n_antennas as usize;
+        if n_subcarriers > max_subcarriers {
             return Err(ParseError::InvalidSubcarrierCount {
                 count: n_subcarriers,
-                max: MAX_SUBCARRIERS,
+                max: max_subcarriers,
             });
         }
 
         // Frequency MHz (offset 8, 4 bytes LE)
-        let channel_freq_mhz = cursor.read_u32::<LittleEndian>().map_err(|_| ParseError::ByteError {
-            offset: 8,
-            message: "Failed to read frequency".into(),
-        })?;
+        let channel_freq_mhz =
+            cursor
+                .read_u32::<LittleEndian>()
+                .map_err(|_| ParseError::ByteError {
+                    offset: 8,
+                    message: "Failed to read frequency".into(),
+                })?;
 
         // Sequence number (offset 12, 4 bytes LE)
-        let sequence = cursor.read_u32::<LittleEndian>().map_err(|_| ParseError::ByteError {
-            offset: 12,
-            message: "Failed to read sequence number".into(),
-        })?;
+        let sequence = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|_| ParseError::ByteError {
+                offset: 12,
+                message: "Failed to read sequence number".into(),
+            })?;
 
         // RSSI (offset 16, 1 byte signed)
         let rssi_dbm = cursor.read_i8().map_err(|_| ParseError::ByteError {
@@ -178,11 +194,20 @@ impl Esp32CsiParser {
             message: "Failed to read noise floor".into(),
         })?;
 
-        // Reserved (offset 18, 2 bytes) — skip
-        let _reserved = cursor.read_u16::<LittleEndian>().map_err(|_| ParseError::ByteError {
+        // ADR-110: bytes 18-19 carry PPDU type + flags (previously reserved-zero,
+        // now opt-in via CONFIG_CSI_FRAME_HE_TAGGING in firmware). Pre-ADR-110
+        // firmware sends zeros, which round-trip as PpduType::HtLegacy +
+        // Adr018Flags::default() — fully backwards compatible.
+        let ppdu_byte = cursor.read_u8().map_err(|_| ParseError::ByteError {
             offset: 18,
-            message: "Failed to read reserved bytes".into(),
+            message: "Failed to read PPDU type byte".into(),
         })?;
+        let flags_byte = cursor.read_u8().map_err(|_| ParseError::ByteError {
+            offset: 19,
+            message: "Failed to read flags byte".into(),
+        })?;
+        let ppdu_type = PpduType::from_byte(ppdu_byte);
+        let adr018_flags = Adr018Flags::from_byte(flags_byte);
 
         // I/Q data: n_antennas * n_subcarriers * 2 bytes
         let iq_pair_count = n_antennas as usize * n_subcarriers;
@@ -222,12 +247,35 @@ impl Esp32CsiParser {
             }
         }
 
-        // Determine bandwidth from subcarrier count
-        let bandwidth = match n_subcarriers {
-            0..=56 => Bandwidth::Bw20,
-            57..=114 => Bandwidth::Bw40,
-            115..=242 => Bandwidth::Bw80,
-            _ => Bandwidth::Bw160,
+        // Determine bandwidth from PPDU type + subcarrier count (ADR-110).
+        //
+        // HE-LTF uses a 4x denser tone grid than HT-LTF on the same channel
+        // width: HE20 = 256-FFT (242 active tones), HE40 = 512-FFT (484
+        // active). So a 256-bin frame on an HE PPDU is *20 MHz*, not 160.
+        // For HE frames the firmware also writes the bandwidth into byte 19
+        // bit 0 (see Adr018Flags::bw40) — prefer that when set.
+        //
+        // HT/legacy keeps the count heuristic, with 64 included in the 20 MHz
+        // bucket: ESP32 HT20 CSI delivers the full 64-bin FFT grid (live
+        // capture evidence: 148-byte frames = 64 subcarriers on a 20 MHz
+        // channel, issue #1005). Larger counts come from merged LLTF/HT-LTF
+        // buffers (e.g. 192 = 3 x 64, 306) on 20/40 MHz channels; ESP32-family
+        // radios do not use 80/160 MHz, so anything above 64 maps to 40 MHz.
+        //
+        // CLAIMED: the "HT/legacy count above 64 means 40 MHz" rule is inferred
+        // from the datasheet, not measured on these frames. ESP32-C5/C6 are not
+        // separately covered by it.
+        let bandwidth = if ppdu_type.is_he() {
+            if adr018_flags.bw40 || n_subcarriers > 256 {
+                Bandwidth::Bw40
+            } else {
+                Bandwidth::Bw20
+            }
+        } else {
+            match n_subcarriers {
+                0..=64 => Bandwidth::Bw20,
+                _ => Bandwidth::Bw40,
+            }
         };
 
         let frame = CsiFrame {
@@ -245,6 +293,8 @@ impl Esp32CsiParser {
                     rx_antennas: n_antennas,
                 },
                 sequence,
+                ppdu_type,
+                adr018_flags,
             },
             subcarriers,
         };
@@ -293,7 +343,20 @@ mod tests {
     use super::*;
 
     /// Build a valid ADR-018 ESP32 CSI frame with known parameters.
+    /// PPDU type + flags bytes (offset 18-19) are zero — pre-ADR-110 default,
+    /// which round-trips as PpduType::HtLegacy + Adr018Flags::default().
     fn build_test_frame(node_id: u8, n_antennas: u8, subcarrier_pairs: &[(i8, i8)]) -> Vec<u8> {
+        build_test_frame_with_he(node_id, n_antennas, subcarrier_pairs, 0, 0)
+    }
+
+    /// ADR-110-aware variant: explicit byte 18 (PPDU type) and byte 19 (flags).
+    fn build_test_frame_with_he(
+        node_id: u8,
+        n_antennas: u8,
+        subcarrier_pairs: &[(i8, i8)],
+        ppdu_byte: u8,
+        flags_byte: u8,
+    ) -> Vec<u8> {
         let n_subcarriers = if n_antennas == 0 {
             subcarrier_pairs.len()
         } else {
@@ -301,32 +364,82 @@ mod tests {
         };
 
         let mut buf = Vec::new();
-
-        // Magic (offset 0)
         buf.extend_from_slice(&ESP32_CSI_MAGIC.to_le_bytes());
-        // Node ID (offset 4)
         buf.push(node_id);
-        // Number of antennas (offset 5)
         buf.push(n_antennas);
-        // Number of subcarriers (offset 6, LE u16)
         buf.extend_from_slice(&(n_subcarriers as u16).to_le_bytes());
-        // Frequency MHz (offset 8, LE u32)
         buf.extend_from_slice(&2437u32.to_le_bytes());
-        // Sequence number (offset 12, LE u32)
         buf.extend_from_slice(&1u32.to_le_bytes());
-        // RSSI (offset 16, i8)
         buf.push((-50i8) as u8);
-        // Noise floor (offset 17, i8)
         buf.push((-95i8) as u8);
-        // Reserved (offset 18, 2 bytes)
-        buf.extend_from_slice(&[0u8; 2]);
-        // I/Q data (offset 20)
+        buf.push(ppdu_byte);
+        buf.push(flags_byte);
         for (i, q) in subcarrier_pairs {
             buf.push(*i as u8);
             buf.push(*q as u8);
         }
 
         buf
+    }
+
+    // ── ADR-110: byte 18-19 round-trip tests ─────────────────────────────────
+
+    #[test]
+    fn adr110_pre_adr110_firmware_round_trips_as_ht_legacy_default_flags() {
+        // Pre-ADR-110 firmware writes zeros to bytes 18-19. The parser must
+        // surface that as HtLegacy + default flags so old aggregators see
+        // identical behavior to before the extension.
+        let data = build_test_frame(1, 1, &[(0, 0); 56]);
+        let (frame, _) = Esp32CsiParser::parse_frame(&data).unwrap();
+        assert_eq!(frame.metadata.ppdu_type, PpduType::HtLegacy);
+        assert_eq!(frame.metadata.adr018_flags, Adr018Flags::default());
+        assert!(!frame.metadata.ppdu_type.is_he());
+    }
+
+    #[test]
+    fn adr110_he_su_ppdu_decodes() {
+        let data = build_test_frame_with_he(2, 1, &[(0, 0); 56], /*PPDU*/ 1, /*flags*/ 0);
+        let (frame, _) = Esp32CsiParser::parse_frame(&data).unwrap();
+        assert_eq!(frame.metadata.ppdu_type, PpduType::HeSu);
+        assert!(frame.metadata.ppdu_type.is_he());
+    }
+
+    #[test]
+    fn adr110_he_mu_he_tb_decode() {
+        let mu = build_test_frame_with_he(3, 1, &[(0, 0); 56], 2, 0);
+        let tb = build_test_frame_with_he(4, 1, &[(0, 0); 56], 3, 0);
+        let (mu_frame, _) = Esp32CsiParser::parse_frame(&mu).unwrap();
+        let (tb_frame, _) = Esp32CsiParser::parse_frame(&tb).unwrap();
+        assert_eq!(mu_frame.metadata.ppdu_type, PpduType::HeMu);
+        assert_eq!(tb_frame.metadata.ppdu_type, PpduType::HeTb);
+    }
+
+    #[test]
+    fn adr110_unknown_ppdu_byte_decodes_as_unknown() {
+        let data = build_test_frame_with_he(5, 1, &[(0, 0); 56], 0xFF, 0);
+        let (frame, _) = Esp32CsiParser::parse_frame(&data).unwrap();
+        assert_eq!(frame.metadata.ppdu_type, PpduType::Unknown);
+    }
+
+    #[test]
+    fn adr110_flags_round_trip_all_bits() {
+        // All known flag bits set: bw40 + STBC + LDPC + sync + sanitized prefix = 0x3D.
+        let data = build_test_frame_with_he(6, 1, &[(0, 0); 56], 1, 0x3D);
+        let (frame, _) = Esp32CsiParser::parse_frame(&data).unwrap();
+        assert!(frame.metadata.adr018_flags.bw40);
+        assert!(frame.metadata.adr018_flags.stbc);
+        assert!(frame.metadata.adr018_flags.ldpc);
+        assert!(frame.metadata.adr018_flags.ieee802154_sync_valid);
+        assert!(frame.metadata.adr018_flags.first_word_sanitized);
+        // Round-trip the encoder
+        assert_eq!(frame.metadata.adr018_flags.to_byte(), 0x3D);
+    }
+
+    #[test]
+    fn adr110_ppdu_byte_round_trips_for_known_variants() {
+        for v in [PpduType::HtLegacy, PpduType::HeSu, PpduType::HeMu, PpduType::HeTb, PpduType::Unknown] {
+            assert_eq!(PpduType::from_byte(v.to_byte()), v, "round-trip failed for {v:?}");
+        }
     }
 
     #[test]
@@ -390,11 +503,17 @@ mod tests {
             RUVIEW_FEATURE_STATE_MAGIC,
             RUVIEW_TEMPORAL_MAGIC,
         ] {
-            assert!(ruview_sibling_packet_name(m).is_some(), "{m:#010x} unclassified");
+            assert!(
+                ruview_sibling_packet_name(m).is_some(),
+                "{m:#010x} unclassified"
+            );
             let mut data = vec![0u8; 24];
             data[0..4].copy_from_slice(&m.to_le_bytes());
             assert!(
-                matches!(Esp32CsiParser::parse_frame(&data), Err(ParseError::NonCsiPacket { .. })),
+                matches!(
+                    Esp32CsiParser::parse_frame(&data),
+                    Err(ParseError::NonCsiPacket { .. })
+                ),
                 "{m:#010x} should parse as NonCsiPacket"
             );
         }
@@ -467,5 +586,60 @@ mod tests {
         assert_eq!(frame.metadata.n_subcarriers, 4);
         assert_eq!(frame.subcarrier_count(), 12); // 3 antennas * 4 subcarriers
         assert_eq!(frame.metadata.antenna_config.rx_antennas, 3);
+    }
+
+    // ── Real-hardware subcarrier counts ──────────────────────────────────────
+
+    #[test]
+    fn s3_306_subcarrier_single_antenna_frame_parses() {
+        // ESP32-S3 nodes on firmware 0.8.12 at 2432 MHz emit 1-antenna frames
+        // with 306 subcarriers (612 I/Q bytes) alongside 192/128/64 counts.
+        let pairs: Vec<(i8, i8)> = (0..306)
+            .map(|k| ((k % 7) as i8, -((k % 5) as i8)))
+            .collect();
+        let data = build_test_frame(2, 1, &pairs);
+        assert_eq!(data.len(), HEADER_SIZE + 612);
+        let (frame, consumed) = Esp32CsiParser::parse_frame(&data).expect("306-sc frame");
+        assert_eq!(consumed, data.len());
+        assert_eq!(frame.metadata.n_subcarriers, 306);
+        assert_eq!(frame.subcarrier_count(), 306);
+        assert_eq!(frame.metadata.rssi_dbm, -50);
+    }
+
+    #[test]
+    fn ht_bandwidth_never_exceeds_40mhz_for_esp32_counts() {
+        // ESP32-family radios use 20/40 MHz channels. Merged-LTF buffers
+        // (192 = 3 x 64, 306) must not be classified as 80/160 MHz.
+        for &n in &[64usize, 128, 188, 192, 306] {
+            let pairs = vec![(1i8, 1i8); n];
+            let (frame, _) = Esp32CsiParser::parse_frame(&build_test_frame(1, 1, &pairs))
+                .unwrap_or_else(|e| panic!("{n}-sc frame: {e}"));
+            let bw = frame.metadata.bandwidth;
+            assert!(
+                matches!(bw, Bandwidth::Bw20 | Bandwidth::Bw40),
+                "{n} subcarriers classified as {bw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn iq_pairs_beyond_firmware_buffer_are_rejected() {
+        // Firmware CSI_MAX_FRAME_SIZE leaves 2048 I/Q bytes = 1024 pairs.
+        let max = vec![(0i8, 0i8); MAX_IQ_PAIRS];
+        assert!(Esp32CsiParser::parse_frame(&build_test_frame(1, 1, &max)).is_ok());
+        let over = vec![(0i8, 0i8); MAX_IQ_PAIRS + 1];
+        assert!(matches!(
+            Esp32CsiParser::parse_frame(&build_test_frame(1, 1, &over)),
+            Err(ParseError::InvalidSubcarrierCount { .. })
+        ));
+        // The bound is on total pairs: 2 antennas x 600 subcarriers = 1200.
+        let two_ant = vec![(0i8, 0i8); 1200];
+        assert!(matches!(
+            Esp32CsiParser::parse_frame(&build_test_frame(1, 2, &two_ant)),
+            Err(ParseError::InvalidSubcarrierCount {
+                count: 600,
+                max: 512
+            })
+        ));
     }
 }

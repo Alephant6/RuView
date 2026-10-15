@@ -29,8 +29,8 @@
 //! 4. Sent over plain UDP
 
 use super::quic_transport::{
-    FramedMessage, MessageType, QuicTransportConfig,
-    QuicTransportHandle, QuicTransportError, SecurityMode,
+    FramedMessage, MessageType, QuicTransportConfig, QuicTransportError, QuicTransportHandle,
+    SecurityMode,
 };
 use super::tdm::{SyncBeacon, TdmCoordinator, TdmSchedule, TdmSlotCompleted};
 use hmac::{Hmac, Mac};
@@ -47,6 +47,42 @@ type HmacSha256 = Hmac<Sha256>;
 /// Size of the HMAC-SHA256 truncated tag (manual crypto mode).
 const HMAC_TAG_SIZE: usize = 8;
 
+/// Constant-time comparison of two fixed-size HMAC/auth tags.
+///
+/// ADR-157 §B4: the previous `self.hmac_tag == expected` short-circuits on the
+/// first differing byte, leaking how many leading bytes matched through its
+/// execution time. For an authentication tag that is a timing oracle: an
+/// attacker who can submit forged beacons and measure verification latency can
+/// recover the correct tag byte-by-byte (~256·N trials instead of 256^N).
+///
+/// This hand-rolled compare avoids adding the `subtle` crate (ADR-157 deferred
+/// B4 only to dodge that dependency — a fixed 8-byte compare needs none). We
+/// XOR-accumulate every byte difference into a single `u8` with **no early
+/// exit**, so the work done is identical regardless of where (or whether) the
+/// tags differ. The accumulator is non-zero iff any byte differed; we compare
+/// it to zero exactly once at the end.
+///
+/// `#[inline(never)]` plus `black_box` on the accumulator stop the optimizer
+/// from reintroducing a short-circuit or hoisting the loop into a `memcmp`
+/// (which is itself non-constant-time). The two slices are required to be the
+/// same length by construction (both `[u8; HMAC_TAG_SIZE]`); a length mismatch
+/// returns `false` without inspecting contents.
+#[inline(never)]
+fn constant_time_tag_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        // Branch-free: accumulate the bitwise difference of every byte.
+        diff |= x ^ y;
+    }
+    // black_box prevents the compiler from proving `diff == 0` early and
+    // short-circuiting the loop above. The single equality check is the only
+    // data-dependent branch, and it is on the fully-accumulated value.
+    core::hint::black_box(diff) == 0
+}
+
 /// Size of the nonce field (manual crypto mode).
 const NONCE_SIZE: usize = 4;
 
@@ -59,8 +95,7 @@ pub const AUTHENTICATED_BEACON_SIZE: usize = 16 + NONCE_SIZE + HMAC_TAG_SIZE;
 /// Default pre-shared key for testing (16 bytes). In production, this
 /// would be loaded from NVS or a secure key store.
 const DEFAULT_TEST_KEY: [u8; 16] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
 ];
 
 // ---------------------------------------------------------------------------
@@ -79,7 +114,10 @@ pub enum SecureTdmError {
     /// QUIC transport error.
     Transport(QuicTransportError),
     /// The security mode does not match the incoming packet format.
-    ModeMismatch { expected: SecurityMode, got: SecurityMode },
+    ModeMismatch {
+        expected: SecurityMode,
+        got: SecurityMode,
+    },
     /// The mesh key has not been provisioned.
     NoMeshKey,
 }
@@ -88,7 +126,10 @@ impl fmt::Display for SecureTdmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SecureTdmError::BeaconAuthFailed => write!(f, "Beacon HMAC verification failed"),
-            SecureTdmError::BeaconReplay { nonce, last_accepted } => {
+            SecureTdmError::BeaconReplay {
+                nonce,
+                last_accepted,
+            } => {
                 write!(
                     f,
                     "Beacon replay: nonce {} <= last_accepted {} - REPLAY_WINDOW",
@@ -96,11 +137,19 @@ impl fmt::Display for SecureTdmError {
                 )
             }
             SecureTdmError::BeaconTooShort { expected, got } => {
-                write!(f, "Beacon too short: expected {} bytes, got {}", expected, got)
+                write!(
+                    f,
+                    "Beacon too short: expected {} bytes, got {}",
+                    expected, got
+                )
             }
             SecureTdmError::Transport(e) => write!(f, "Transport error: {}", e),
             SecureTdmError::ModeMismatch { expected, got } => {
-                write!(f, "Security mode mismatch: expected {}, got {}", expected, got)
+                write!(
+                    f,
+                    "Security mode mismatch: expected {}, got {}",
+                    expected, got
+                )
             }
             SecureTdmError::NoMeshKey => write!(f, "Mesh key not provisioned"),
         }
@@ -252,10 +301,9 @@ impl AuthenticatedBeacon {
     /// Compute the HMAC-SHA256 tag for this beacon, truncated to 8 bytes.
     ///
     /// Uses the `hmac` + `sha2` crates for cryptographically secure
-    /// message authentication (ADR-050, Sprint 1).
+    /// message authentication (ADR-166, Sprint 1).
     pub fn compute_tag(payload_and_nonce: &[u8], key: &[u8; 16]) -> [u8; HMAC_TAG_SIZE] {
-        let mut mac = HmacSha256::new_from_slice(key)
-            .expect("HMAC-SHA256 accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
         mac.update(payload_and_nonce);
         let result = mac.finalize().into_bytes();
         let mut tag = [0u8; HMAC_TAG_SIZE];
@@ -269,7 +317,10 @@ impl AuthenticatedBeacon {
         msg[..16].copy_from_slice(&self.beacon.to_bytes());
         msg[16..20].copy_from_slice(&self.nonce.to_le_bytes());
         let expected = Self::compute_tag(&msg, key);
-        if self.hmac_tag == expected {
+        // ADR-157 §B4: constant-time compare — `==` on the tag would leak,
+        // via short-circuit timing, how many leading bytes an attacker's
+        // forged tag matched, enabling byte-by-byte tag recovery.
+        if constant_time_tag_eq(&self.hmac_tag, &expected) {
             Ok(())
         } else {
             Err(SecureTdmError::BeaconAuthFailed)
@@ -346,10 +397,7 @@ pub struct SecureTdmCoordinator {
 
 impl SecureTdmCoordinator {
     /// Create a new secure TDM coordinator.
-    pub fn new(
-        schedule: TdmSchedule,
-        config: SecureTdmConfig,
-    ) -> Result<Self, SecureTdmError> {
+    pub fn new(schedule: TdmSchedule, config: SecureTdmConfig) -> Result<Self, SecureTdmError> {
         let transport = if config.security_mode == SecurityMode::QuicTransport {
             Some(QuicTransportHandle::new(config.quic_config.clone())?)
         } else {
@@ -400,10 +448,7 @@ impl SecureTdmCoordinator {
             }
             SecurityMode::QuicTransport => {
                 let beacon_bytes = beacon.to_bytes();
-                let framed = FramedMessage::new(
-                    MessageType::Beacon,
-                    beacon_bytes.to_vec(),
-                );
+                let framed = FramedMessage::new(MessageType::Beacon, beacon_bytes.to_vec());
                 let wire = framed.to_bytes();
 
                 if let Some(ref mut transport) = self.transport {
@@ -449,12 +494,11 @@ impl SecureTdmCoordinator {
                     }
                 } else if buf.len() >= 16 && self.config.sec_level != SecLevel::Enforcing {
                     // Accept unauthenticated 16-byte beacon in permissive/transitional
-                    let beacon = SyncBeacon::from_bytes(buf).ok_or(
-                        SecureTdmError::BeaconTooShort {
+                    let beacon =
+                        SyncBeacon::from_bytes(buf).ok_or(SecureTdmError::BeaconTooShort {
                             expected: 16,
                             got: buf.len(),
-                        },
-                    )?;
+                        })?;
                     self.beacons_verified += 1;
                     Ok(beacon)
                 } else {
@@ -466,12 +510,11 @@ impl SecureTdmCoordinator {
             }
             SecurityMode::QuicTransport => {
                 // In QUIC mode, extract beacon from framed message
-                let (framed, _) = FramedMessage::from_bytes(buf).ok_or(
-                    SecureTdmError::BeaconTooShort {
+                let (framed, _) =
+                    FramedMessage::from_bytes(buf).ok_or(SecureTdmError::BeaconTooShort {
                         expected: 5 + 16,
                         got: buf.len(),
-                    },
-                )?;
+                    })?;
                 if framed.message_type != MessageType::Beacon {
                     return Err(SecureTdmError::ModeMismatch {
                         expected: SecurityMode::QuicTransport,
@@ -496,11 +539,7 @@ impl SecureTdmCoordinator {
     }
 
     /// Complete a slot in the current cycle (delegates to inner coordinator).
-    pub fn complete_slot(
-        &mut self,
-        slot_index: usize,
-        capture_quality: f32,
-    ) -> TdmSlotCompleted {
+    pub fn complete_slot(&mut self, slot_index: usize, capture_quality: f32) -> TdmSlotCompleted {
         self.inner.complete_slot(slot_index, capture_quality)
     }
 
@@ -752,13 +791,128 @@ mod tests {
         ));
     }
 
+    // ---- ADR-157 §B4: constant-time tag compare ----
+
+    /// Functional pin proving the new constant-time helper is wired and correct
+    /// for the four tag-shape cases. This is the *hard gate* for §B4 — it fails
+    /// on the old `==` path only if the helper is removed/unwired, and it
+    /// guarantees accept/reject semantics are byte-exact. Grade: MEASURED
+    /// (constant-time *construction*); micro-timing on a noisy host is only a
+    /// smoke check (see `tag_compare_timing_invariance_smoke`, #[ignore]).
+    #[test]
+    fn tag_compare_is_constant_time_shape() {
+        let base = [0xA5u8; HMAC_TAG_SIZE];
+
+        // Equal tags accept.
+        assert!(constant_time_tag_eq(&base, &base), "equal tags must accept");
+
+        // First byte differs → reject.
+        let mut first = base;
+        first[0] ^= 0xFF;
+        assert!(
+            !constant_time_tag_eq(&base, &first),
+            "first-byte-differ must reject"
+        );
+
+        // Last byte differs → reject.
+        let mut last = base;
+        last[HMAC_TAG_SIZE - 1] ^= 0x01;
+        assert!(
+            !constant_time_tag_eq(&base, &last),
+            "last-byte-differ must reject"
+        );
+
+        // Every byte differs → reject.
+        let all = [0x5Au8; HMAC_TAG_SIZE]; // bitwise-inverse of 0xA5
+        assert!(
+            !constant_time_tag_eq(&base, &all),
+            "all-bytes-differ must reject"
+        );
+
+        // Length mismatch → reject without inspecting contents.
+        assert!(
+            !constant_time_tag_eq(&base, &base[..HMAC_TAG_SIZE - 1]),
+            "length mismatch must reject"
+        );
+
+        // End-to-end through verify(): a tag whose only difference is the
+        // *last* byte must still be rejected exactly like a first-byte diff.
+        let beacon = SyncBeacon {
+            cycle_id: 7,
+            cycle_period: Duration::from_millis(50),
+            drift_correction_us: 0,
+            generated_at: std::time::Instant::now(),
+        };
+        let key = DEFAULT_TEST_KEY;
+        let nonce = 1u32;
+        let mut msg = [0u8; 20];
+        msg[..16].copy_from_slice(&beacon.to_bytes());
+        msg[16..20].copy_from_slice(&nonce.to_le_bytes());
+        let mut tag = AuthenticatedBeacon::compute_tag(&msg, &key);
+        tag[HMAC_TAG_SIZE - 1] ^= 0x01; // tamper the LAST byte only
+        let auth = AuthenticatedBeacon {
+            beacon,
+            nonce,
+            hmac_tag: tag,
+        };
+        assert!(
+            matches!(auth.verify(&key), Err(SecureTdmError::BeaconAuthFailed)),
+            "last-byte tamper must fail verify()"
+        );
+    }
+
+    /// Coarse timing-invariance smoke check. #[ignore]d so it never flakes CI —
+    /// the host is noisy and a hard timing bound is unreliable. Run manually
+    /// with `cargo test -p wifi-densepose-hardware -- --ignored
+    /// tag_compare_timing_invariance_smoke --nocapture`. The assertion is a
+    /// deliberately *generous* ratio bound (4×): a short-circuit `==` would show
+    /// last-byte-differ ≫ first-byte-differ; the constant-time helper should not.
+    #[test]
+    #[ignore = "timing smoke check — noisy host, run manually with --ignored"]
+    fn tag_compare_timing_invariance_smoke() {
+        use std::time::Instant;
+        const ITERS: u32 = 2_000_000;
+        let base = [0xA5u8; HMAC_TAG_SIZE];
+        let mut first = base;
+        first[0] ^= 0xFF;
+        let mut last = base;
+        last[HMAC_TAG_SIZE - 1] ^= 0x01;
+
+        // Warm up.
+        for _ in 0..ITERS / 10 {
+            core::hint::black_box(constant_time_tag_eq(&base, &first));
+        }
+
+        let t0 = Instant::now();
+        let mut acc = false;
+        for _ in 0..ITERS {
+            acc ^= constant_time_tag_eq(&base, &first);
+        }
+        core::hint::black_box(acc);
+        let dt_first = t0.elapsed().as_nanos() as f64;
+
+        let t1 = Instant::now();
+        let mut acc2 = false;
+        for _ in 0..ITERS {
+            acc2 ^= constant_time_tag_eq(&base, &last);
+        }
+        core::hint::black_box(acc2);
+        let dt_last = t1.elapsed().as_nanos() as f64;
+
+        let ratio = dt_last.max(dt_first) / dt_last.min(dt_first).max(1.0);
+        println!(
+            "first-differ {dt_first:.0}ns, last-differ {dt_last:.0}ns, ratio {ratio:.3}"
+        );
+        assert!(
+            ratio < 4.0,
+            "timing ratio {ratio:.3} too large — possible short-circuit leak"
+        );
+    }
+
     #[test]
     fn test_auth_beacon_too_short() {
         let result = AuthenticatedBeacon::from_bytes(&[0u8; 10]);
-        assert!(matches!(
-            result,
-            Err(SecureTdmError::BeaconTooShort { .. })
-        ));
+        assert!(matches!(result, Err(SecureTdmError::BeaconTooShort { .. })));
     }
 
     #[test]
@@ -770,8 +924,7 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_manual_create() {
-        let coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         assert_eq!(coord.security_mode(), SecurityMode::ManualCrypto);
         assert_eq!(coord.beacons_produced(), 0);
         assert!(coord.transport().is_none());
@@ -779,8 +932,7 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_manual_begin_cycle() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
         assert_eq!(output.mode, SecurityMode::ManualCrypto);
@@ -792,8 +944,7 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_manual_nonce_increments() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
 
         for expected_nonce in 1..=5u32 {
             let _output = coord.begin_secure_cycle().unwrap();
@@ -807,47 +958,37 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_manual_verify_own_beacon() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
         // Create a second coordinator to verify
-        let mut verifier =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
-        let beacon = verifier
-            .verify_beacon(&output.authenticated_bytes)
-            .unwrap();
+        let mut verifier = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let beacon = verifier.verify_beacon(&output.authenticated_bytes).unwrap();
         assert_eq!(beacon.cycle_id, 0);
     }
 
     #[test]
     fn test_secure_coordinator_manual_reject_tampered() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
         let mut tampered = output.authenticated_bytes.clone();
         tampered[25] ^= 0xFF; // Tamper with HMAC tag
 
-        let mut verifier =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut verifier = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         assert!(verifier.verify_beacon(&tampered).is_err());
         assert_eq!(verifier.verification_failures(), 1);
     }
 
     #[test]
     fn test_secure_coordinator_manual_reject_replay() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
-        let mut verifier =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut verifier = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
 
         // First acceptance succeeds
-        verifier
-            .verify_beacon(&output.authenticated_bytes)
-            .unwrap();
+        verifier.verify_beacon(&output.authenticated_bytes).unwrap();
 
         // Replay of same beacon fails
         let result = verifier.verify_beacon(&output.authenticated_bytes);
@@ -908,16 +1049,14 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_quic_create() {
-        let coord =
-            SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
+        let coord = SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
         assert_eq!(coord.security_mode(), SecurityMode::QuicTransport);
         assert!(coord.transport().is_some());
     }
 
     #[test]
     fn test_secure_coordinator_quic_begin_cycle() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
         assert_eq!(output.mode, SecurityMode::QuicTransport);
@@ -928,22 +1067,17 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_quic_verify_own_beacon() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
         let output = coord.begin_secure_cycle().unwrap();
 
-        let mut verifier =
-            SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
-        let beacon = verifier
-            .verify_beacon(&output.authenticated_bytes)
-            .unwrap();
+        let mut verifier = SecureTdmCoordinator::new(test_schedule(), quic_config()).unwrap();
+        let beacon = verifier.verify_beacon(&output.authenticated_bytes).unwrap();
         assert_eq!(beacon.cycle_id, 0);
     }
 
     #[test]
     fn test_secure_coordinator_complete_cycle() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
         coord.begin_secure_cycle().unwrap();
 
         for i in 0..4 {
@@ -955,8 +1089,7 @@ mod tests {
 
     #[test]
     fn test_secure_coordinator_cycle_id_increments() {
-        let mut coord =
-            SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
+        let mut coord = SecureTdmCoordinator::new(test_schedule(), manual_config()).unwrap();
 
         let out0 = coord.begin_secure_cycle().unwrap();
         assert_eq!(out0.beacon.cycle_id, 0);
@@ -977,7 +1110,7 @@ mod tests {
         assert_eq!(SecLevel::Enforcing as u8, 2);
     }
 
-    // ---- Security tests (ADR-050) ----
+    // ---- Security tests (ADR-166) ----
 
     #[test]
     fn test_hmac_different_keys_produce_different_tags() {
@@ -986,7 +1119,10 @@ mod tests {
         let key2: [u8; 16] = [0x02; 16];
         let tag1 = AuthenticatedBeacon::compute_tag(msg, &key1);
         let tag2 = AuthenticatedBeacon::compute_tag(msg, &key2);
-        assert_ne!(tag1, tag2, "Different keys must produce different HMAC tags");
+        assert_ne!(
+            tag1, tag2,
+            "Different keys must produce different HMAC tags"
+        );
     }
 
     #[test]
@@ -994,7 +1130,10 @@ mod tests {
         let key: [u8; 16] = DEFAULT_TEST_KEY;
         let tag1 = AuthenticatedBeacon::compute_tag(b"message one", &key);
         let tag2 = AuthenticatedBeacon::compute_tag(b"message two", &key);
-        assert_ne!(tag1, tag2, "Different messages must produce different HMAC tags");
+        assert_ne!(
+            tag1, tag2,
+            "Different messages must produce different HMAC tags"
+        );
     }
 
     #[test]
@@ -1023,8 +1162,15 @@ mod tests {
         msg[16..20].copy_from_slice(&nonce.to_le_bytes());
         let tag = AuthenticatedBeacon::compute_tag(&msg, &correct_key);
 
-        let auth = AuthenticatedBeacon { beacon, nonce, hmac_tag: tag };
-        assert!(auth.verify(&wrong_key).is_err(), "Wrong key must fail verification");
+        let auth = AuthenticatedBeacon {
+            beacon,
+            nonce,
+            hmac_tag: tag,
+        };
+        assert!(
+            auth.verify(&wrong_key).is_err(),
+            "Wrong key must fail verification"
+        );
     }
 
     #[test]
@@ -1043,12 +1189,19 @@ mod tests {
         msg[16..20].copy_from_slice(&nonce.to_le_bytes());
         let tag = AuthenticatedBeacon::compute_tag(&msg, &key);
 
-        let auth = AuthenticatedBeacon { beacon, nonce, hmac_tag: tag };
+        let auth = AuthenticatedBeacon {
+            beacon,
+            nonce,
+            hmac_tag: tag,
+        };
         let mut wire = auth.to_bytes();
         // Flip one bit in the beacon payload
         wire[0] ^= 0x01;
         let tampered = AuthenticatedBeacon::from_bytes(&wire).unwrap();
-        assert!(tampered.verify(&key).is_err(), "Single bit flip must fail verification");
+        assert!(
+            tampered.verify(&key).is_err(),
+            "Single bit flip must fail verification"
+        );
     }
 
     #[test]
@@ -1063,7 +1216,8 @@ mod tests {
             cycle_period: Duration::from_millis(50),
             drift_correction_us: 0,
             generated_at: std::time::Instant::now(),
-        }.to_bytes();
+        }
+        .to_bytes();
 
         assert!(coord.verify_beacon(&raw).is_err());
     }

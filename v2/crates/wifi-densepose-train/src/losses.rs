@@ -118,7 +118,7 @@ impl WiFiDensePoseLoss {
         // Normalise by number of visible joints in the batch.
         let n_visible = visibility.sum(Kind::Float);
         // Guard against division by zero (entire batch may have no labels).
-        let safe_n = n_visible.clamp(1.0, f64::MAX);
+        let safe_n = n_visible.clamp_min(1.0);
 
         masked.sum(Kind::Float) / safe_n
     }
@@ -152,32 +152,23 @@ impl WiFiDensePoseLoss {
         // tch cross_entropy_loss expects (input: [B,C,…], target: [B,…] of i64).
         let target_int = target_parts.to_kind(Kind::Int64);
         // weight=None, reduction=Mean, ignore_index=-100, label_smoothing=0.0
-        let part_loss = pred_parts.cross_entropy_loss::<Tensor>(
-            &target_int,
-            None,
-            Reduction::Mean,
-            -100,
-            0.0,
-        );
+        let part_loss =
+            pred_parts.cross_entropy_loss::<Tensor>(&target_int, None, Reduction::Mean, -100, 0.0);
 
         // ── 2. UV regression: Smooth-L1 masked by foreground pixels ────────
         // Foreground mask: pixels where target part ≠ 0, shape [B, H, W].
         let fg_mask = target_int.not_equal(0_i64);
         // Expand to [B, 1, H, W] then broadcast to [B, 48, H, W].
-        let fg_mask_f = fg_mask
-            .unsqueeze(1)
-            .expand_as(pred_uv)
-            .to_kind(Kind::Float);
+        let fg_mask_f = fg_mask.unsqueeze(1).expand_as(pred_uv).to_kind(Kind::Float);
 
         let masked_pred_uv = pred_uv * &fg_mask_f;
         let masked_target_uv = target_uv * &fg_mask_f;
 
         // Count foreground pixels × 48 channels to normalise.
-        let n_fg = fg_mask_f.sum(Kind::Float).clamp(1.0, f64::MAX);
+        let n_fg = fg_mask_f.sum(Kind::Float).clamp_min(1.0);
 
         // Smooth-L1 with beta=1.0, reduction=Sum then divide by fg count.
-        let uv_loss_sum =
-            masked_pred_uv.smooth_l1_loss(&masked_target_uv, Reduction::Sum, 1.0);
+        let uv_loss_sum = masked_pred_uv.smooth_l1_loss(&masked_target_uv, Reduction::Sum, 1.0);
         let uv_loss = uv_loss_sum / n_fg;
 
         part_loss + uv_loss
@@ -236,25 +227,17 @@ impl WiFiDensePoseLoss {
             (Some(pp), Some(tp), Some(pu), Some(tu)) => {
                 // Part cross-entropy
                 let target_int = tp.to_kind(Kind::Int64);
-                let part_loss = pp.cross_entropy_loss::<Tensor>(
-                    &target_int,
-                    None,
-                    Reduction::Mean,
-                    -100,
-                    0.0,
-                );
+                let part_loss =
+                    pp.cross_entropy_loss::<Tensor>(&target_int, None, Reduction::Mean, -100, 0.0);
                 let part_val = part_loss.double_value(&[]) as f32;
 
                 // UV loss (foreground masked)
                 let fg_mask = target_int.not_equal(0_i64);
-                let fg_mask_f = fg_mask
-                    .unsqueeze(1)
-                    .expand_as(pu)
-                    .to_kind(Kind::Float);
-                let n_fg = fg_mask_f.sum(Kind::Float).clamp(1.0, f64::MAX);
-                let uv_loss = (pu * &fg_mask_f)
-                    .smooth_l1_loss(&(tu * &fg_mask_f), Reduction::Sum, 1.0)
-                    / n_fg;
+                let fg_mask_f = fg_mask.unsqueeze(1).expand_as(pu).to_kind(Kind::Float);
+                let n_fg = fg_mask_f.sum(Kind::Float).clamp_min(1.0);
+                let uv_loss =
+                    (pu * &fg_mask_f).smooth_l1_loss(&(tu * &fg_mask_f), Reduction::Sum, 1.0)
+                        / n_fg;
                 let uv_val = uv_loss.double_value(&[]) as f32;
 
                 let dp_loss = &part_loss + &uv_loss;
@@ -369,8 +352,7 @@ pub fn generate_target_heatmaps(
     let batch = keypoints.shape()[0];
     let num_joints = keypoints.shape()[1];
 
-    let mut heatmaps =
-        ndarray::Array4::zeros((batch, num_joints, heatmap_size, heatmap_size));
+    let mut heatmaps = ndarray::Array4::zeros((batch, num_joints, heatmap_size, heatmap_size));
 
     for b in 0..batch {
         for j in 0..num_joints {
@@ -571,8 +553,7 @@ pub fn generate_gaussian_heatmaps(
     let two_sigma_sq = 2.0 * sigma * sigma;
     let dx = &xs - &cx;
     let dy = &ys - &cy;
-    let heatmaps =
-        (-(dx.pow_tensor_scalar(2.0) + dy.pow_tensor_scalar(2.0)) / two_sigma_sq).exp();
+    let heatmaps = (-(dx.pow_tensor_scalar(2.0) + dy.pow_tensor_scalar(2.0)) / two_sigma_sq).exp();
 
     // Zero out invisible keypoints: visibility [B, 17] → [B, 17, 1, 1] boolean mask.
     let vis_mask = visibility
@@ -595,10 +576,10 @@ pub fn densepose_part_loss(pred_logits: &Tensor, gt_labels: &Tensor) -> Tensor {
     let labels_i64 = gt_labels.to_kind(Kind::Int64);
     pred_logits.cross_entropy_loss::<Tensor>(
         &labels_i64,
-        None,            // no per-class weights
+        None, // no per-class weights
         Reduction::Mean,
-        -1,              // ignore_index
-        0.0,             // label_smoothing
+        -1,  // ignore_index
+        0.0, // label_smoothing
     )
 }
 
@@ -671,11 +652,11 @@ pub fn fn_transfer_loss(student_features: &Tensor, teacher_features: &Tensor) ->
             let h = t_size[2];
             let w = t_size[3];
             s_spatial
-                .permute([0, 2, 3, 1])       // [B, H, W, Cs]
-                .reshape([-1, 1, cs])          // [B·H·W, 1, Cs]
-                .adaptive_avg_pool1d(ct)       // [B·H·W, 1, Ct]
-                .reshape([b, h, w, ct])        // [B, H, W, Ct]
-                .permute([0, 3, 1, 2])         // [B, Ct, H, W]
+                .permute([0, 2, 3, 1]) // [B, H, W, Cs]
+                .reshape([-1, 1, cs]) // [B·H·W, 1, Cs]
+                .adaptive_avg_pool1d(ct) // [B·H·W, 1, Ct]
+                .reshape([b, h, w, ct]) // [B, H, W, Ct]
+                .permute([0, 3, 1, 2]) // [B, Ct, H, W]
         }
     } else {
         s_spatial
@@ -718,10 +699,7 @@ mod tests {
 
         // Values far from the centre should be ≈ 0.
         let far = hm[[0, 0]];
-        assert!(
-            far < 0.01,
-            "Corner value {far} should be near zero"
-        );
+        assert!(far < 0.01, "Corner value {far} should be near zero");
     }
 
     #[test]
@@ -765,14 +743,18 @@ mod tests {
         }
 
         // Visible batch (index 1) should have non-zero heatmaps.
+        let heatmaps_ref = &heatmaps;
         let batch1_sum: f32 = (0..num_joints)
             .map(|j| {
                 (0..size)
-                    .flat_map(|r| (0..size).map(move |c| heatmaps[[1, j, r, c]]))
+                    .flat_map(|r| (0..size).map(move |c| heatmaps_ref[[1, j, r, c]]))
                     .sum::<f32>()
             })
             .sum();
-        assert!(batch1_sum > 0.0, "Visible joints should produce non-zero heatmaps");
+        assert!(
+            batch1_sum > 0.0,
+            "Visible joints should produce non-zero heatmaps"
+        );
     }
 
     // ── Loss functions ────────────────────────────────────────────────────────
@@ -813,7 +795,10 @@ mod tests {
         let loss = loss_fn.keypoint_loss(&pred, &target, &vis);
         let val = loss.double_value(&[]) as f32;
 
-        assert!(val > 0.0, "Keypoint loss should be positive for wrong predictions");
+        assert!(
+            val > 0.0,
+            "Keypoint loss should be positive for wrong predictions"
+        );
     }
 
     #[test]
@@ -864,9 +849,7 @@ mod tests {
         let target = Tensor::ones([1, 17, 8, 8], (Kind::Float, dev));
         let vis = Tensor::ones([1, 17], (Kind::Float, dev));
 
-        let (_, output) = loss_fn.forward(
-            &pred, &target, &vis, None, None, None, None, None, None,
-        );
+        let (_, output) = loss_fn.forward(&pred, &target, &vis, None, None, None, None, None, None);
 
         assert!(
             output.total.abs() < 1e-5,
@@ -898,10 +881,7 @@ mod tests {
         let loss = loss_fn.densepose_loss(&pred_parts, &target_parts, &uv, &uv);
         let val = loss.double_value(&[]) as f32;
 
-        assert!(
-            val >= 0.0,
-            "DensePose loss must be non-negative, got {val}"
-        );
+        assert!(val >= 0.0, "DensePose loss must be non-negative, got {val}");
         // With identical UV the total equals only the CE part loss.
         // CE of uniform logits over 25 classes: ln(25) ≈ 3.22
         assert!(
@@ -918,7 +898,10 @@ mod tests {
         let t = Tensor::ones([2, 17, 8, 8], (Kind::Float, dev));
         let loss = keypoint_heatmap_loss(&t, &t);
         let v = loss.double_value(&[]) as f32;
-        assert!(v.abs() < 1e-6, "Identical heatmaps → loss must be ≈0, got {v}");
+        assert!(
+            v.abs() < 1e-6,
+            "Identical heatmaps → loss must be ≈0, got {v}"
+        );
     }
 
     #[test]
@@ -988,7 +971,10 @@ mod tests {
         let t = Tensor::ones(&[2i64, 64, 8, 8], (Kind::Float, dev));
         let loss = fn_transfer_loss(&t, &t);
         let v = loss.double_value(&[]);
-        assert!(v.abs() < 1e-6, "Identical features → transfer loss ≈ 0, got {v}");
+        assert!(
+            v.abs() < 1e-6,
+            "Identical features → transfer loss ≈ 0, got {v}"
+        );
     }
 
     #[test]
@@ -998,7 +984,10 @@ mod tests {
         let teacher = Tensor::ones(&[1i64, 64, 8, 8], (Kind::Float, dev));
         let loss = fn_transfer_loss(&student, &teacher);
         let v = loss.double_value(&[]);
-        assert!(v.is_finite() && v >= 0.0, "Spatial-mismatch transfer loss must be finite");
+        assert!(
+            v.is_finite() && v >= 0.0,
+            "Spatial-mismatch transfer loss must be finite"
+        );
     }
 
     #[test]
@@ -1016,8 +1005,9 @@ mod tests {
         let dev = device();
         let pred = Tensor::ones(&[1i64, 17, 8, 8], (Kind::Float, dev));
         let gt = Tensor::ones(&[1i64, 17, 8, 8], (Kind::Float, dev));
-        let out = compute_losses(&pred, &gt, None, None, None, None, None, None,
-                                 1.0, 1.0, 1.0);
+        let out = compute_losses(
+            &pred, &gt, None, None, None, None, None, None, 1.0, 1.0, 1.0,
+        );
         assert!(out.total.is_finite());
         assert!(out.keypoint >= 0.0);
         assert!(out.densepose_parts.is_none());
@@ -1032,20 +1022,26 @@ mod tests {
         let h = 4i64;
         let w = 4i64;
         let pred_kpt = Tensor::ones(&[b, 17, h, w], (Kind::Float, dev));
-        let gt_kpt   = Tensor::ones(&[b, 17, h, w], (Kind::Float, dev));
-        let logits   = Tensor::zeros(&[b, 25, h, w], (Kind::Float, dev));
-        let labels   = Tensor::zeros(&[b, h, w], (Kind::Int64, dev));
-        let pred_uv  = Tensor::ones(&[b, 48, h, w], (Kind::Float, dev));
-        let gt_uv    = Tensor::ones(&[b, 48, h, w], (Kind::Float, dev));
-        let sf       = Tensor::ones(&[b, 64, 2, 2], (Kind::Float, dev));
-        let tf       = Tensor::ones(&[b, 64, 2, 2], (Kind::Float, dev));
+        let gt_kpt = Tensor::ones(&[b, 17, h, w], (Kind::Float, dev));
+        let logits = Tensor::zeros(&[b, 25, h, w], (Kind::Float, dev));
+        let labels = Tensor::zeros(&[b, h, w], (Kind::Int64, dev));
+        let pred_uv = Tensor::ones(&[b, 48, h, w], (Kind::Float, dev));
+        let gt_uv = Tensor::ones(&[b, 48, h, w], (Kind::Float, dev));
+        let sf = Tensor::ones(&[b, 64, 2, 2], (Kind::Float, dev));
+        let tf = Tensor::ones(&[b, 64, 2, 2], (Kind::Float, dev));
 
         let out = compute_losses(
-            &pred_kpt, &gt_kpt,
-            Some(&logits), Some(&labels),
-            Some(&pred_uv), Some(&gt_uv),
-            Some(&sf), Some(&tf),
-            1.0, 0.5, 0.1,
+            &pred_kpt,
+            &gt_kpt,
+            Some(&logits),
+            Some(&labels),
+            Some(&pred_uv),
+            Some(&gt_uv),
+            Some(&sf),
+            Some(&tf),
+            1.0,
+            0.5,
+            0.1,
         );
 
         assert!(out.total.is_finite() && out.total >= 0.0);

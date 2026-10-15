@@ -47,7 +47,10 @@ impl GateDecision {
 
     /// Returns true if this is a reject or recalibrate decision.
     pub fn is_rejected(&self) -> bool {
-        matches!(self, GateDecision::Reject | GateDecision::Recalibrate { .. })
+        matches!(
+            self,
+            GateDecision::Reject | GateDecision::Recalibrate { .. }
+        )
     }
 
     /// Returns the noise multiplier for accepted decisions, or None otherwise.
@@ -74,13 +77,27 @@ pub struct GatePolicyConfig {
     pub adaptive: bool,
 }
 
+// Gate-policy DEFAULTS (ADR-154 §7.4 #9 — DATA-GATED). These were bare literals
+// in the `Default` impl. They are already tunable per-instance via
+// `GatePolicyConfig`/`GatePolicy::new` (the config seam exists), so de-magicking
+// here is about naming + pinning the DEFAULTS. EMPIRICAL — defensible values
+// need labelled coherence traces; the VALUES are unchanged.
+/// Default coherence accept cutoff (full Kalman update above this).
+const DEFAULT_ACCEPT_THRESHOLD: f32 = 0.85;
+/// Default coherence reject cutoff (discard measurement below this).
+const DEFAULT_REJECT_THRESHOLD: f32 = 0.5;
+/// Default stale-frame budget before forcing recalibration (≈10 s at 20 Hz).
+const DEFAULT_MAX_STALE_FRAMES: u64 = 200;
+/// Default PredictOnly-zone measurement-noise inflation factor.
+const DEFAULT_PREDICT_ONLY_NOISE: f32 = 3.0;
+
 impl Default for GatePolicyConfig {
     fn default() -> Self {
         Self {
-            accept_threshold: 0.85,
-            reject_threshold: 0.5,
-            max_stale_frames: 200, // 10s at 20Hz
-            predict_only_noise: 3.0,
+            accept_threshold: DEFAULT_ACCEPT_THRESHOLD,
+            reject_threshold: DEFAULT_REJECT_THRESHOLD,
+            max_stale_frames: DEFAULT_MAX_STALE_FRAMES,
+            predict_only_noise: DEFAULT_PREDICT_ONLY_NOISE,
             adaptive: false,
         }
     }
@@ -95,7 +112,8 @@ pub struct GatePolicy {
     reject_threshold: f32,
     /// Maximum stale frames before recalibration.
     max_stale_frames: u64,
-    /// Noise inflation for predict-only zone.
+    /// Noise inflation for predict-only zone (reserved for future tuning).
+    #[allow(dead_code)]
     predict_only_noise: f32,
     /// Running count of consecutive rejected/predict-only frames.
     consecutive_low: u64,
@@ -110,7 +128,7 @@ impl GatePolicy {
             accept_threshold: accept,
             reject_threshold: reject,
             max_stale_frames: max_stale,
-            predict_only_noise: 3.0,
+            predict_only_noise: DEFAULT_PREDICT_ONLY_NOISE,
             consecutive_low: 0,
             last_decision: None,
         }
@@ -216,7 +234,9 @@ mod tests {
     fn accept_high_coherence() {
         let mut gate = GatePolicy::new(0.85, 0.5, 200);
         let decision = gate.evaluate(0.95, 0);
-        assert!(matches!(decision, GateDecision::Accept { noise_multiplier } if (noise_multiplier - 1.0).abs() < f32::EPSILON));
+        assert!(
+            matches!(decision, GateDecision::Accept { noise_multiplier } if (noise_multiplier - 1.0).abs() < f32::EPSILON)
+        );
         assert!(decision.allows_update());
         assert!(!decision.is_rejected());
     }
@@ -243,7 +263,10 @@ mod tests {
     fn recalibrate_after_stale_timeout() {
         let mut gate = GatePolicy::new(0.85, 0.5, 200);
         let decision = gate.evaluate(0.3, 200);
-        assert!(matches!(decision, GateDecision::Recalibrate { stale_frames: 200 }));
+        assert!(matches!(
+            decision,
+            GateDecision::Recalibrate { stale_frames: 200 }
+        ));
         assert!(decision.is_rejected());
     }
 
@@ -286,7 +309,9 @@ mod tests {
 
     #[test]
     fn noise_multiplier_accessor() {
-        let accept = GateDecision::Accept { noise_multiplier: 2.5 };
+        let accept = GateDecision::Accept {
+            noise_multiplier: 2.5,
+        };
         assert_eq!(accept.noise_multiplier(), Some(2.5));
 
         let reject = GateDecision::Reject;
@@ -305,7 +330,11 @@ mod tests {
     #[test]
     fn adaptive_noise_midpoint() {
         let mid = adaptive_noise_multiplier(0.675, 0.85, 0.5, 3.0);
-        assert!((mid - 2.0).abs() < 0.01, "Midpoint noise should be ~2.0, got {}", mid);
+        assert!(
+            (mid - 2.0).abs() < 0.01,
+            "Midpoint noise should be ~2.0, got {}",
+            mid
+        );
     }
 
     #[test]
@@ -326,6 +355,17 @@ mod tests {
         assert_eq!(cfg.max_stale_frames, 200);
         assert!((cfg.predict_only_noise - 3.0).abs() < f32::EPSILON);
         assert!(!cfg.adaptive);
+    }
+
+    /// ADR-154 §7.4 #9 (DATA-GATED): the named DEFAULT_* consts must equal the
+    /// original bare literals — pins the de-magicked defaults so a future
+    /// labelled-data retune is a visible, tested change. Values UNCHANGED.
+    #[test]
+    fn gate_default_consts_unchanged_from_literals() {
+        assert_eq!(DEFAULT_ACCEPT_THRESHOLD, 0.85);
+        assert_eq!(DEFAULT_REJECT_THRESHOLD, 0.5);
+        assert_eq!(DEFAULT_MAX_STALE_FRAMES, 200);
+        assert_eq!(DEFAULT_PREDICT_ONLY_NOISE, 3.0);
     }
 
     #[test]

@@ -45,7 +45,9 @@ pub fn conjugate_multiply(
 /// Input: `csi_complex` is (num_antennas × num_subcarriers) complex CSI.
 /// Output: For each pair (i, j) where j > i, a row of conjugate-multiplied values.
 /// Returns (num_pairs × num_subcarriers) matrix.
-pub fn compute_ratio_matrix(csi_complex: &Array2<Complex64>) -> Result<Array2<Complex64>, CsiRatioError> {
+pub fn compute_ratio_matrix(
+    csi_complex: &Array2<Complex64>,
+) -> Result<Array2<Complex64>, CsiRatioError> {
     let (n_ant, n_sc) = csi_complex.dim();
     if n_ant < 2 {
         return Err(CsiRatioError::InsufficientAntennas { count: n_ant });
@@ -170,16 +172,16 @@ mod tests {
             assert!(
                 (phase[[0, j]] - (-path_diff_phase)).abs() < 1e-10,
                 "Subcarrier {} phase={}, expected={}",
-                j, phase[[0, j]], -path_diff_phase
+                j,
+                phase[[0, j]],
+                -path_diff_phase
             );
         }
     }
 
     #[test]
     fn test_single_antenna_error() {
-        let csi = Array2::from_shape_fn((1, 10), |(_, j)| {
-            Complex64::new(j as f64, 0.0)
-        });
+        let csi = Array2::from_shape_fn((1, 10), |(_, j)| Complex64::new(j as f64, 0.0));
         assert!(matches!(
             compute_ratio_matrix(&csi),
             Err(CsiRatioError::InsufficientAntennas { .. })
@@ -194,5 +196,62 @@ mod tests {
             conjugate_multiply(&h1, &h2),
             Err(CsiRatioError::LengthMismatch { .. })
         ));
+    }
+
+    // ADR-154 §7.4 #19: the CSI *ratio model*. The classic ratio is
+    // `H_i[k] / H_j[k]`, which blows up (±inf / NaN) when `H_j[k]` approaches
+    // zero — the case a `1e-12` division-guard epsilon is meant to protect. This
+    // module deliberately implements the ratio as the **conjugate product**
+    // `H_i * conj(H_j)` (SpotFi/IndoTrack), which has *no division* and is
+    // therefore finite even at and below the `1e-12` magnitude boundary. This
+    // test pins that property: at the epsilon boundary the output is finite and
+    // exactly the conjugate product (no silent NaN/inf from a hidden divide).
+    #[test]
+    fn ratio_finite_at_and_below_1e_12_epsilon() {
+        let eps = 1e-12_f64;
+        // Reference at unit magnitude; target swept across / under the epsilon
+        // boundary a naive H_i/H_j division would need to guard.
+        let h_ref = vec![
+            Complex64::from_polar(1.0, 0.3),
+            Complex64::from_polar(1.0, 0.3),
+            Complex64::from_polar(1.0, 0.3),
+            Complex64::from_polar(1.0, 0.3),
+        ];
+        let h_target = vec![
+            Complex64::new(eps, 0.0),           // exactly at the epsilon
+            Complex64::new(eps * 0.5, 0.0),     // below the epsilon
+            Complex64::new(0.0, eps),           // imaginary axis, at epsilon
+            Complex64::new(0.0, 0.0),           // exact zero — div would be inf/NaN
+        ];
+
+        let ratio = conjugate_multiply(&h_ref, &h_target).unwrap();
+        assert_eq!(ratio.len(), 4);
+        for (k, r) in ratio.iter().enumerate() {
+            assert!(
+                r.re.is_finite() && r.im.is_finite(),
+                "conjugate-multiply ratio must be finite at boundary k={k}: {r:?}"
+            );
+        }
+
+        // The near-zero / zero target collapses the product toward zero (the
+        // physically correct "no measurable path" answer), never to inf/NaN.
+        assert!(
+            ratio[3].norm() == 0.0,
+            "exact-zero target → zero product, got {}",
+            ratio[3].norm()
+        );
+        // The at-epsilon entries equal the exact conjugate product (bit-exact).
+        let expected0 = h_ref[0] * h_target[0].conj();
+        assert_eq!(ratio[0].re.to_bits(), expected0.re.to_bits());
+        assert_eq!(ratio[0].im.to_bits(), expected0.im.to_bits());
+
+        // The full pipeline (amplitude/phase extraction) is also finite here.
+        let mut m = Array2::<Complex64>::zeros((1, 4));
+        for (k, &v) in ratio.iter().enumerate() {
+            m[[0, k]] = v;
+        }
+        let (amp, phase) = ratio_to_amplitude_phase(&m);
+        assert!(amp.iter().all(|a| a.is_finite()));
+        assert!(phase.iter().all(|p| p.is_finite()));
     }
 }
