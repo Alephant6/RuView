@@ -19,7 +19,7 @@ one bridge network (`ruview-data`) for the persistence + visualisation layer.
                               │     │ writes both (until WP1.5)   │
                               │     ▼                             │
                               │  influxdb:8086 ──────────────────┼──▶ exposed on host:8086
-                              │  timescaledb:5432 ◀── db-migrate ┼──▶ NAS loopback :5432
+                              │  timescaledb:5432 ◀── db-migrate ┼──▶ NAS loopback PG_PORT
                               │     ▲                             │
                               │     │ reads                       │
                               │  grafana:3000  ──────────────────┼──▶ exposed on host:3030
@@ -35,7 +35,7 @@ one bridge network (`ruview-data`) for the persistence + visualisation layer.
 | `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities |
 | `csi-recorder` | local build (csi-recorder/Dockerfile) | — (loopback 5006/udp) | Raw datagrams from the server's UDP tee: 72 h rolling files plus permanent labelled clips (`docker/data/csi`) |
 | `influxdb` | `influxdb:2.7` | 8086 | Time-series store, retired after WP1.5 |
-| `timescaledb` | `timescale/timescaledb:2.30.2-pg17` | 127.0.0.1:5432 | Long-term SQL store: raw rows 14 days, per-minute and per-hour aggregates forever ([timescaledb/README.md](timescaledb/README.md)) |
+| `timescaledb` | `timescale/timescaledb:2.30.2-pg17` | 127.0.0.1:`PG_PORT` (5432) | Long-term SQL store: raw rows 14 days, per-minute and per-hour aggregates forever ([timescaledb/README.md](timescaledb/README.md)) |
 | `db-migrate` | same image | — | Applies `timescaledb/migrations` and the roles' passwords, then exits |
 | `telegraf` | `telegraf:1.39.3` | — | MQTT → InfluxDB + TimescaleDB ingest |
 | `grafana` | `grafana/grafana:11.2.0` | 3030 | Dashboards (auto-provisioned) |

@@ -111,7 +111,9 @@ From another machine, the port listens on the NAS loopback only
 (`PG_BIND=127.0.0.1`), so use a tunnel and the read-only role:
 
 ```bash
-ssh -N -L 5432:127.0.0.1:5432 <user>@192.168.1.195
+# The NAS end is PG_PORT from docker/.env (5434 on the home NAS, whose own
+# PostgreSQL holds 5432 and 5433).
+ssh -N -L 5432:127.0.0.1:5434 <user>@192.168.1.195
 psql "host=127.0.0.1 dbname=ruview user=grafana"
 ```
 
