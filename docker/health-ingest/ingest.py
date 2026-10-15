@@ -50,7 +50,7 @@ WRITE_CHUNK = 5000
 
 
 def parse_tokens(raw: str) -> dict[str, str]:
-    """'sq:abc,ml:def' -> {'abc': 'peter', 'def': 'ml'}"""
+    """'sq:abc,ml:def' -> {'abc': 'sq', 'def': 'ml'}"""
     out: dict[str, str] = {}
     for item in raw.split(","):
         item = item.strip()
