@@ -26,6 +26,11 @@ LEVELS = {"ok": 0, "info": 1, "warning": 2, "critical": 3}
 BRIDGE_STATUS_MAX_AGE_S = 60.0
 # The bridge publishes each node at most once per second.
 NODE_MQTT_MAX_AGE_S = 30.0
+# The csi-recorder publishes its status every 30 s by default.
+RECORDER_STATUS_MAX_AGE_S = 90.0
+RECORDER_QUIET_S = 60.0
+# A newly raised problem in one of these asks the recorder to keep raw CSI.
+KEEP_ON_RAISE = ("vitals_frozen", "vitals_range", "presence")
 
 
 @dataclass(frozen=True)
@@ -284,6 +289,42 @@ def rule_calibration(ctx: Ctx) -> Result:
     return Result(True, "warning", ctx.t("calibration_missing", status=status), detail)
 
 
+def rule_recorder(ctx: Ctx) -> Result:
+    store = ctx.store
+    if store.recorder_avail is None and store.recorder_status is None:
+        return UNKNOWN                  # no csi-recorder deployed
+    if store.recorder_avail == "offline":
+        return Result(True, "warning", ctx.t("recorder_offline"))
+    status = store.recorder_status or {}
+    ts = as_number(status.get("ts"))
+    if ts is None:
+        return UNKNOWN
+    age = ctx.now - ts
+    if age > RECORDER_STATUS_MAX_AGE_S:
+        return Result(True, "warning", ctx.t("recorder_silent", age=ctx.duration(age)),
+                      {"status_age_s": round(age)})
+    detail = {key: status.get(key) for key in
+              ("datagrams_hz", "ring_hours", "disk_free_gb", "keep_pending", "kernel_drops")
+              if key in status}
+    if status.get("disk_low"):
+        free = as_number(status.get("disk_free_gb"))
+        return Result(True, "warning",
+                      ctx.t("recorder_disk_low", free="?" if free is None else f"{free:.1f}"), detail)
+    hz = as_number(status.get("datagrams_hz"))
+    if hz and status.get("recording") is False:
+        error = str(status.get("last_error") or "?")[:120]
+        return Result(True, "warning", ctx.t("recorder_write", error=error), detail)
+    quiet = as_number(status.get("last_datagram_age_s"))
+    if quiet is None or quiet > RECORDER_QUIET_S:
+        # Only a problem while the nodes are sending to the server: the tee
+        # copies what the server receives.
+        if any(_node_view(ctx, nid)[0] for nid in ctx.cfg.expected_nodes):
+            if quiet is None:
+                return Result(True, "warning", ctx.t("recorder_no_data_never"), detail)
+            return Result(True, "warning", ctx.t("recorder_no_data", age=ctx.duration(quiet)), detail)
+    return Result(False, detail=detail)
+
+
 def rule_presence(ctx: Ctx) -> Result:
     cfg, persons = ctx.cfg, ctx.store.persons
     if not persons:
@@ -327,6 +368,7 @@ def default_checks(cfg: Config) -> list[Check]:
         Check("vitals_frozen", "Vitals Frozen", rule_vitals_frozen, clear_after_s=300),
         Check("vitals_range", "Vitals Range", rule_vitals_range, clear_after_s=300),
         Check("calibration", "Calibration", rule_calibration, suppressed_by=("server",)),
+        Check("recorder", "Recorder", rule_recorder, raise_after_s=120, clear_after_s=60),
     ]
     if cfg.presence_enabled:
         checks.append(Check("presence", "Presence vs Phones", rule_presence, clear_after_s=600))
@@ -475,6 +517,29 @@ def vitals_status(cfg: Config, store: Store, now: float) -> dict[str, Any]:
     if code:
         text += ("：" if lang == "zh" else ": ") + str(reason(lang, code))
     return {"state": "withheld", "text": text, "reason": code}
+
+
+def keep_requests(cfg: Config, store: Store, report: dict[str, Any],
+                  transitions: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """csi-recorder keep requests (`ruview/recorder/keep`) for vitals and
+    presence problems raised in this round, so the raw CSI that led to them
+    can be replayed later. Only when a recorder has been seen."""
+    if cfg.keep_on_raise_s <= 0 or (store.recorder_avail is None and store.recorder_status is None):
+        return []
+    out = []
+    for check_id, change in transitions:
+        if change != "raised" or check_id not in KEEP_ON_RAISE:
+            continue
+        entry = report["checks"][check_id]
+        since = as_number(entry.get("since_ts")) or report["ts"]
+        out.append({
+            "id": f"wd-{check_id}-{int(since)}",
+            "tag": f"watchdog_{check_id}",
+            "last_s": cfg.keep_on_raise_s,
+            "source": "watchdog",
+            "note": str(entry.get("summary") or "")[:200],
+        })
+    return out
 
 
 def metrics(report: dict[str, Any]) -> dict[str, Any]:

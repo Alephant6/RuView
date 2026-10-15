@@ -98,6 +98,9 @@ class Config:
     presence_window_s: float = 1800.0
     presence_min_samples: int = 600
     presence_max_fraction: float = 0.8
+    # On a newly raised vitals or presence problem, ask the csi-recorder to
+    # keep the raw CSI of this many seconds before it (0 = off).
+    keep_on_raise_s: float = 1200.0
 
     @property
     def topics(self) -> dict[str, str]:
@@ -110,6 +113,9 @@ class Config:
             "avail": f"{p}/watchdog/availability",
             "report": f"{p}/watchdog/state",
             "metrics": f"{p}/watchdog/metrics",
+            "recorder_avail": f"{p}/recorder/availability",
+            "recorder_status": f"{p}/recorder/status",
+            "recorder_keep": f"{p}/recorder/keep",
         }
 
     @property
@@ -142,4 +148,5 @@ class Config:
             check_interval_s=_float(env, "CHECK_INTERVAL_S", cls.check_interval_s, 5, 600),
             lang=lang,
             min_node_fps=_float(env, "MIN_NODE_FPS", cls.min_node_fps, 0, 1000),
+            keep_on_raise_s=60 * _float(env, "KEEP_ON_RAISE_MIN", cls.keep_on_raise_s / 60, 0, 120),
         )

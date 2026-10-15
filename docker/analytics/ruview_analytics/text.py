@@ -75,6 +75,30 @@ MESSAGES: dict[str, dict[str, str]] = {
         "zh": "所有手机都离家 {away}，但 CSI 过去 {minutes} 分钟有 {pct}% 的时间判断有人",
         "en": "All phones away for {away}, yet CSI saw someone {pct}% of the last {minutes} min",
     },
+    "recorder_offline": {
+        "zh": "原始 CSI 录制器（csi-recorder）已离线",
+        "en": "The raw CSI recorder (csi-recorder) is offline",
+    },
+    "recorder_silent": {
+        "zh": "已有 {age} 没收到原始 CSI 录制器的状态",
+        "en": "No status from the raw CSI recorder for {age}",
+    },
+    "recorder_disk_low": {
+        "zh": "数据盘只剩 {free} GB，原始 CSI 录制已暂停",
+        "en": "Only {free} GB free on the data volume; raw CSI recording is paused",
+    },
+    "recorder_write": {
+        "zh": "录制器收到数据但写不进磁盘：{error}",
+        "en": "The recorder receives data but cannot write it: {error}",
+    },
+    "recorder_no_data": {
+        "zh": "节点在发数据，但录制器已有 {age} 没收到数据包（检查 sensing-server 的 RUVIEW_UDP_TEE）",
+        "en": "Nodes are sending, but the recorder has had no datagram for {age} (check RUVIEW_UDP_TEE on the sensing-server)",
+    },
+    "recorder_no_data_never": {
+        "zh": "节点在发数据，但录制器一个数据包都没收到（检查 sensing-server 的 RUVIEW_UDP_TEE）",
+        "en": "Nodes are sending, but the recorder has not received a single datagram (check RUVIEW_UDP_TEE on the sensing-server)",
+    },
     "suppressed": {
         "zh": "数据源离线，暂不单独判断",
         "en": "Not evaluated while the source is down",

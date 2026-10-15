@@ -89,6 +89,8 @@ class Store:
     rest: RestSnapshot | None = None
     persons: dict[str, PersonState] | None = None
     persons_error: str | None = None
+    recorder_avail: str | None = None
+    recorder_status: dict[str, Any] | None = None
     hr: Series = field(init=False)
     br: Series = field(init=False)
     occupied: Series = field(init=False)
@@ -110,6 +112,9 @@ class Store:
         if topic == topics["bridge_avail"]:
             self.bridge_avail = payload.decode("utf-8", "replace").strip()
             return
+        if topic == topics["recorder_avail"]:
+            self.recorder_avail = payload.decode("utf-8", "replace").strip()
+            return
         if topic == topics["report"]:
             if self.prior_report is None:
                 self.prior_report = _json_object(payload) or {}
@@ -119,6 +124,8 @@ class Store:
             return
         if topic == topics["bridge_status"]:
             self.bridge_status = data
+        elif topic == topics["recorder_status"]:
+            self.recorder_status = data
         elif topic == topics["state"]:
             self.on_state(data, now)
         elif topic.startswith(f"{self.cfg.mqtt_prefix}/nodes/"):

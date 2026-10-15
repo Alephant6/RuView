@@ -42,6 +42,8 @@ v2/data/recordings/
 rust-port/wifi-densepose-rs/data/recordings/
 **/*.csi.jsonl
 **/*.csi.meta.json
+**/*.csi.raw.gz
+**/*.csi.raw.gz.part
 
 # NVS partition images and CSVs (contain WiFi credentials)
 nvs.bin

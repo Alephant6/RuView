@@ -376,6 +376,89 @@ def test_broken_rule_does_not_stop_other_checks():
     assert report["checks"]["server"]["state"] == "ok"
 
 
+# ── raw CSI recorder ─────────────────────────────────────────────────────
+
+def recorder_status(now: float, **over) -> dict:
+    return {"ts": now, "recording": True, "datagrams_hz": 70.0, "last_datagram_age_s": 0.1,
+            "ring_hours": 12.5, "disk_free_gb": 250.0, "disk_low": False, "keep_pending": 0,
+            "kernel_drops": 0, "last_error": None, **over}
+
+
+def recorder_round(store: Store, wd: C.Watchdog, now: float, **status):
+    store.rest = healthy_rest(now)
+    bridge_alive(store, now)
+    store.on_message("ruview/recorder/status", json.dumps(recorder_status(now, **status)).encode(), now)
+    return run(wd, store, now)
+
+
+def test_recorder_check_is_unknown_until_a_recorder_appears():
+    cfg, store, wd = make()
+    report, _ = run(wd, store, T0 + 100)
+    assert report["checks"]["recorder"]["state"] == "unknown"
+    store.on_message("ruview/recorder/availability", b"online", T0 + 100)
+    report, _ = recorder_round(store, wd, T0 + 110)
+    assert report["checks"]["recorder"]["state"] == "ok"
+    assert report["checks"]["recorder"]["detail"]["ring_hours"] == 12.5
+
+
+@pytest.mark.parametrize("status, text", [
+    ({"disk_low": True, "disk_free_gb": 1.4}, "1.4 GB"),
+    ({"recording": False, "last_error": "write failed: [Errno 5] I/O error"}, "Errno 5"),
+    ({"datagrams_hz": 0.0, "last_datagram_age_s": 300.0}, "RUVIEW_UDP_TEE"),
+    ({"datagrams_hz": 0.0, "last_datagram_age_s": None}, "一个数据包都没收到"),
+])
+def test_recorder_problems_raise_after_delay(status, text):
+    cfg, store, wd = make()
+    store.on_message("ruview/recorder/availability", b"online", T0)
+    for dt in (100, 160):
+        report, transitions = recorder_round(store, wd, T0 + dt, **status)
+        assert report["checks"]["recorder"]["state"] == "ok" and transitions == {}
+    report, transitions = recorder_round(store, wd, T0 + 225, **status)
+    assert transitions == {"recorder": "raised"}
+    assert text in report["checks"]["recorder"]["summary"]
+
+
+def test_recorder_quiet_is_fine_when_nodes_are_quiet_too():
+    cfg, store, wd = make()
+    store.on_message("ruview/recorder/availability", b"online", T0)
+    for dt in (100, 200, 300):
+        store.rest = healthy_rest(T0 + dt, nodes=())
+        bridge_alive(store, T0 + dt)
+        store.recorder_status = recorder_status(T0 + dt, datagrams_hz=0.0, last_datagram_age_s=500.0)
+        report, _ = run(wd, store, T0 + dt)
+    assert report["checks"]["recorder"]["state"] == "ok"
+
+
+def test_recorder_offline_and_silent():
+    cfg, store, wd = make()
+    store.on_message("ruview/recorder/availability", b"offline", T0)
+    for dt in (100, 230):
+        report, _ = run(wd, store, T0 + dt)
+    assert report["checks"]["recorder"]["state"] == "problem"
+    assert "离线" in report["checks"]["recorder"]["summary"]
+    cfg, store, wd = make(lang="en")
+    store.on_message("ruview/recorder/availability", b"online", T0)
+    store.recorder_status = recorder_status(T0)
+    for dt in (100, 230):
+        report, _ = run(wd, store, T0 + dt)
+    assert report["checks"]["recorder"]["summary"].startswith("No status from the raw CSI recorder")
+
+
+def test_keep_requests_for_new_vitals_problems_only_with_a_recorder():
+    cfg, store, wd = make()
+    report = {"ts": T0, "checks": {"vitals_frozen": {"since_ts": T0 - 30, "summary": "心率冻结"},
+                                   "node_1": {"since_ts": T0, "summary": "x"}}}
+    transitions = [("vitals_frozen", "raised"), ("node_1", "raised")]
+    assert C.keep_requests(cfg, store, report, transitions) == []      # no recorder seen
+    store.recorder_avail = "online"
+    (req,) = C.keep_requests(cfg, store, report, transitions)
+    assert req == {"id": f"wd-vitals_frozen-{int(T0 - 30)}", "tag": "watchdog_vitals_frozen",
+                   "last_s": 1200.0, "source": "watchdog", "note": "心率冻结"}
+    assert C.keep_requests(cfg, store, report, [("vitals_frozen", "cleared")]) == []
+    off = Config.from_env({"KEEP_ON_RAISE_MIN": "0"})
+    assert C.keep_requests(off, store, report, transitions) == []
+
+
 # ── REST polling ─────────────────────────────────────────────────────────
 
 def fake_get(routes):

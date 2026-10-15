@@ -9,7 +9,8 @@
 # Entity ids come from the MQTT device name "RuView Watchdog". If yours
 # differ, check Settings -> Devices & services -> MQTT -> RuView Watchdog.
 # Node entities follow EXPECTED_NODES; the "Presence vs Phones" entity only
-# exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog.
+# exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog, and
+# "Recorder" stays unknown until the csi-recorder runs.
 
 - id: ruview_watchdog_problem
   alias: "RuView: data problem"
@@ -28,6 +29,7 @@
         - binary_sensor.ruview_watchdog_vitals_frozen
         - binary_sensor.ruview_watchdog_vitals_range
         - binary_sensor.ruview_watchdog_calibration
+        - binary_sensor.ruview_watchdog_recorder
         - binary_sensor.ruview_watchdog_presence_vs_phones
       to: "on"
       not_from: "unavailable"
