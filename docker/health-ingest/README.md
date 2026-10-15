@@ -9,7 +9,7 @@ POST 到 NAS 上的这个服务，再写进 InfluxDB 的 `sensing` bucket，和 
 1. 给每人生成一个 token（至少 16 位）：
    `python3 -c "import secrets;print(secrets.token_urlsafe(24))"`
 2. 在 `docker/.env` 里加一行（名字和 RuView 的 profile 名对应）：
-   `HEALTH_TOKENS=peter:<token1>,ml:<token2>`
+   `HEALTH_TOKENS=sq:<token1>,ml:<token2>`
 3. 启动：
    `docker compose -f docker-compose.yml -f docker-compose.health.yml up -d --build health-ingest`
 4. 检查：`curl http://192.168.1.195:8095/health` 应返回 `{"ok": true}`。
@@ -50,5 +50,5 @@ Flux 示例（某人夜间心率）：
 ```flux
 from(bucket: "sensing")
   |> range(start: -1d)
-  |> filter(fn: (r) => r._measurement == "apple_health" and r.metric == "heart_rate" and r.person == "peter" and r._field == "avg")
+  |> filter(fn: (r) => r._measurement == "apple_health" and r.metric == "heart_rate" and r.person == "sq" and r._field == "avg")
 ```
