@@ -52,10 +52,24 @@ services:
       # Upstream UDP source guard (ADR-296): UDP binds 127.0.0.1 unless one of
       # these is set, so ESP32 frames from the LAN need e.g.
       # RUVIEW_UDP_ALLOW=192.168.1.0/24 (preferred) or RUVIEW_UDP_INSECURE_LAN=true.
-      - RUVIEW_UDP_ALLOW
+      # Defaults to the home LAN; narrow to the three node IPs in .env if desired.
+      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-192.168.1.0/24}
       - RUVIEW_UDP_INSECURE_LAN
       - RUVIEW_UDP_BIND
       - SENSING_ALLOWED_HOSTS
+      # Built-in MQTT publisher (ADR-115): owns the room-level HA entities
+      # (presence, HR/BR, person count, motion, fall, RSSI) per node, plus the
+      # semantic states (sleeping, distress, bed exit, fall risk, no movement,
+      # ...). State topics: homeassistant/<component>/wifi_densepose_ruview-node<N>/<entity>/state.
+      # The mqtt-bridge below keeps the per-person / enrolled-name entities.
+      - RUVIEW_MQTT=${RUVIEW_MQTT:-true}
+      - RUVIEW_MQTT_HOST=${MQTT_HOST:-homeassistant.local}
+      - RUVIEW_MQTT_PORT=${MQTT_PORT:-1883}
+      - RUVIEW_MQTT_USERNAME=${MQTT_USER:-}
+      - MQTT_PASSWORD=${MQTT_PASS:-}
+      # Fixed client id so HA device ids and topics stay stable across rebuilds.
+      - RUVIEW_MQTT_CLIENT_ID=${RUVIEW_MQTT_CLIENT_ID:-ruview}
+      - RUVIEW_MQTT_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
     volumes:
       - ./models:/app/models
       - ./data:/app/data
@@ -63,10 +77,11 @@ services:
     # No explicit command needed — docker-entrypoint.sh uses CSI_SOURCE.
     # Override with: command: ["--source", "esp32", "--tick-ms", "500"]
 
-  # ── Home Assistant MQTT bridge (option B) ────────────────────────────────
-  # Subscribes to sensing-server's WebSocket, translates SensingUpdate JSON
-  # into MQTT topics under ${MQTT_PREFIX}/, and publishes HA MQTT Discovery
-  # configs so entities show up automatically. Source in ./bridge/.
+  # ── Home Assistant MQTT bridge ──────────────────────────────────────────
+  # Subscribes to sensing-server's WebSocket and translates SensingUpdate JSON
+  # into MQTT topics under ${MQTT_PREFIX}/ (read by Telegraf). Publishes HA
+  # discovery for the per-person slot and enrolled-name entities, which the
+  # built-in publisher does not have. Source in ./bridge/.
   mqtt-bridge:
     build:
       context: ./bridge
@@ -90,6 +105,10 @@ services:
       - DEVICE_NAME=${DEVICE_NAME:-RuView Sensing}
       - DEVICE_ID=${DEVICE_ID:-ruview}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # false while sensing-server's --mqtt owns the room-level entities: the
+      # bridge retracts its old room-level discovery configs and only keeps the
+      # per-person slot and enrolled-name entities.
+      - ROOM_ENTITIES=${ROOM_ENTITIES:-false}
     restart: unless-stopped
 
   # ── InfluxDB 2.x ─────────────────────────────────────────────────────────
@@ -137,6 +156,7 @@ services:
       - MQTT_USER=${MQTT_USER:-}
       - MQTT_PASS=${MQTT_PASS:-}
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
+      - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
       - INFLUXDB_URL=http://influxdb:8086
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-ruview-local-dev-token-change-me}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}

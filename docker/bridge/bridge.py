@@ -42,6 +42,13 @@ HA_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
 DEVICE_NAME = os.getenv("DEVICE_NAME", "RuView Sensing")
 DEVICE_ID = os.getenv("DEVICE_ID", "ruview")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Room-level HA entities (presence, HR/BR, person count, motion, fall, ...).
+# Set ROOM_ENTITIES=false when the sensing-server's built-in MQTT publisher
+# (`--mqtt`, ADR-115) owns those entities: the bridge then retracts its own
+# retained room-level discovery configs and only announces the per-person
+# slot / enrolled-label entities, which upstream does not publish. The
+# ruview/* state topics keep flowing either way for Telegraf.
+ROOM_ENTITIES = os.getenv("ROOM_ENTITIES", "true").strip().lower() in ("1", "true", "yes", "on")
 
 # Per-person fixed-slot publishing. `MAX_TRACKED_PERSONS` slots are registered
 # in HA Discovery; each tick the bridge sorts detected persons by `bbox.x`
@@ -155,7 +162,19 @@ def _passes_z_gate(person: dict[str, Any]) -> bool:
 
 
 def discovery_messages() -> list[tuple[str, str]]:
-    """Return all entity discovery configs to publish on connect."""
+    """Return all entity discovery configs to publish on connect.
+
+    With ROOM_ENTITIES off, room-level configs are replaced by empty retained
+    payloads, which makes Home Assistant remove those entities.
+    """
+    room = room_discovery_messages()
+    if not ROOM_ENTITIES:
+        room = [(topic, "") for topic, _ in room]
+    return room + slot_discovery_messages()
+
+
+def room_discovery_messages() -> list[tuple[str, str]]:
+    """Room-level entities fed from ruview/state and ruview/event."""
     msgs: list[tuple[str, str]] = []
 
     # ── Binary sensors ────────────────────────────────────────────────
@@ -248,6 +267,13 @@ def discovery_messages() -> list[tuple[str, str]]:
         "event_types": ["fall"],
         "value_template": "{{ value_json.event_type }}",
     }))
+
+    return msgs
+
+
+def slot_discovery_messages() -> list[tuple[str, str]]:
+    """Per-person slot entities (person_1 .. person_N)."""
+    msgs: list[tuple[str, str]] = []
 
     # ── Per-person fixed slots ─────────────────────────────────────────
     # Each slot gets its own state + availability topic so HA entities
@@ -490,7 +516,10 @@ def make_mqtt() -> mqtt.Client:
             c.publish(AVAIL_TOPIC, "online", retain=True)
             for topic, payload in discovery_messages():
                 c.publish(topic, payload, retain=True)
-            LOG.info("HA discovery configs published")
+            LOG.info(
+                "HA discovery configs published (room entities %s)",
+                "on" if ROOM_ENTITIES else "retracted",
+            )
         else:
             LOG.error("MQTT connect failed, reason=%s", reason_code)
 
