@@ -34,7 +34,7 @@ The host-network services reach the bus on the NAS loopback
 | `mosquitto` | `eclipse-mosquitto:2.0.22` | 127.0.0.1:`MQTT_BUS_PORT` (1883) | NAS message bus; bridges the topics Home Assistant uses to its broker ([mosquitto/README.md](mosquitto/README.md)) |
 | `sensing-server` | local build (Dockerfile.rust) | 3000, 3001, 5005/udp | Rust DSP pipeline, eats CSI, emits SensingUpdate on WS |
 | `mqtt-bridge` | local build (bridge/Dockerfile) | — | WS → MQTT translator + HA Discovery |
-| `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities |
+| `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities; optional automatic empty-room calibration while nobody is home |
 | `csi-recorder` | local build (csi-recorder/Dockerfile) | — (loopback 5006/udp) | Raw datagrams from the server's UDP tee: 72 h rolling files plus permanent labelled clips (`docker/data/csi`) |
 | `influxdb` | `influxdb:2.7` | 8086 | Time-series store, retired after WP1.5 |
 | `timescaledb` | `timescale/timescaledb:2.30.2-pg17` | 127.0.0.1:`PG_PORT` (5432) | Long-term SQL store: raw rows 14 days, per-minute and per-hour aggregates forever ([timescaledb/README.md](timescaledb/README.md)) |
@@ -111,7 +111,7 @@ Home Assistant's broker (→) or from it (←); the list lives in
 | `ruview/recorder/status` (retained) | csi-recorder | every 30 s | | datagram rates per kind and node, ring size and age, free disk, keep budget (`recorder` measurement) |
 | `ruview/recorder/keep` | HA label buttons, analytics | on request | ← | keep a time range of raw CSI permanently |
 | `ruview/recorder/keep/result` | csi-recorder | per request | → | accepted / rejected / kept / empty / failed (`recorder_keep` measurement) |
-| `ruview/annotation` | HA label buttons | on press | ← | alcohol, sick, travel, quiet sitting, changes, ... (`annotation` measurement, stored at the press time) |
+| `ruview/annotation` | HA label buttons, analytics | on press | ← | alcohol, sick, travel, quiet sitting, changes, ...; the start and end of each automatic calibration (`annotation` measurement, stored at the press time) |
 | `ruview/bus/ha_connected` (retained) | the bus bridge | on connect and drop | both | 1 / 0, shown in HA as "NAS Link"; HA's broker writes the 0 itself |
 
 The sensing-server re-sends its latest update at 10 Hz even when the ESP32s

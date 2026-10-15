@@ -1,4 +1,7 @@
-"""Read-only polling of the sensing-server and Home Assistant REST APIs."""
+"""Polling of the sensing-server and Home Assistant REST APIs.
+
+Everything here reads; the only writes are the sensing-server calibration
+calls of automatic calibration (autocal.py), through `http_post_json`."""
 
 from __future__ import annotations
 
@@ -24,13 +27,26 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # (status code or None, parsed JSON or None, error text or None)
 Response = tuple[int | None, Any, str | None]
 Getter = Callable[[str, str, float], Response]
+Poster = Callable[[str, str, Any, float], Response]
 
 
 def http_get_json(url: str, token: str, timeout_s: float) -> Response:
+    return _request_json("GET", url, token, None, timeout_s)
+
+
+def http_post_json(url: str, token: str, body: Any, timeout_s: float) -> Response:
+    return _request_json("POST", url, token, body, timeout_s)
+
+
+def _request_json(method: str, url: str, token: str, body: Any, timeout_s: float) -> Response:
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(url, headers=headers, method="GET")
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with _OPENER.open(request, timeout=timeout_s) as resp:
             body = resp.read(MAX_BODY_BYTES + 1)

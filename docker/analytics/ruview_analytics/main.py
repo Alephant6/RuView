@@ -12,6 +12,7 @@ import time
 
 import paho.mqtt.client as mqtt
 
+from .autocal import AutoCalibrator
 from .checks import Watchdog, keep_requests, metrics
 from .config import Config, ConfigError
 from .ha import discovery_messages
@@ -61,7 +62,7 @@ def make_client(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watch
 
 
 def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdog,
-              client: mqtt.Client) -> dict:
+              client: mqtt.Client, autocal: AutoCalibrator | None = None) -> dict:
     snap = poll_sensing_server(cfg, time.time())
     persons, persons_error = poll_ha_persons(cfg) if cfg.presence_enabled else (None, None)
     with lock:
@@ -70,6 +71,16 @@ def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdo
             store.persons, store.persons_error = persons, persons_error
         report, transitions = watchdog.evaluate(store, time.time())
         keeps = keep_requests(cfg, store, report, transitions)
+        view = autocal.observe(store, time.time()) if autocal else None
+    if autocal is not None and view is not None:
+        # The calibration calls go out after the lock is released. A bug
+        # here must not hold back the report.
+        try:
+            for note in autocal.step(view, time.time()):
+                client.publish(cfg.topics["annotation"], json.dumps(note, ensure_ascii=False), qos=1)
+            report["autocal"] = autocal.status(time.time())
+        except Exception:
+            LOG.exception("automatic calibration round failed")
     for check_id, change in transitions:
         entry = report["checks"][check_id]
         if change == "raised":
@@ -102,10 +113,14 @@ def run() -> None:
     LOG.info("  server:  %s (token %s)", cfg.ruview_http, "set" if cfg.api_token else "not set")
     LOG.info("  nodes:   %s", ",".join(map(str, cfg.expected_nodes)) or "-")
     LOG.info("  phones:  %s", ",".join(cfg.ha_persons) if cfg.presence_enabled else "off (set HA_URL, HA_TOKEN, HA_PERSONS)")
+    LOG.info("  autocal: %s", f"node {cfg.autocal_source_node}, phones away {cfg.autocal_away_s / 60:g} min, "
+             f"refresh after {cfg.autocal_refresh_s / 3600:g} h" if cfg.autocal_enabled
+             else "off (set AUTOCAL_SOURCE_NODE)")
 
     store = Store(cfg, started_at=time.time())
     lock = threading.Lock()
     watchdog = Watchdog(cfg)
+    autocal = AutoCalibrator(cfg) if cfg.autocal_enabled else None
     client = make_client(cfg, store, lock, watchdog)
 
     stop = threading.Event()
@@ -115,7 +130,7 @@ def run() -> None:
     stop.wait(STARTUP_GRACE_S)
     while not stop.is_set():
         try:
-            run_round(cfg, store, lock, watchdog, client)
+            run_round(cfg, store, lock, watchdog, client, autocal)
         except Exception:  # keep watching; the next round may succeed
             LOG.exception("watchdog round failed")
         stop.wait(cfg.check_interval_s)

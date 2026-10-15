@@ -532,7 +532,8 @@ def test_discovery_templates_render():
     env = jinja2.Environment()
     env.filters["tojson"] = lambda v: json.dumps(v)
     cfg, store, wd = make()
-    configs = {json.loads(p)["unique_id"]: json.loads(p) for _, p in discovery_messages(cfg, wd.checks)}
+    # An empty payload removes an entity (Auto Calibration, off here).
+    configs = {json.loads(p)["unique_id"]: json.loads(p) for _, p in discovery_messages(cfg, wd.checks) if p}
     assert len(configs) == 7 + len(wd.checks)
     link = configs["ruview_watchdog_nas_link"]
     assert link["state_topic"] == "ruview/bus/ha_connected"

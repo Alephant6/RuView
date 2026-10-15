@@ -61,6 +61,12 @@ BEGIN
                    AND tags ->> 'label' = 'alcohol' AND fields ->> 'text' = 'ci sample') THEN
         RAISE EXCEPTION 'ingest.annotation: not stored at its press time';
     END IF;
+    IF NOT EXISTS (SELECT FROM ingest.annotation WHERE time = '2026-09-21T14:23:20Z'
+                   AND tags ->> 'kind' = 'calibration' AND tags ->> 'action' = 'done'
+                   AND tags ->> 'source' = 'watchdog' AND (fields ->> 'frame_count')::float = 12000
+                   AND (fields ->> 'source_node')::float = 1 AND fields ->> 'text' = 'ci calibration') THEN
+        RAISE EXCEPTION 'ingest.annotation: watchdog calibration note missing or without its numbers';
+    END IF;
 END
 $$;
 

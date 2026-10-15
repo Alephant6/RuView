@@ -206,6 +206,14 @@ def _node_view(ctx: Ctx, node_id: int) -> tuple[bool | None, float | None, float
     return fresh, as_number(payload.get("csi_fps")), (ms / 1000 if ms is not None else age), "mqtt"
 
 
+def node_streaming(cfg: Config, store: Store, now: float, node_id: int) -> bool | None:
+    """Whether one node is sending CSI at a normal rate (None: no data)."""
+    fresh, fps, _, _ = _node_view(Ctx(cfg, store, now), node_id)
+    if fresh is None:
+        return None
+    return fresh and (fps is None or fps >= cfg.min_node_fps)
+
+
 def node_rule(node_id: int) -> Rule:
     def rule(ctx: Ctx) -> Result:
         fresh, fps, last_seen_s, via = _node_view(ctx, node_id)
@@ -278,15 +286,26 @@ def rule_calibration(ctx: Ctx) -> Result:
     status = str(cal.get("status", "none")).lower()
     mode = cal.get("binding_mode")
     detail = {"status": status, "binding_mode": mode}
+
+    def problem(severity: str, key: str, **kwargs: object) -> Result:
+        text = ctx.t(key, **kwargs)
+        if ctx.cfg.autocal_enabled:
+            text += ctx.t("calibration_auto_hint")
+        return Result(True, severity, text, detail)
+
     if status == "collecting":
         return Result(False, detail=detail)
     if status in ("fresh", "stale") and mode == "bootstrap_only":
-        return Result(True, "warning", ctx.t("calibration_bootstrap"), detail)
+        return problem("warning", "calibration_bootstrap")
+    faults = cal.get("sequence_fault_node_ids")
+    if status in ("fresh", "stale") and isinstance(faults, list) and faults:
+        detail["sequence_fault_node_ids"] = faults
+        return problem("warning", "calibration_fault", nodes=",".join(map(str, faults)))
     if status == "fresh":
         return Result(False, detail=detail)
     if status == "stale":
-        return Result(True, "info", ctx.t("calibration_stale"), detail)
-    return Result(True, "warning", ctx.t("calibration_missing", status=status), detail)
+        return problem("info", "calibration_stale")
+    return problem("warning", "calibration_missing", status=status)
 
 
 def rule_recorder(ctx: Ctx) -> Result:
@@ -555,4 +574,9 @@ def metrics(report: dict[str, Any]) -> dict[str, Any]:
             out[f"check_{check_id}"] = 1 if entry["state"] == "problem" else 0
     if report.get("ha_link") is not None:
         out["ha_link"] = 1 if report["ha_link"] else 0
+    autocal = report.get("autocal")
+    if isinstance(autocal, dict):
+        out["autocal_collecting"] = 1 if autocal.get("state") == "collecting" else 0
+        if autocal.get("calibration_age_h") is not None:
+            out["calibration_age_h"] = autocal["calibration_age_h"]
     return out
