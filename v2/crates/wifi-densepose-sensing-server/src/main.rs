@@ -14684,7 +14684,17 @@ async fn main() {
             );
             mcfg.privacy_mode = args.privacy_mode;
             let mcfg = std::sync::Arc::new(mcfg);
-            match mcfg.validate() {
+            // `PlaintextOnPublicHost` is advisory (`is_fatal() == false`):
+            // a LAN broker such as the HA Mosquitto add-on is plaintext by
+            // default, so warn and keep going instead of dropping the publisher.
+            let validated = match mcfg.validate() {
+                Err(e) if !e.is_fatal() => {
+                    tracing::warn!("MQTT: {e}");
+                    Ok(())
+                }
+                other => other,
+            };
+            match validated {
                 Ok(()) => {
                     let node_id = mcfg.client_id.clone();
                     let builder = mqtt::publisher::OwnedDiscoveryBuilder {
