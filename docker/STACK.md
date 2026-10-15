@@ -1,6 +1,6 @@
 # RuView docker stack
 
-Five containers, one network namespace for the sensing-server (host) and
+Six containers, one network namespace for the sensing-server (host) and
 one bridge network (`ruview-data`) for the persistence + visualisation layer.
 
 ```
@@ -9,6 +9,7 @@ one bridge network (`ruview-data`) for the persistence + visualisation layer.
 │                                  │                      │
 │                                  ▼ WebSocket            │
 │  mqtt-bridge ───────────▶ HA Mosquitto (LAN: 1883)     │
+│  analytics (watchdog) ◀── REST 3000 + MQTT ──▶ HA       │
 └────────────────────────────────────│────────────────────┘
                                      │ MQTT subscribe
                                      ▼
@@ -29,6 +30,7 @@ one bridge network (`ruview-data`) for the persistence + visualisation layer.
 |---------|-------|-----------|--------------|
 | `sensing-server` | local build (Dockerfile.rust) | 3000, 3001, 5005/udp | Rust DSP pipeline, eats CSI, emits SensingUpdate on WS |
 | `mqtt-bridge` | local build (bridge/Dockerfile) | — | WS → MQTT translator + HA Discovery |
+| `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration → HA "RuView Watchdog" entities |
 | `influxdb` | `influxdb:2.7` | 8086 | Time-series store |
 | `telegraf` | `telegraf:1.30` | — | MQTT → InfluxDB ingest |
 | `grafana` | `grafana/grafana:11.2.0` | 3030 | Dashboards (auto-provisioned) |
@@ -74,6 +76,23 @@ sudo docker compose logs influxdb | grep -i "Setup complete"
 #      - Vital Signs
 #      - Presence & People
 ```
+
+## MQTT topics written by the stack
+
+| Topic | Writer | Rate | Notes |
+|---|---|---|---|
+| `ruview/state` | mqtt-bridge | one per new server tick, ≤ `STATE_MAX_HZ` (10) | withheld HR/BR are `null`, never 0; quality fields `vitals_present`, `stale_source`, `abstention_reason`, `cal_person_count`, ... |
+| `ruview/nodes/<id>` | mqtt-bridge | ≤ `NODE_MAX_HZ` (1) per node | `csi_fps`, `stale`, `last_seen_ms`, RSSI |
+| `ruview/person/<slot or label>` | mqtt-bridge | on change, ≤ 1 Hz, 30 s heartbeat | availability subtopics only on transitions |
+| `ruview/bridge` (retained) | mqtt-bridge | every 10 s and on change | WS connected, source, age of the last new tick, message rates |
+| `ruview/watchdog/state` (retained) | analytics | every 30 s | full watchdog report; HA entities read it |
+| `ruview/watchdog/metrics` | analytics | every 30 s | flat numbers for Telegraf (`watchdog` measurement) |
+
+The sensing-server re-sends its latest update at 10 Hz even when the ESP32s
+are gone (as `esp32:offline`). The bridge drops those repeats, so a stalled
+source shows up as `ruview/state` going quiet while `ruview/bridge` keeps
+reporting `new_ticks_hz: 0` — which the watchdog turns into a "CSI Source"
+problem in Home Assistant.
 
 ## Querying InfluxDB directly
 

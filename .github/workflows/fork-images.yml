@@ -58,6 +58,11 @@ jobs:
             file: docker/bridge/Dockerfile
             submodules: false
             free_disk: false
+          - name: analytics
+            context: docker/analytics
+            file: docker/analytics/Dockerfile
+            submodules: false
+            free_disk: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -135,6 +140,17 @@ jobs:
           IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
           docker run --rm --entrypoint python "$IMAGE" -c \
             "import ast; ast.parse(open('/app/bridge.py').read()); import paho.mqtt.client, websockets; print('bridge image OK')"
+
+      - name: Smoke-test analytics
+        if: matrix.name == 'analytics'
+        run: |
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          docker run --rm --entrypoint python "$IMAGE" -c \
+            "import ruview_analytics.main; print('analytics image OK')"
+          # The entrypoint must start and reject a bad setting with exit code 2.
+          rc=0
+          docker run --rm -e RUVIEW_HTTP=ftp://example.invalid "$IMAGE" || rc=$?
+          test "$rc" -eq 2
 
       - name: Summary
         run: |

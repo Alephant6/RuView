@@ -114,6 +114,43 @@ services:
       # bridge retracts its old room-level discovery configs and only keeps the
       # per-person slot and enrolled-name entities.
       - ROOM_ENTITIES=${ROOM_ENTITIES:-false}
+      # Publish limits: ruview/state per new tick up to STATE_MAX_HZ, each
+      # ruview/nodes/<id> up to NODE_MAX_HZ, person slots on change (at most
+      # PERSON_MAX_HZ) plus a heartbeat. Bridge health goes to ruview/bridge.
+      - STATE_MAX_HZ=${STATE_MAX_HZ:-10}
+      - NODE_MAX_HZ=${NODE_MAX_HZ:-1}
+      - PERSON_MAX_HZ=${PERSON_MAX_HZ:-1}
+    restart: unless-stopped
+
+  # ── Data watchdog (docker/analytics, WP0.4) ─────────────────────────────
+  # Checks the bridge, server, CSI source, each node, frozen/implausible
+  # vitals and calibration; publishes problems to HA as "RuView Watchdog"
+  # entities. Example push automations: analytics/ha/watchdog-notify.yaml.
+  analytics:
+    build:
+      context: ./analytics
+      dockerfile: Dockerfile
+    image: ghcr.io/alephant6/ruview-analytics:${IMAGE_TAG:-latest}
+    container_name: ruview-analytics
+    depends_on:
+      - mqtt-bridge
+    environment:
+      - RUVIEW_HTTP=${RUVIEW_HTTP:-http://192.168.1.195:3000}
+      - RUVIEW_API_TOKEN
+      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USER=${MQTT_USER:-}
+      - MQTT_PASS=${MQTT_PASS:-}
+      - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
+      - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
+      - EXPECTED_NODES=${EXPECTED_NODES:-1,2,3}
+      # Optional phone-presence check: HA URL, a long-lived token and the
+      # person entities, e.g. HA_PERSONS=person.alice,person.bob.
+      - HA_URL=${HA_URL:-}
+      - HA_TOKEN=${HA_TOKEN:-}
+      - HA_PERSONS=${HA_PERSONS:-}
+      - WATCHDOG_LANG=${WATCHDOG_LANG:-zh}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     restart: unless-stopped
 
   # ── InfluxDB 2.x ─────────────────────────────────────────────────────────

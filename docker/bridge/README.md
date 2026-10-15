@@ -21,20 +21,37 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `MAX_TRACKED_PERSONS`  | `2`                                     | Number of fixed per-person slots in HA Discovery   |
 | `Z_MIN`                | `-100.0`                                | Drop persons whose median keypoint z < Z_MIN (m)   |
 | `Z_MAX`                | `100.0`                                 | Drop persons whose median keypoint z > Z_MAX (m). Defaults effectively disable gating until sensing-server emits real floor-relative z. |
+| `STATE_MAX_HZ`         | `10`                                    | Max rate of `<prefix>/state` (one message per new server tick at most); `0` = no limit |
+| `NODE_MAX_HZ`          | `1`                                     | Max rate of each `<prefix>/nodes/<id>`             |
+| `PERSON_MAX_HZ`        | `1`                                     | Max rate of each person topic while its payload keeps changing |
+| `PERSON_HEARTBEAT_S`   | `30`                                    | Re-send an unchanged person payload this often     |
+| `STATUS_INTERVAL_S`    | `10`                                    | Period of the retained `<prefix>/bridge` status    |
+| `EDGE_VITALS_TTL_S`    | `60`                                    | How long an `edge_vitals` message describes the vitals gate |
 
 ## Topics published
 
 | Topic                              | Retained | Payload                                         |
 |------------------------------------|----------|-------------------------------------------------|
 | `<prefix>/availability`            | yes      | `online` / `offline` (LWT)                       |
-| `<prefix>/state`                   | no       | Flat JSON consumed by all entity templates       |
-| `<prefix>/nodes/<id>`              | no       | Per-node RSSI / position                         |
+| `<prefix>/state`                   | no       | Flat JSON consumed by all entity templates; one message per new server tick, at most `STATE_MAX_HZ` |
+| `<prefix>/nodes/<id>`              | no       | Per-node health: RSSI, `csi_fps`, `stale`, `last_seen_ms`, position |
 | `<prefix>/event`                   | no       | One-shot fall events (HA `event` entity)         |
-| `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, x/y/z, conf)    |
-| `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise |
+| `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, x/y/z, conf), sent on change plus a heartbeat |
+| `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise (sent on transitions) |
 | `<prefix>/person/<label>`          | no       | Per-name state (e.g. `ruview/person/alice`) when an enrolled profile matched |
 | `<prefix>/person/<label>/avail`    | yes      | `online` when that named person is detected      |
+| `<prefix>/bridge`                  | yes      | Bridge stream health: WS connected, source, age of the last new tick, message rates |
 | `homeassistant/<comp>/<id>/.../config` | yes  | HA Discovery configs                             |
+
+The sensing-server re-broadcasts its latest update at 10 Hz, also after the
+ESP32s stop sending (the source then reads `esp32:offline`). Repeats of a
+tick are dropped, so `<prefix>/state` goes quiet when the CSI source stalls
+while `<prefix>/bridge` keeps reporting `new_ticks_hz: 0`.
+
+Heart and breathing rate are `null` whenever the server withholds them
+(no fresh calibration, not exactly one person, quality gate); Home Assistant
+then shows the sensors as unknown, and Telegraf stores no point, instead of
+a fake 0 bpm. `abstention_reason` says why, when the server reports it.
 
 ## Enrolled profiles (named entities)
 
@@ -78,3 +95,11 @@ docker run --rm \
 
 Inside the project's `docker-compose.yml`, the bridge is wired to the
 internal network and the WS URL defaults to `sensing-server:3001`.
+
+## Tests
+
+```bash
+cd docker/bridge
+python -m pip install -r requirements.txt pytest jinja2
+python -m pytest -q
+```
