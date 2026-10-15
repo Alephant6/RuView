@@ -29,7 +29,8 @@ services:
     environment:
       - HEALTH_TOKENS
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:?set INFLUXDB_TOKEN in docker/.env}
+      # Taken from docker/.env (same token the influxdb service was set up with).
+      - INFLUXDB_TOKEN
       - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-sensing}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
