@@ -1,0 +1,24 @@
+# Apple Watch / Apple Health ingest (Health Auto Export -> InfluxDB).
+# Kept in its own file so it layers on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.health.yml up -d --build health-ingest
+# Needs HEALTH_TOKENS in docker/.env; see health-ingest/README.md.
+services:
+  health-ingest:
+    build:
+      context: ./health-ingest
+    image: ruview/health-ingest:latest
+    container_name: ruview-health-ingest
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+    networks:
+      - ruview-data
+    ports:
+      - "${HEALTH_INGEST_PORT:-8095}:8095"
+    environment:
+      - HEALTH_TOKENS
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-ruview-local-dev-token-change-me}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-sensing}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
