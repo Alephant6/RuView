@@ -490,6 +490,7 @@ class Watchdog:
             "issues": issues,
             "checks": checks,
             "vitals": vitals_status(self.cfg, store, now),
+            "ha_link": store.ha_link,
         }
 
 
@@ -552,4 +553,6 @@ def metrics(report: dict[str, Any]) -> dict[str, Any]:
     for check_id, entry in report["checks"].items():
         if entry["state"] != "unknown":
             out[f"check_{check_id}"] = 1 if entry["state"] == "problem" else 0
+    if report.get("ha_link") is not None:
+        out["ha_link"] = 1 if report["ha_link"] else 0
     return out

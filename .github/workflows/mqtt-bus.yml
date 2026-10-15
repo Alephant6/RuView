@@ -1,0 +1,131 @@
+name: NAS message bus (Mosquitto bridge)
+
+# WP1.1: the mosquitto service in docker/docker-compose.yml and its bridge to
+# Home Assistant's broker (docker/mosquitto). Starts the compose service with
+# a password-protected Mosquitto standing in for Home Assistant's broker, then
+# docker/mosquitto/tests/check_bridge.py checks that each bridged topic
+# arrives once and nothing else crosses, that the retained messages come back
+# after Home Assistant's broker restarts empty, and that the link state on
+# Home Assistant's broker follows the bus going down and up. Also checks that
+# start.sh refuses settings that would change the generated config.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/mosquitto/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/mqtt-bus.yml'
+  pull_request:
+    paths:
+      - 'docker/mosquitto/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/mqtt-bus.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    name: bridge to a test Home Assistant broker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: docker
+    env:
+      COMPOSE_PROJECT_NAME: ruview-ci
+      # The compose service bridges to the stand-in below, which joins the
+      # bus network under this name.
+      MQTT_HOST: ha-broker
+      MQTT_PORT: '1883'
+      MQTT_USER: mqtt-bridge
+      HA_MQTT_USER: mqtt-bridge
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Install the MQTT client
+        run: python -m pip install 'paho-mqtt>=2.1.0'
+
+      - name: Generate a throwaway password for the test broker
+        run: |
+          value="$(openssl rand -hex 24)"
+          echo "::add-mask::$value"
+          for var in MQTT_PASS HA_MQTT_PASS; do
+            echo "$var=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: start.sh refuses settings that would change the config
+        run: |
+          image="$(docker compose config --format json | jq -r '.services.mosquitto.image')"
+          refused() {
+            name="$1"
+            shift
+            docker run -d --name "$name" --user 1883:1883 \
+              -v "$PWD/mosquitto:/mosquitto/config:ro" "$@" \
+              "$image" sh /mosquitto/config/start.sh > /dev/null
+            code="$(timeout 20 docker wait "$name" || echo running)"
+            docker logs "$name" 2>&1 | tail -n 1
+            docker rm -f "$name" > /dev/null
+            [ "$code" = "1" ]
+          }
+          refused bad-host -e MQTT_HOST='ha-broker listener'
+          refused bad-port -e MQTT_HOST=ha-broker -e MQTT_PORT=70000
+          refused bad-prefix -e MQTT_HOST=ha-broker -e 'MQTT_PREFIX=ruview/#'
+          refused bad-pass -e MQTT_HOST=ha-broker -e MQTT_USER=u \
+            -e "MQTT_PASS=$(printf 'pw\nlistener 9999')"
+
+      - name: Start the bus and a stand-in for Home Assistant's broker
+        run: |
+          image="$(docker compose config --format json | jq -r '.services.mosquitto.image')"
+          # Creates the bus network, which the stand-in joins as ha-broker.
+          docker compose create mosquitto
+          ha="$RUNNER_TEMP/ha"
+          mkdir -p "$ha"
+          printf '%s\n' 'listener 1883' 'allow_anonymous false' \
+            'password_file /ha/passwd' 'persistence false' 'log_dest stdout' > "$ha/ha.conf"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$ha:/ha" -e MQTT_USER -e MQTT_PASS "$image" \
+            sh -c 'mosquitto_passwd -b -c /ha/passwd "$MQTT_USER" "$MQTT_PASS"'
+          # No persistence: a restart forgets every retained message, the
+          # worst case for the entity configs.
+          docker run -d --name ha-broker --network ruview-ci_ruview-bus \
+            --user "$(id -u):$(id -g)" -p 127.0.0.1:18840:1883 -v "$ha:/ha:ro" \
+            "$image" mosquitto -c /ha/ha.conf
+          docker compose up -d --wait mosquitto
+
+      - name: Bridge connects and sets the link state
+        run: python mosquitto/tests/check_bridge.py link 1
+
+      - name: Each topic crosses once, in its direction only
+        run: python mosquitto/tests/check_bridge.py route
+
+      - name: Retained messages come back after Home Assistant's broker restarts
+        run: |
+          docker restart ha-broker
+          python mosquitto/tests/check_bridge.py link 1
+          python mosquitto/tests/check_bridge.py retained
+
+      - name: Link state follows the bus going down and up
+        run: |
+          docker compose stop mosquitto
+          python mosquitto/tests/check_bridge.py link 0
+          docker compose start mosquitto
+          python mosquitto/tests/check_bridge.py link 1
+          # The bus kept its retained messages across the restart.
+          python mosquitto/tests/check_bridge.py retained
+
+      - name: Remove the probes
+        run: python mosquitto/tests/check_bridge.py cleanup
+
+      - name: Logs
+        if: always()
+        run: |
+          docker compose logs mosquitto | tail -n 40
+          docker logs ha-broker 2>&1 | tail -n 40

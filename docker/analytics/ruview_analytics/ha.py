@@ -1,6 +1,6 @@
 """Home Assistant MQTT discovery for the watchdog entities.
 
-All entities read the one retained report topic (`ruview/watchdog/state`):
+These entities read the one retained report topic (`ruview/watchdog/state`):
 
 - binary_sensor  Problem      ON when any warning/critical issue is open
 - sensor         Status       ok / info / warning / critical
@@ -10,6 +10,11 @@ All entities read the one retained report topic (`ruview/watchdog/state`):
 - sensor         Last Check   when the watchdog last ran (heartbeat)
 - binary_sensor  one per check (Bridge, CSI Source, Node 1, ...), with the
                  summary, severity and start time as attributes
+
+NAS Link (connectivity) reads the NAS bus bridge's own state topic instead
+(`ruview/bus/ha_connected`): Home Assistant's broker turns it off by itself
+when the bridge from the NAS drops, so it shows the outage while nothing
+from the NAS reaches Home Assistant.
 """
 
 from __future__ import annotations
@@ -90,6 +95,18 @@ def discovery_messages(cfg: Config, checks: list[Check]) -> list[tuple[str, str]
             "entity_category": "diagnostic",
         }),
     ]
+    # No availability: the link state must show while the watchdog is
+    # unreachable, which is exactly when the link is down.
+    msgs.append((f"{cfg.ha_prefix}/binary_sensor/{cfg.device_id}/nas_link/config", json.dumps({
+        "device": device(cfg),
+        "unique_id": f"{cfg.device_id}_nas_link",
+        "name": "NAS Link",
+        "state_topic": topics["ha_link"],
+        "payload_on": "1",
+        "payload_off": "0",
+        "device_class": "connectivity",
+        "entity_category": "diagnostic",
+    }, ensure_ascii=False)))
     for check in checks:
         ref = f"value_json.checks['{check.id}']"
         msgs.append(disc("binary_sensor", f"check_{check.id}", {

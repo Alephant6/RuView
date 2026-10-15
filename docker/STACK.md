@@ -1,35 +1,37 @@
 # RuView docker stack
 
-Nine containers (db-migrate exits once the database migrations are
-applied), the host network for the sensing-server and the csi-recorder, and
-one bridge network (`ruview-data`) for the persistence + visualisation layer.
+Ten containers (db-migrate exits once the database migrations are
+applied). The sensing-server and the csi-recorder use the host network. The
+NAS message bus and its clients share the `ruview-bus` network, the databases
+and Grafana the `ruview-data` network; Telegraf is on both.
 
 ```
-┌─ host network ─────────────────────────────────────────┐
-│  ESP32 nodes ──UDP:5005──▶ sensing-server (3000/3001)  │
-│  csi-recorder ◀── udp tee :5006 ─┤                     │
-│                                  ▼ WebSocket           │
-│  mqtt-bridge ───────────▶ HA Mosquitto (LAN: 1883)     │
-│  analytics (watchdog) ◀── REST 3000 + MQTT ──▶ HA       │
-└────────────────────────────────────│────────────────────┘
-                                     │ MQTT subscribe
-                                     ▼
-                              ┌─ ruview-data ─────────────────────┐
-                              │  telegraf                         │
-                              │     │ writes both (until WP1.5)   │
-                              │     ▼                             │
-                              │  influxdb:8086 ──────────────────┼──▶ exposed on host:8086
-                              │  timescaledb:5432 ◀── db-migrate ┼──▶ NAS loopback PG_PORT
-                              │     ▲                             │
-                              │     │ reads                       │
-                              │  grafana:3000  ──────────────────┼──▶ exposed on host:3030
-                              └───────────────────────────────────┘
+ESP32 nodes ──UDP:5005──▶ sensing-server ──udp tee :5006──▶ csi-recorder
+                           │         │                          │
+                 WebSocket │         │ built-in MQTT publisher  │
+                           ▼         ▼                          │
+          mqtt-bridge ──▶ mosquitto: the NAS bus ◀──────────────┘
+          analytics   ◀─▶  │   ║
+                           │   ║ bridge: only the topics HA uses,
+                           │   ║ label buttons come back
+                           │   ╚══▶ HA Mosquitto (LAN) ──▶ Home Assistant
+                           ▼
+                       telegraf ──▶ influxdb:8086 (until WP1.5)
+                                └─▶ timescaledb:5432 ◀── db-migrate
+                                          ▲
+                                       grafana
 ```
+
+The host-network services reach the bus on the NAS loopback
+(`127.0.0.1`, port `MQTT_BUS_PORT`, 1883 by default), the containers as
+`mosquitto:1883`. InfluxDB and Grafana are published on the host (8086,
+3030), TimescaleDB on the NAS loopback only (`PG_PORT`, 5432 by default).
 
 ## Services
 
 | Service | Image | Host port | What it does |
 |---------|-------|-----------|--------------|
+| `mosquitto` | `eclipse-mosquitto:2.0.22` | 127.0.0.1:`MQTT_BUS_PORT` (1883) | NAS message bus; bridges the topics Home Assistant uses to its broker ([mosquitto/README.md](mosquitto/README.md)) |
 | `sensing-server` | local build (Dockerfile.rust) | 3000, 3001, 5005/udp | Rust DSP pipeline, eats CSI, emits SensingUpdate on WS |
 | `mqtt-bridge` | local build (bridge/Dockerfile) | — | WS → MQTT translator + HA Discovery |
 | `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities |
@@ -47,7 +49,7 @@ cd /volume1/docker/RuView/docker
 
 # 1. Optional: override defaults via .env
 cat > .env <<'EOF'
-# MQTT (already used by mqtt-bridge)
+# Home Assistant's broker: the bus bridges to it with this login
 MQTT_HOST=192.168.1.227
 MQTT_USER=mqtt-bridge
 MQTT_PASS=mqtt-bridge-pass
@@ -76,6 +78,7 @@ sudo docker compose up -d --build
 
 # 3. First-boot verification
 sudo docker compose ps -a           # all "running" except db-migrate, "exited (0)"
+sudo docker compose exec mosquitto mosquitto_sub -t ruview/bus/ha_connected -C 1 -W 5   # 1: bridged to HA
 sudo docker compose logs telegraf | grep -i "Successfully connected"
 sudo docker compose logs influxdb | grep -i "Setup complete"
 
@@ -89,18 +92,27 @@ sudo docker compose logs influxdb | grep -i "Setup complete"
 
 ## MQTT topics written by the stack
 
-| Topic | Writer | Rate | Notes |
-|---|---|---|---|
-| `ruview/state` | mqtt-bridge | one per new server tick, ≤ `STATE_MAX_HZ` (10) | withheld HR/BR are `null`, never 0; quality fields `vitals_present`, `stale_source`, `abstention_reason`, `cal_person_count`, ... |
-| `ruview/nodes/<id>` | mqtt-bridge | ≤ `NODE_MAX_HZ` (1) per node | `csi_fps`, `stale`, `last_seen_ms`, RSSI |
-| `ruview/person/<slot or label>` | mqtt-bridge | on change, ≤ 1 Hz, 30 s heartbeat | availability subtopics only on transitions |
-| `ruview/bridge` (retained) | mqtt-bridge | every 10 s and on change | WS connected, source, age of the last new tick, message rates |
-| `ruview/watchdog/state` (retained) | analytics | every 30 s | full watchdog report; HA entities read it |
-| `ruview/watchdog/metrics` | analytics | every 30 s | flat numbers for Telegraf (`watchdog` measurement) |
-| `ruview/recorder/status` (retained) | csi-recorder | every 30 s | datagram rates per kind and node, ring size and age, free disk, keep budget (`recorder` measurement) |
-| `ruview/recorder/keep` | HA label buttons, analytics | on request | keep a time range of raw CSI permanently |
-| `ruview/recorder/keep/result` | csi-recorder | per request | accepted / rejected / kept / empty / failed (`recorder_keep` measurement) |
-| `ruview/annotation` | HA label buttons | on press | alcohol, sick, travel, quiet sitting, changes, ... (`annotation` measurement, stored at the press time) |
+All of them go through the NAS bus. "To HA" marks the ones the bus bridges to
+Home Assistant's broker (→) or from it (←); the list lives in
+[mosquitto/start.sh](mosquitto/start.sh).
+
+| Topic | Writer | Rate | To HA | Notes |
+|---|---|---|---|---|
+| `homeassistant/…` | sensing-server, mqtt-bridge, analytics | per entity | → | entity configs (retained); the sensing-server's built-in publisher also sends its states and availability here |
+| `ruview/availability` (retained) | mqtt-bridge | on connect, will | → | online / offline |
+| `ruview/state` | mqtt-bridge | one per new server tick, ≤ `STATE_MAX_HZ` (10) | | withheld HR/BR are `null`, never 0; quality fields `vitals_present`, `stale_source`, `abstention_reason`, `cal_person_count`, ... |
+| `ruview/nodes/<id>` | mqtt-bridge | ≤ `NODE_MAX_HZ` (1) per node | → | `csi_fps`, `stale`, `last_seen_ms`, RSSI |
+| `ruview/person/<slot or label>` | mqtt-bridge | on change, ≤ 1 Hz, 30 s heartbeat | → | availability subtopics only on transitions |
+| `ruview/event` | mqtt-bridge | per fall event | → | |
+| `ruview/bridge` (retained) | mqtt-bridge | every 10 s and on change | | WS connected, source, age of the last new tick, message rates |
+| `ruview/watchdog/state` (retained) | analytics | every 30 s | → | full watchdog report; HA entities read it |
+| `ruview/watchdog/availability` (retained) | analytics | on connect, will | → | |
+| `ruview/watchdog/metrics` | analytics | every 30 s | | flat numbers for Telegraf (`watchdog` measurement) |
+| `ruview/recorder/status` (retained) | csi-recorder | every 30 s | | datagram rates per kind and node, ring size and age, free disk, keep budget (`recorder` measurement) |
+| `ruview/recorder/keep` | HA label buttons, analytics | on request | ← | keep a time range of raw CSI permanently |
+| `ruview/recorder/keep/result` | csi-recorder | per request | → | accepted / rejected / kept / empty / failed (`recorder_keep` measurement) |
+| `ruview/annotation` | HA label buttons | on press | ← | alcohol, sick, travel, quiet sitting, changes, ... (`annotation` measurement, stored at the press time) |
+| `ruview/bus/ha_connected` (retained) | the bus bridge | on connect and drop | both | 1 / 0, shown in HA as "NAS Link"; HA's broker writes the 0 itself |
 
 The sensing-server re-sends its latest update at 10 Hz even when the ESP32s
 are gone (as `esp32:offline`). The bridge drops those repeats, so a stalled
@@ -138,16 +150,24 @@ Tables, roles, retention and remote access: [timescaledb/README.md](timescaledb/
 
 ## Persistence
 
-InfluxDB, TimescaleDB and Grafana use **named docker volumes**
-(`influxdb-data`, `influxdb-config`, `timescaledb-data`, `grafana-data`) so a
-`docker compose down` keeps your data. `docker compose down -v` will wipe them — don't do that if you care
-about history.
+InfluxDB, TimescaleDB, Grafana and the bus use **named docker volumes**
+(`influxdb-data`, `influxdb-config`, `timescaledb-data`, `grafana-data`,
+`mosquitto-data`) so a `docker compose down` keeps your data.
+`docker compose down -v` will wipe them — don't do that if you care about
+history.
 
 ## Troubleshooting
 
-- **Telegraf can't reach MQTT** — check `MQTT_HOST` resolves from inside the
-  `ruview-data` network. From the NAS: `sudo docker compose exec telegraf
-  getent hosts ${MQTT_HOST}`. If it fails, use the broker's IP literally.
+- **Telegraf can't reach MQTT** — it reads the NAS bus, not Home Assistant's
+  broker: check `sudo docker compose ps mosquitto` shows it healthy.
+- **HA shows old RuView values, "NAS Link" is off** — the bus cannot reach
+  Home Assistant's broker. `sudo docker compose logs mosquitto | tail` shows
+  `Connecting bridge ha (<host>:<port>)` at each attempt. `Connection Refused:
+  not authorised` after it means `MQTT_USER` / `MQTT_PASS` are wrong; attempts
+  without any answer mean `MQTT_HOST` is unreachable (use the broker's IP).
+  The database keeps recording meanwhile. See
+  [mosquitto/README.md](mosquitto/README.md).
+- **Port 1883 already used on the NAS** — set `MQTT_BUS_PORT` in `.env`.
 - **InfluxDB rejects the Telegraf token** — they must agree on
   `INFLUXDB_TOKEN`. Bounce both: `sudo docker compose restart influxdb
   telegraf`.

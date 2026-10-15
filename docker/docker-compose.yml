@@ -4,6 +4,53 @@
 #   docker compose pull && docker compose up -d
 # `build:` stays so a dev machine can still `docker compose build` locally.
 services:
+  # ── NAS message bus (docker/mosquitto, WP1.1) ───────────────────────────
+  # Every RuView service below publishes and subscribes here, so ingest keeps
+  # running while Home Assistant restarts or upgrades. start.sh bridges the
+  # topics Home Assistant uses (entities, availability, label buttons) to
+  # its broker at MQTT_HOST with the MQTT_USER / MQTT_PASS login; the rest,
+  # notably <prefix>/state at up to 10 Hz, stays on the NAS. Containers
+  # reach the bus as mosquitto:1883 on the ruview-bus network, host-network
+  # services on 127.0.0.1:${MQTT_BUS_PORT:-1883}. See mosquitto/README.md.
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    container_name: ruview-mosquitto
+    restart: unless-stopped
+    command: ["sh", "/mosquitto/config/start.sh"]
+    networks:
+      - ruview-bus
+    ports:
+      # Loopback only: clients connect without a password.
+      - "127.0.0.1:${MQTT_BUS_PORT:-1883}:1883"
+    environment:
+      # Home Assistant's broker, the one the services used before the bus.
+      # Empty MQTT_HOST runs the bus without the bridge.
+      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USER=${MQTT_USER:-}
+      - MQTT_PASS
+      - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
+      - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
+    volumes:
+      - ./mosquitto:/mosquitto/config:ro
+      # Retained messages and queued messages for the bridge.
+      - mosquitto-data:/mosquitto/data
+    # The image's mosquitto user owns /mosquitto/data; start.sh writes the
+    # generated config, which holds the bridge password, to /tmp.
+    user: "1883:1883"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # The broker's uptime is retained, so this returns at once while it runs.
+      test: ["CMD", "mosquitto_sub", "-h", "127.0.0.1", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "5"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
   sensing-server:
     build:
       context: ..
@@ -71,17 +118,19 @@ services:
       # semantic states (sleeping, distress, bed exit, fall risk, no movement,
       # ...). State topics: homeassistant/<component>/wifi_densepose_ruview-node<N>/<entity>/state.
       # The mqtt-bridge below keeps the per-person / enrolled-name entities.
+      # Publishes to the NAS bus (mosquitto below) on the host's loopback,
+      # which passes these topics on to Home Assistant's broker.
       - RUVIEW_MQTT=${RUVIEW_MQTT:-true}
-      - RUVIEW_MQTT_HOST=${MQTT_HOST:-homeassistant.local}
-      - RUVIEW_MQTT_PORT=${MQTT_PORT:-1883}
-      - RUVIEW_MQTT_USERNAME=${MQTT_USER:-}
-      - MQTT_PASSWORD=${MQTT_PASS:-}
+      - RUVIEW_MQTT_HOST=127.0.0.1
+      - RUVIEW_MQTT_PORT=${MQTT_BUS_PORT:-1883}
       # Fixed client id so HA device ids and topics stay stable across rebuilds.
       - RUVIEW_MQTT_CLIENT_ID=${RUVIEW_MQTT_CLIENT_ID:-ruview}
       - RUVIEW_MQTT_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+    depends_on:
+      - mosquitto
     restart: unless-stopped
     # No explicit command needed — docker-entrypoint.sh uses CSI_SOURCE.
     # Override with: command: ["--source", "esp32", "--tick-ms", "500"]
@@ -99,16 +148,19 @@ services:
     container_name: ruview-mqtt-bridge
     depends_on:
       - sensing-server
+      - mosquitto
+    networks:
+      - ruview-bus
     environment:
       # Inside the compose network we can reach the sensing-server by name.
       - RUVIEW_WS=ws://192.168.1.195:3001/ws/sensing
       # Same token as sensing-server; sent as a bearer header on the WS upgrade.
       - RUVIEW_API_TOKEN
-      # Point at your Home Assistant MQTT broker (e.g. the Mosquitto add-on).
-      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
-      - MQTT_PORT=${MQTT_PORT:-1883}
-      - MQTT_USER=${MQTT_USER:-}
-      - MQTT_PASS=${MQTT_PASS:-}
+      # The NAS bus. Only the topics Home Assistant uses cross to its broker;
+      # with ROOM_ENTITIES=true, <prefix>/state (up to STATE_MAX_HZ) would
+      # also have to be added to the bridge in mosquitto/start.sh.
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
       - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
       - DEVICE_NAME=${DEVICE_NAME:-RuView Sensing}
@@ -138,13 +190,14 @@ services:
     container_name: ruview-analytics
     depends_on:
       - mqtt-bridge
+      - mosquitto
+    networks:
+      - ruview-bus
     environment:
       - RUVIEW_HTTP=${RUVIEW_HTTP:-http://192.168.1.195:3000}
       - RUVIEW_API_TOKEN
-      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
-      - MQTT_PORT=${MQTT_PORT:-1883}
-      - MQTT_USER=${MQTT_USER:-}
-      - MQTT_PASS=${MQTT_PASS:-}
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
       - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
       - EXPECTED_NODES=${EXPECTED_NODES:-1,2,3}
@@ -187,12 +240,13 @@ services:
       - MIN_FREE_GB=${MIN_FREE_GB:-2}
       - KEEP_MAX_MIN=${KEEP_MAX_MIN:-120}
       - KEEP_MAX_H_PER_DAY=${KEEP_MAX_H_PER_DAY:-2}
-      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
-      - MQTT_PORT=${MQTT_PORT:-1883}
-      - MQTT_USER=${MQTT_USER:-}
-      - MQTT_PASS=${MQTT_PASS:-}
+      # The NAS bus, on the host's loopback.
+      - MQTT_HOST=127.0.0.1
+      - MQTT_PORT=${MQTT_BUS_PORT:-1883}
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      - mosquitto
     volumes:
       - ${CSI_DATA_DIR:-./data/csi}:/data
     # Writes only to /data; binds an unprivileged loopback port.
@@ -304,25 +358,33 @@ services:
     restart: "no"
 
   # ── Telegraf MQTT → InfluxDB + TimescaleDB ───────────────────────────────
-  # Subscribes to ruview/# and the built-in publisher's topics on the same
-  # MQTT broker the HA bridge writes to, parses each JSON payload, and writes
-  # it to InfluxDB and to TimescaleDB (schema ingest). It does not wait for
-  # the database: if TimescaleDB is down, Telegraf keeps writing InfluxDB and
-  # retries it at every flush.
+  # Subscribes to ruview/# and the built-in publisher's topics on the NAS
+  # bus, parses each JSON payload, and writes it to InfluxDB and to
+  # TimescaleDB (schema ingest). It does not wait for the database: if
+  # TimescaleDB is down, Telegraf keeps writing InfluxDB and retries it at
+  # every flush. It does wait for the bus, since it exits when it cannot
+  # connect at startup.
   telegraf:
     image: telegraf:1.39.3
     container_name: ruview-telegraf
     restart: unless-stopped
     depends_on:
-      - influxdb
-      - mqtt-bridge
+      influxdb:
+        condition: service_started
+      mqtt-bridge:
+        condition: service_started
+      mosquitto:
+        condition: service_healthy
     networks:
       - ruview-data
+      - ruview-bus
     environment:
-      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
-      - MQTT_PORT=${MQTT_PORT:-1883}
-      - MQTT_USER=${MQTT_USER:-}
-      - MQTT_PASS=${MQTT_PASS:-}
+      # The bus needs no login. Set empty on purpose: Telegraf keeps an unset
+      # ${MQTT_USER} in telegraf.conf as literal text.
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_USER=
+      - MQTT_PASS=
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
       - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
       - INFLUXDB_URL=http://influxdb:8086
@@ -368,9 +430,13 @@ services:
 networks:
   ruview-data:
     driver: bridge
+  # The bus and its clients only; the databases and Grafana are not on it.
+  ruview-bus:
+    driver: bridge
 
 volumes:
   influxdb-data:
   influxdb-config:
   grafana-data:
   timescaledb-data:
+  mosquitto-data:

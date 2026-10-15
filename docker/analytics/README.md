@@ -59,9 +59,14 @@ behind the problem can be replayed after a fix.
 - Home Assistant entities under the device **RuView Watchdog**: Problem,
   Status, Open Issues, Top Issue, CSI Vitals, Last Check, and one problem
   sensor per check.
+- **NAS Link** in the same device: whether the NAS bus is bridged to Home
+  Assistant's broker. It reads `ruview/bus/ha_connected`, which that broker
+  sets to 0 itself when the bridge drops, so it also works while nothing
+  from the NAS arrives ([../mosquitto/README.md](../mosquitto/README.md)).
 
 `ha/watchdog-notify.yaml` has example automations that push new problems
-and recoveries to a phone, and alert when the watchdog itself is offline.
+and recoveries to a phone, and alert when the watchdog itself is offline or
+the NAS link has been down for 5 minutes.
 `ha/ruview-labels.yaml` is the Home Assistant package with the label
 buttons (alcohol, sick, quiet sitting, change log, ...), see WP0.6.
 
@@ -71,7 +76,7 @@ buttons (alcohol, sick, quiet sitting, change log, ...), see WP0.6.
 |---|---|---|
 | `RUVIEW_HTTP` | `http://192.168.1.195:3000` | sensing-server REST base URL; its host must be in the server's `SENSING_ALLOWED_HOSTS`, or the server answers HTTP 421 |
 | `RUVIEW_API_TOKEN` | — | same token as the server |
-| `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` | | broker the bridge publishes to |
+| `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` | | broker the bridge publishes to (the NAS bus in docker-compose) |
 | `MQTT_PREFIX` / `HA_DISCOVERY_PREFIX` | `ruview` / `homeassistant` | |
 | `EXPECTED_NODES` | `1,2,3` | node ids that should be online |
 | `MIN_NODE_FPS` | `5` | |

@@ -9,8 +9,9 @@
 # Entity ids come from the MQTT device name "RuView Watchdog". If yours
 # differ, check Settings -> Devices & services -> MQTT -> RuView Watchdog.
 # Node entities follow EXPECTED_NODES; the "Presence vs Phones" entity only
-# exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog, and
-# "Recorder" stays unknown until the csi-recorder runs.
+# exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog,
+# "Recorder" stays unknown until the csi-recorder runs, and "NAS Link" stays
+# unknown until the NAS bus (docker/mosquitto) runs.
 
 - id: ruview_watchdog_problem
   alias: "RuView: data problem"
@@ -77,3 +78,39 @@
       data:
         title: "RuView 看门狗离线"
         message: "看门狗已经离线 5 分钟，这段时间的数据问题不会被发现。"
+
+# NAS Link turns off when the bridge from the NAS bus to this broker drops.
+# Nothing from the NAS arrives then, so the watchdog automations above stay
+# quiet and every RuView entity keeps its last value instead of going
+# unavailable.
+- id: ruview_nas_link_down
+  alias: "RuView: NAS link down"
+  description: "Nothing from the NAS bus has reached Home Assistant for 5 minutes."
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.ruview_watchdog_nas_link
+      to: "off"
+      for: "00:05:00"
+  actions:
+    - action: notify.mobile_app_iphone
+      data:
+        title: "RuView 与 NAS 断开"
+        message: "NAS 与 Home Assistant 之间的连接已断开 5 分钟，HA 里的 RuView 数值停在断开前。请检查 NAS 和 ruview-mosquitto 容器。"
+
+- id: ruview_nas_link_restored
+  alias: "RuView: NAS link restored"
+  description: "Follows a link-down push: the link was off for 5 minutes or more."
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.ruview_watchdog_nas_link
+      from: "off"
+      to: "on"
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() >= 300 }}
+  actions:
+    - action: notify.mobile_app_iphone
+      data:
+        title: "RuView 已恢复"
+        message: "NAS 与 Home Assistant 的连接已恢复"

@@ -354,6 +354,7 @@ def test_report_sorting_metrics_and_vitals_status():
     assert m["status_level"] == 2 and m["warning"] == 1 and m["info"] == 1
     assert m["check_node_3"] == 1 and m["check_node_1"] == 0
     assert "check_vitals_frozen" not in m  # unknown checks are left out
+    assert report["ha_link"] is None and "ha_link" not in m  # no NAS bus
 
     store.on_state({"vitals_present": False, "abstention_reason": "exactly_one_occupant_required"}, t + 125)
     status = C.vitals_status(cfg, store, t + 126)
@@ -509,6 +510,21 @@ def test_store_ignores_oversized_and_non_object_payloads():
     assert store.nodes_mqtt == {}
 
 
+def test_ha_link_from_the_bus_bridge():
+    cfg, store, wd = make()
+    store.rest = healthy_rest(T0)
+    bridge_alive(store, T0)
+    store.on_message("ruview/bus/ha_connected", b"1", T0)
+    report, _ = run(wd, store, T0)
+    assert report["ha_link"] is True and C.metrics(report)["ha_link"] == 1
+    store.on_message("ruview/bus/ha_connected", b"0", T0 + 1)
+    report, _ = run(wd, store, T0 + 1)
+    assert report["ha_link"] is False and C.metrics(report)["ha_link"] == 0
+    # A cleared retained topic (empty payload) means no bus bridge any more.
+    store.on_message("ruview/bus/ha_connected", b"", T0 + 2)
+    assert store.ha_link is None
+
+
 # ── Home Assistant discovery ─────────────────────────────────────────────
 
 def test_discovery_templates_render():
@@ -517,7 +533,14 @@ def test_discovery_templates_render():
     env.filters["tojson"] = lambda v: json.dumps(v)
     cfg, store, wd = make()
     configs = {json.loads(p)["unique_id"]: json.loads(p) for _, p in discovery_messages(cfg, wd.checks)}
-    assert len(configs) == 6 + len(wd.checks)
+    assert len(configs) == 7 + len(wd.checks)
+    link = configs["ruview_watchdog_nas_link"]
+    assert link["state_topic"] == "ruview/bus/ha_connected"
+    assert (link["payload_on"], link["payload_off"]) == ("1", "0")
+    assert link["device_class"] == "connectivity"
+    # Must not go unavailable with the watchdog: it matters most when the
+    # watchdog's own messages cannot reach Home Assistant.
+    assert "availability_topic" not in link and "availability" not in link
     node2 = configs["ruview_watchdog_check_node_2"]
     assert node2["name"] == "Node 2" and node2["device_class"] == "problem"
     tpl = env.from_string(node2["value_template"])
