@@ -91,6 +91,7 @@ class Store:
     persons_error: str | None = None
     recorder_avail: str | None = None
     recorder_status: dict[str, Any] | None = None
+    ha_link: bool | None = None         # bus bridge to HA's broker up (None: no bus)
     hr: Series = field(init=False)
     br: Series = field(init=False)
     occupied: Series = field(init=False)
@@ -114,6 +115,9 @@ class Store:
             return
         if topic == topics["recorder_avail"]:
             self.recorder_avail = payload.decode("utf-8", "replace").strip()
+            return
+        if topic == topics["ha_link"]:
+            self.ha_link = {b"1": True, b"0": False}.get(payload.strip())
             return
         if topic == topics["report"]:
             if self.prior_report is None:

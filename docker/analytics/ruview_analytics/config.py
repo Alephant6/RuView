@@ -116,6 +116,8 @@ class Config:
             "recorder_avail": f"{p}/recorder/availability",
             "recorder_status": f"{p}/recorder/status",
             "recorder_keep": f"{p}/recorder/keep",
+            # 1 / 0 from the NAS bus bridge (docker/mosquitto/start.sh)
+            "ha_link": f"{p}/bus/ha_connected",
         }
 
     @property
