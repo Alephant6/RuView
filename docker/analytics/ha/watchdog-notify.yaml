@@ -1,0 +1,77 @@
+# RuView data watchdog -> phone notifications (example automations).
+#
+# 1. Install the Home Assistant app on the phone and allow notifications.
+# 2. Replace notify.mobile_app_iphone below with the phone's notify action
+#    (Developer tools -> Actions, search "mobile_app").
+# 3. Paste into automations.yaml, or create each automation in the UI and
+#    switch the editor to YAML.
+#
+# Entity ids come from the MQTT device name "RuView Watchdog". If yours
+# differ, check Settings -> Devices & services -> MQTT -> RuView Watchdog.
+# Node entities follow EXPECTED_NODES; the "Presence vs Phones" entity only
+# exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog.
+
+- id: ruview_watchdog_problem
+  alias: "RuView: data problem"
+  description: "Push each newly raised warning or critical watchdog check."
+  mode: queued
+  triggers:
+    - trigger: state
+      entity_id: &ruview_checks
+        - binary_sensor.ruview_watchdog_sensing_server
+        - binary_sensor.ruview_watchdog_api_access
+        - binary_sensor.ruview_watchdog_bridge
+        - binary_sensor.ruview_watchdog_csi_source
+        - binary_sensor.ruview_watchdog_node_1
+        - binary_sensor.ruview_watchdog_node_2
+        - binary_sensor.ruview_watchdog_node_3
+        - binary_sensor.ruview_watchdog_vitals_frozen
+        - binary_sensor.ruview_watchdog_vitals_range
+        - binary_sensor.ruview_watchdog_calibration
+        - binary_sensor.ruview_watchdog_presence_vs_phones
+      to: "on"
+      not_from: "unavailable"
+  conditions:
+    # Only problems that started in the last 15 minutes: a Home Assistant or
+    # watchdog restart re-delivers old problems, which were already pushed.
+    - condition: template
+      value_template: >-
+        {{ state_attr(trigger.entity_id, 'severity') in ['warning', 'critical']
+           and (as_timestamp(now()) - (state_attr(trigger.entity_id, 'since_ts') or 0)) < 900 }}
+  actions:
+    - action: notify.mobile_app_iphone
+      data:
+        title: "RuView 数据异常"
+        message: "{{ state_attr(trigger.entity_id, 'summary') }}"
+        data:
+          push:
+            interruption-level: >-
+              {{ 'time-sensitive' if state_attr(trigger.entity_id, 'severity') == 'critical' else 'active' }}
+
+- id: ruview_watchdog_recovered
+  alias: "RuView: data problem cleared"
+  mode: queued
+  triggers:
+    - trigger: state
+      entity_id: *ruview_checks
+      from: "on"
+      to: "off"
+  actions:
+    - action: notify.mobile_app_iphone
+      data:
+        title: "RuView 已恢复"
+        message: "{{ state_attr(trigger.entity_id, 'friendly_name') }} 恢复正常"
+
+- id: ruview_watchdog_offline
+  alias: "RuView: watchdog offline"
+  description: "The watchdog itself stopped (its entities go unavailable)."
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.ruview_watchdog_problem
+      to: "unavailable"
+      for: "00:05:00"
+  actions:
+    - action: notify.mobile_app_iphone
+      data:
+        title: "RuView 看门狗离线"
+        message: "看门狗已经离线 5 分钟，这段时间的数据问题不会被发现。"

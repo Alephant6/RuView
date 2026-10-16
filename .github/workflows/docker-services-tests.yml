@@ -1,0 +1,51 @@
+name: Docker service tests (bridge, analytics)
+
+# Unit tests of the Python services the home NAS runs: the WS -> MQTT bridge
+# and the data watchdog (docker/analytics, WP0.4). Each folder is a
+# standalone container, so the tests run from inside it with its own
+# requirements; the repository-wide pytest settings do not apply.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/bridge/**'
+      - 'docker/analytics/**'
+      - '.github/workflows/docker-services-tests.yml'
+  pull_request:
+    paths:
+      - 'docker/bridge/**'
+      - 'docker/analytics/**'
+      - '.github/workflows/docker-services-tests.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [bridge, analytics]
+    defaults:
+      run:
+        working-directory: docker/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          # Same as the python:3.12-slim base image.
+          python-version: '3.12'
+
+      - name: Install
+        run: python -m pip install -r requirements.txt pytest jinja2
+
+      - name: Test
+        run: python -m pytest -q
