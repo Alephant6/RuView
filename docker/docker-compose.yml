@@ -214,8 +214,15 @@ services:
       # Minutes of raw CSI the csi-recorder keeps when a vitals or presence
       # problem is raised (0 = off).
       - KEEP_ON_RAISE_MIN=${KEEP_ON_RAISE_MIN:-20}
+      # Automatic empty-room calibration (off unless AUTOCAL_SOURCE_NODE is
+      # set; needs the phone-presence settings above and RUVIEW_API_TOKEN).
+      - AUTOCAL_SOURCE_NODE=${AUTOCAL_SOURCE_NODE:-}
+      - AUTOCAL_AWAY_MIN=${AUTOCAL_AWAY_MIN:-10}
+      - AUTOCAL_REFRESH_H=${AUTOCAL_REFRESH_H:-6}
+      - AUTOCAL_MAX_MOVING=${AUTOCAL_MAX_MOVING:-0.25}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    # Reads MQTT and REST and writes nothing to disk: no capabilities needed.
+    # Reads MQTT and REST (its only REST writes are the calibration calls)
+    # and writes nothing to disk: no capabilities needed.
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     read_only: true

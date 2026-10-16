@@ -65,6 +65,12 @@ def one_of_each(now: float) -> list[tuple[str, dict | str]]:
         ("ruview/annotation", {"kind": "tag", "label": "alcohol", "action": "mark",
                                "ts": ANNOTATION_TS_MS, "person": "sq", "source": "ha", "value": 1,
                                "text": "ci sample"}),
+        # The end of an automatic calibration (analytics autocal.py).
+        ("ruview/annotation", {"kind": "calibration", "label": "empty_room", "action": "done",
+                               "ts": ANNOTATION_TS_MS + 600_000, "person": "", "source": "watchdog",
+                               "value": 1, "source_node": 1, "text": "ci calibration", "elapsed_s": 600,
+                               "frame_count": 12000, "variance_explained": 0.93,
+                               "baseline_eigenvalue_count": 2}),
         (f"homeassistant/sensor/{dev}/heart_rate/state", {"bpm": 61.0, "confidence": 0.7, "ts": now}),
         (f"homeassistant/sensor/{dev}/person_count/state", {"n_persons": 1, "ts": now}),
         (f"homeassistant/sensor/{dev}/rssi/state", {"dbm": -60.0, "ts": now}),

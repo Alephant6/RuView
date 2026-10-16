@@ -102,6 +102,14 @@ class Config:
     # keep the raw CSI of this many seconds before it (0 = off).
     keep_on_raise_s: float = 1200.0
 
+    # ── automatic empty-room calibration (autocal.py) ───────────────────
+    # The node whose CSI the calibration is taken from; None switches
+    # automatic calibration off.
+    autocal_source_node: int | None = None
+    autocal_away_s: float = 600.0       # every phone away at least this long
+    autocal_refresh_s: float = 6 * 3600.0   # recalibrate a fresh one this old
+    autocal_max_moving: float = 0.25    # largest share of "moving" CSI states
+
     @property
     def topics(self) -> dict[str, str]:
         p = self.mqtt_prefix
@@ -118,11 +126,17 @@ class Config:
             "recorder_keep": f"{p}/recorder/keep",
             # 1 / 0 from the NAS bus bridge (docker/mosquitto/start.sh)
             "ha_link": f"{p}/bus/ha_connected",
+            # Same topic as the HA label buttons; Telegraf stores both.
+            "annotation": f"{p}/annotation",
         }
 
     @property
     def presence_enabled(self) -> bool:
         return bool(self.ha_url and self.ha_token and self.ha_persons)
+
+    @property
+    def autocal_enabled(self) -> bool:
+        return self.autocal_source_node is not None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
@@ -133,7 +147,14 @@ class Config:
         port_raw = env.get("MQTT_PORT", "1883").strip() or "1883"
         if not port_raw.isdigit() or not 0 < int(port_raw) < 65536:
             raise ConfigError(f"MQTT_PORT must be a TCP port, got {port_raw!r}")
-        return cls(
+        expected_nodes = _nodes(env.get("EXPECTED_NODES", "1,2,3"))
+        source_raw = env.get("AUTOCAL_SOURCE_NODE", "").strip()
+        source_node = None
+        if source_raw:
+            if not source_raw.isdigit() or int(source_raw) not in expected_nodes:
+                raise ConfigError(f"AUTOCAL_SOURCE_NODE must be one of EXPECTED_NODES, got {source_raw!r}")
+            source_node = int(source_raw)
+        cfg = cls(
             mqtt_host=env.get("MQTT_HOST", cls.mqtt_host).strip() or cls.mqtt_host,
             mqtt_port=int(port_raw),
             mqtt_user=env.get("MQTT_USER", ""),
@@ -146,9 +167,17 @@ class Config:
             ha_url=_http_url("HA_URL", env.get("HA_URL", "")),
             ha_token=env.get("HA_TOKEN", "").strip(),
             ha_persons=_entities(env.get("HA_PERSONS", "")),
-            expected_nodes=_nodes(env.get("EXPECTED_NODES", "1,2,3")),
+            expected_nodes=expected_nodes,
             check_interval_s=_float(env, "CHECK_INTERVAL_S", cls.check_interval_s, 5, 600),
             lang=lang,
             min_node_fps=_float(env, "MIN_NODE_FPS", cls.min_node_fps, 0, 1000),
             keep_on_raise_s=60 * _float(env, "KEEP_ON_RAISE_MIN", cls.keep_on_raise_s / 60, 0, 120),
+            autocal_source_node=source_node,
+            autocal_away_s=60 * _float(env, "AUTOCAL_AWAY_MIN", cls.autocal_away_s / 60, 1, 240),
+            autocal_refresh_s=3600 * _float(env, "AUTOCAL_REFRESH_H", cls.autocal_refresh_s / 3600, 1, 12),
+            autocal_max_moving=_float(env, "AUTOCAL_MAX_MOVING", cls.autocal_max_moving, 0, 1),
         )
+        if cfg.autocal_enabled and not cfg.presence_enabled:
+            raise ConfigError("AUTOCAL_SOURCE_NODE needs HA_URL, HA_TOKEN and HA_PERSONS: "
+                              "it calibrates only while every phone is away")
+        return cfg

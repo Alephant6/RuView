@@ -65,24 +65,34 @@
         title: "RuView 已恢复"
         message: "{{ state_attr(trigger.entity_id, 'friendly_name') }} 恢复正常"
 
+# The watchdog's entities go unavailable when it stops (its MQTT will) and
+# when its loop stalls (no report for 5 minutes: expire_after).
 - id: ruview_watchdog_offline
   alias: "RuView: watchdog offline"
-  description: "The watchdog itself stopped (its entities go unavailable)."
+  description: "The watchdog stopped or stalled (its entities went unavailable)."
   triggers:
     - trigger: state
       entity_id: binary_sensor.ruview_watchdog_problem
       to: "unavailable"
       for: "00:05:00"
+  conditions:
+    # With the NAS link down nothing from the NAS arrives, the watchdog's
+    # reports included; the NAS link automation below pushes that instead.
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: binary_sensor.ruview_watchdog_nas_link
+          state: "off"
   actions:
     - action: notify.mobile_app_iphone
       data:
         title: "RuView 看门狗离线"
-        message: "看门狗已经离线 5 分钟，这段时间的数据问题不会被发现。"
+        message: "看门狗已经 5 分钟以上没有更新，这段时间的数据问题不会被发现。"
 
 # NAS Link turns off when the bridge from the NAS bus to this broker drops.
-# Nothing from the NAS arrives then, so the watchdog automations above stay
-# quiet and every RuView entity keeps its last value instead of going
-# unavailable.
+# Nothing from the NAS arrives then, so the problem automations above stay
+# quiet: the RuView sensor values freeze at their last value and the
+# watchdog's entities go unavailable once their reports expire.
 - id: ruview_nas_link_down
   alias: "RuView: NAS link down"
   description: "Nothing from the NAS bus has reached Home Assistant for 5 minutes."

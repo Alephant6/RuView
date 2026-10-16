@@ -20,6 +20,11 @@ LOG = logging.getLogger("ruview-analytics.store")
 # MQTT payloads are small JSON objects; anything bigger is not ours.
 MAX_PAYLOAD_BYTES = 64 * 1024
 
+# The sensing-server's room motion levels (`ruview/state` motion_level).
+MOTION_LEVELS = ("absent", "present_still", "present_moving")
+# Automatic calibration looks back at most this far for movement.
+MOVING_WINDOW_S = 900.0
+
 
 def as_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
@@ -95,6 +100,7 @@ class Store:
     hr: Series = field(init=False)
     br: Series = field(init=False)
     occupied: Series = field(init=False)
+    moving: Series = field(init=False)  # 1 while the room motion level is "present_moving"
     # Previous run's report (retained topic), used to keep `since` stable
     # across watchdog restarts.
     prior_report: dict[str, Any] | None = None
@@ -103,6 +109,7 @@ class Store:
         self.hr = Series(self.cfg.vitals_window_s)
         self.br = Series(self.cfg.vitals_window_s)
         self.occupied = Series(self.cfg.presence_window_s)
+        self.moving = Series(MOVING_WINDOW_S)
 
     # ── MQTT ──────────────────────────────────────────────────────────────
     def on_message(self, topic: str, payload: bytes, now: float) -> None:
@@ -150,6 +157,9 @@ class Store:
         occ = occupancy(state)
         if occ is not None:
             self.occupied.add(now, 1.0 if occ else 0.0)
+        level = state.get("motion_level")
+        if level in MOTION_LEVELS:
+            self.moving.add(now, 1.0 if level == "present_moving" else 0.0)
 
     def bridge_last_seen(self) -> float | None:
         """Newest evidence that the bridge process is alive (epoch seconds)."""
