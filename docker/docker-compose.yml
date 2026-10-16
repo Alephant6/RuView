@@ -61,6 +61,10 @@ services:
       - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-192.168.1.0/24}
       - RUVIEW_UDP_INSECURE_LAN
       - RUVIEW_UDP_BIND
+      # Raw datagram copy for the csi-recorder below (ADR-380 udp tee):
+      # every admitted UDP datagram, unchanged, to loopback only. Set
+      # RUVIEW_UDP_TEE= (empty) in .env to switch it off.
+      - RUVIEW_UDP_TEE=${RUVIEW_UDP_TEE-127.0.0.1:5006}
       # Host-header allowlist (upstream host_validation): requests whose Host is
       # not loopback or listed here get HTTP 421. mqtt-bridge connects to
       # ws://192.168.1.195:3001 and browsers may use nas.local, so list both.
@@ -154,11 +158,52 @@ services:
       - HA_TOKEN
       - HA_PERSONS=${HA_PERSONS:-}
       - WATCHDOG_LANG=${WATCHDOG_LANG:-zh}
+      # Minutes of raw CSI the csi-recorder keeps when a vitals or presence
+      # problem is raised (0 = off).
+      - KEEP_ON_RAISE_MIN=${KEEP_ON_RAISE_MIN:-20}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     # Reads MQTT and REST and writes nothing to disk: no capabilities needed.
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     read_only: true
+    restart: unless-stopped
+
+  # ── Raw CSI recorder (docker/csi-recorder, WP0.5) ──────────────────────
+  # Writes every datagram the sensing-server tees to 127.0.0.1:5006 into
+  # hourly .csi.raw.gz files, keeps the last RING_HOURS, and copies ranges
+  # requested on ruview/recorder/keep (HA label buttons, watchdog) into
+  # permanent clips. Raw CSI is person data (ADR-299): it stays on this
+  # volume. The directory must be writable by uid 65534 (nobody):
+  #   mkdir -p data/csi && sudo chown 65534:65534 data/csi
+  csi-recorder:
+    build:
+      context: ./csi-recorder
+      dockerfile: Dockerfile
+    image: ghcr.io/alephant6/ruview-csi-recorder:${IMAGE_TAG:-latest}
+    container_name: ruview-csi-recorder
+    # Host network: the tee sends to the host's loopback.
+    network_mode: host
+    environment:
+      - RECORDER_LISTEN=${RECORDER_LISTEN:-127.0.0.1:5006}
+      - RING_HOURS=${RING_HOURS:-72}
+      - RING_MAX_GB=${RING_MAX_GB:-20}
+      - MIN_FREE_GB=${MIN_FREE_GB:-2}
+      - KEEP_MAX_MIN=${KEEP_MAX_MIN:-120}
+      - KEEP_MAX_H_PER_DAY=${KEEP_MAX_H_PER_DAY:-2}
+      - MQTT_HOST=${MQTT_HOST:-homeassistant.local}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USER=${MQTT_USER:-}
+      - MQTT_PASS=${MQTT_PASS:-}
+      - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ${CSI_DATA_DIR:-./data/csi}:/data
+    # Writes only to /data; binds an unprivileged loopback port.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    # Lets an unfinished clip extraction stop cleanly; it resumes after a restart.
+    stop_grace_period: 30s
     restart: unless-stopped
 
   # ── InfluxDB 2.x ─────────────────────────────────────────────────────────

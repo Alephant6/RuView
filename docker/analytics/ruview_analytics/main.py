@@ -12,7 +12,7 @@ import time
 
 import paho.mqtt.client as mqtt
 
-from .checks import Watchdog, metrics
+from .checks import Watchdog, keep_requests, metrics
 from .config import Config, ConfigError
 from .ha import discovery_messages
 from .rest import poll_ha_persons, poll_sensing_server
@@ -42,7 +42,8 @@ def make_client(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watch
         for topic, payload in discovery_messages(cfg, watchdog.checks):
             c.publish(topic, payload, qos=1, retain=True)
         c.subscribe([(topics[key], 0) for key in
-                     ("bridge_avail", "bridge_status", "state", "nodes", "report")])
+                     ("bridge_avail", "bridge_status", "state", "nodes", "report",
+                      "recorder_avail", "recorder_status")])
 
     def on_disconnect(_c, _userdata, _flags, reason_code, _props=None):
         LOG.warning("MQTT disconnected, reason=%s; paho will reconnect", reason_code)
@@ -68,6 +69,7 @@ def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdo
         if cfg.presence_enabled:
             store.persons, store.persons_error = persons, persons_error
         report, transitions = watchdog.evaluate(store, time.time())
+        keeps = keep_requests(cfg, store, report, transitions)
     for check_id, change in transitions:
         entry = report["checks"][check_id]
         if change == "raised":
@@ -78,6 +80,9 @@ def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdo
         LOG.debug("HA persons: %s", persons_error)
     client.publish(cfg.topics["report"], json.dumps(report, ensure_ascii=False), qos=1, retain=True)
     client.publish(cfg.topics["metrics"], json.dumps(metrics(report)))
+    for request in keeps:
+        LOG.info("asking the csi-recorder to keep raw CSI: %s", request["tag"])
+        client.publish(cfg.topics["recorder_keep"], json.dumps(request, ensure_ascii=False), qos=1)
     return report
 
 

@@ -1,0 +1,258 @@
+# RuView labels (WP0.6): one-tap annotations and raw-CSI keep requests.
+#
+# Install as a Home Assistant package (Home Assistant 2024.10 or later, with
+# the MQTT integration that already carries the RuView entities):
+#   1. In configuration.yaml:
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   2. Copy this file to <config>/packages/ruview_labels.yaml, run
+#      Developer tools -> YAML -> Check configuration, then restart.
+#   3. Add a card (Edit dashboard -> Add card -> Manual):
+#        type: entities
+#        title: RuView 标注
+#        entities:
+#          - input_button.ruview_alcohol
+#          - input_button.ruview_sick
+#          - input_button.ruview_exercise
+#          - input_button.ruview_late_night
+#          - input_boolean.ruview_travel
+#          - input_boolean.ruview_guests
+#          - input_boolean.ruview_gt_session
+#          - input_button.ruview_report_wrong
+#          - input_button.ruview_keep_raw
+#          - input_text.ruview_change_note
+#          - input_button.ruview_log_change
+#
+# Every press or switch publishes one JSON message on ruview/annotation:
+#   {"kind": "tag" | "gt_session" | "change", "label": "alcohol",
+#    "action": "mark" | "start" | "stop", "ts": <epoch ms>, "person": "sq",
+#    "source": "ha", "value": 1, "text": "..." (changes only)}
+# Telegraf stores it in InfluxDB (measurement "annotation"), where Grafana and
+# the weekly/monthly reports read it.
+#
+# Raw CSI: "保留最近 10 分钟原始数据" and the end of a "独处静坐" session also
+# ask the csi-recorder (ruview/recorder/keep) to keep that time range of raw
+# CSI permanently. If the recorder refuses (daily budget, too long, ...), a
+# notification appears in Home Assistant.
+#
+# person: whoever pressed, as the object id of their person entity
+# (person.sq -> "sq"). Give the person entities the ids sq and ml (Settings ->
+# People -> person -> entity id). Presses from an automation or a shared
+# account are stored with an empty person, meaning the whole household.
+# Change notes are stored as typed: write sq/ml rather than names.
+
+input_button:
+  ruview_alcohol:
+    name: "喝酒"
+    icon: mdi:glass-wine
+  ruview_sick:
+    name: "生病"
+    icon: mdi:emoticon-sick-outline
+  ruview_exercise:
+    name: "剧烈运动"
+    icon: mdi:run-fast
+  ruview_late_night:
+    name: "熬夜"
+    icon: mdi:weather-night
+  ruview_report_wrong:
+    name: "报告有误"
+    icon: mdi:file-alert-outline
+  ruview_keep_raw:
+    name: "保留最近 10 分钟原始数据"
+    icon: mdi:content-save-outline
+  ruview_log_change:
+    name: "记录变更"
+    icon: mdi:wrench-outline
+
+input_boolean:
+  ruview_travel:
+    name: "出差"
+    icon: mdi:airplane
+  ruview_guests:
+    name: "来客人"
+    icon: mdi:account-group
+  ruview_gt_session:
+    name: "独处静坐"
+    icon: mdi:meditation
+
+input_text:
+  ruview_change_note:
+    name: "变更说明（挪节点、刷固件、标定……）"
+    max: 200
+    icon: mdi:note-edit-outline
+
+automation:
+  - id: ruview_label_mark
+    alias: "RuView: label button"
+    description: "Publish an annotation when a RuView label button is pressed."
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - input_button.ruview_alcohol
+          - input_button.ruview_sick
+          - input_button.ruview_exercise
+          - input_button.ruview_late_night
+          - input_button.ruview_report_wrong
+          - input_button.ruview_keep_raw
+    conditions:
+      # A press changes the button's timestamp; a restart or reload restores it.
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state != 'unavailable'
+             and trigger.to_state.state not in ['unavailable', 'unknown'] }}
+    actions:
+      - variables:
+          label: "{{ trigger.entity_id.split('.')[1] | replace('ruview_', '', 1) }}"
+          person: >-
+            {%- set uid = trigger.to_state.context.user_id -%}
+            {%- set ns = namespace(id='') -%}
+            {%- for p in states.person if uid and p.attributes.user_id == uid -%}
+              {%- set ns.id = p.object_id -%}
+            {%- endfor -%}
+            {{ ns.id }}
+          ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
+      - action: mqtt.publish
+        data:
+          topic: ruview/annotation
+          qos: 1
+          payload: >-
+            {{ {'kind': 'tag', 'label': label, 'action': 'mark', 'ts': ts,
+                'person': person, 'source': 'ha', 'value': 1} | to_json }}
+      - if:
+          - condition: template
+            value_template: "{{ label == 'keep_raw' }}"
+        then:
+          - action: mqtt.publish
+            data:
+              topic: ruview/recorder/keep
+              qos: 1
+              payload: >-
+                {{ {'tag': 'keep_raw', 'last_s': 600, 'person': person,
+                    'source': 'ha', 'note': 'HA 按钮：保留最近 10 分钟'} | to_json }}
+
+  - id: ruview_label_switch
+    alias: "RuView: label switch"
+    description: "Publish start/stop annotations; keep the raw CSI of a quiet-sitting session."
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: &ruview_switches
+          - input_boolean.ruview_travel
+          - input_boolean.ruview_guests
+          - input_boolean.ruview_gt_session
+        from: "off"
+        to: "on"
+        id: start
+      - trigger: state
+        entity_id: *ruview_switches
+        from: "on"
+        to: "off"
+        id: stop
+    actions:
+      - variables:
+          label: "{{ trigger.entity_id.split('.')[1] | replace('ruview_', '', 1) }}"
+          # The person who switched it on owns the session, also for the stop.
+          person: >-
+            {%- set st = trigger.to_state if trigger.id == 'start' else trigger.from_state -%}
+            {%- set uid = st.context.user_id -%}
+            {%- set ns = namespace(id='') -%}
+            {%- for p in states.person if uid and p.attributes.user_id == uid -%}
+              {%- set ns.id = p.object_id -%}
+            {%- endfor -%}
+            {{ ns.id }}
+          ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
+          started: "{{ as_timestamp(trigger.from_state.last_changed) }}"
+          ended: "{{ as_timestamp(trigger.to_state.last_changed) }}"
+      - action: mqtt.publish
+        data:
+          topic: ruview/annotation
+          qos: 1
+          payload: >-
+            {{ {'kind': 'gt_session' if label == 'gt_session' else 'tag', 'label': label,
+                'action': trigger.id, 'ts': ts, 'person': person, 'source': 'ha',
+                'value': 1} | to_json }}
+      - if:
+          - condition: template
+            value_template: >-
+              {{ trigger.id == 'stop' and label == 'gt_session' and ended - started >= 60 }}
+        then:
+          - action: mqtt.publish
+            data:
+              topic: ruview/recorder/keep
+              qos: 1
+              payload: >-
+                {{ {'tag': 'gt_session', 'start': started, 'end': ended, 'person': person,
+                    'source': 'ha', 'note': '独处静坐'} | to_json }}
+
+  - id: ruview_gt_session_timeout
+    alias: "RuView: end a long quiet-sitting session"
+    description: "The recorder keeps at most 2 hours per clip, so end the session before that."
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.ruview_gt_session
+        to: "on"
+        for: "01:55:00"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.ruview_gt_session
+
+  - id: ruview_label_change
+    alias: "RuView: log a change"
+    description: "Publish the change note (moved a node, flashed firmware, ...) and clear it."
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: input_button.ruview_log_change
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.from_state is not none
+             and trigger.from_state.state != 'unavailable'
+             and trigger.to_state.state not in ['unavailable', 'unknown']
+             and states('input_text.ruview_change_note') | trim | length > 0 }}
+    actions:
+      - variables:
+          person: >-
+            {%- set uid = trigger.to_state.context.user_id -%}
+            {%- set ns = namespace(id='') -%}
+            {%- for p in states.person if uid and p.attributes.user_id == uid -%}
+              {%- set ns.id = p.object_id -%}
+            {%- endfor -%}
+            {{ ns.id }}
+          ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
+          text: "{{ states('input_text.ruview_change_note') | trim }}"
+      - action: mqtt.publish
+        data:
+          topic: ruview/annotation
+          qos: 1
+          payload: >-
+            {{ {'kind': 'change', 'label': 'change', 'action': 'mark', 'ts': ts,
+                'person': person, 'source': 'ha', 'text': text, 'value': 1} | to_json }}
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.ruview_change_note
+        data:
+          value: ""
+
+  - id: ruview_keep_refused
+    alias: "RuView: raw CSI not kept"
+    description: "Show a notification when the csi-recorder refuses or fails a keep request."
+    mode: queued
+    triggers:
+      - trigger: mqtt
+        topic: ruview/recorder/keep/result
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.payload_json is defined
+             and trigger.payload_json.status in ['rejected', 'failed'] }}
+    actions:
+      - action: persistent_notification.create
+        data:
+          title: "RuView 原始数据没有保存"
+          message: >-
+            {{ trigger.payload_json.tag | default('?') }}：{{ trigger.payload_json.error | default('') }}
+          notification_id: "ruview_keep_{{ trigger.payload_json.id | default('request') }}"

@@ -1,13 +1,14 @@
 # RuView docker stack
 
-Six containers, one network namespace for the sensing-server (host) and
-one bridge network (`ruview-data`) for the persistence + visualisation layer.
+Seven containers, the host network for the sensing-server and the
+csi-recorder, and one bridge network (`ruview-data`) for the persistence +
+visualisation layer.
 
 ```
 ┌─ host network ─────────────────────────────────────────┐
 │  ESP32 nodes ──UDP:5005──▶ sensing-server (3000/3001)  │
-│                                  │                      │
-│                                  ▼ WebSocket            │
+│  csi-recorder ◀── udp tee :5006 ─┤                     │
+│                                  ▼ WebSocket           │
 │  mqtt-bridge ───────────▶ HA Mosquitto (LAN: 1883)     │
 │  analytics (watchdog) ◀── REST 3000 + MQTT ──▶ HA       │
 └────────────────────────────────────│────────────────────┘
@@ -30,7 +31,8 @@ one bridge network (`ruview-data`) for the persistence + visualisation layer.
 |---------|-------|-----------|--------------|
 | `sensing-server` | local build (Dockerfile.rust) | 3000, 3001, 5005/udp | Rust DSP pipeline, eats CSI, emits SensingUpdate on WS |
 | `mqtt-bridge` | local build (bridge/Dockerfile) | — | WS → MQTT translator + HA Discovery |
-| `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration → HA "RuView Watchdog" entities |
+| `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities |
+| `csi-recorder` | local build (csi-recorder/Dockerfile) | — (loopback 5006/udp) | Raw datagrams from the server's UDP tee: 72 h rolling files plus permanent labelled clips (`docker/data/csi`) |
 | `influxdb` | `influxdb:2.7` | 8086 | Time-series store |
 | `telegraf` | `telegraf:1.30` | — | MQTT → InfluxDB ingest |
 | `grafana` | `grafana/grafana:11.2.0` | 3030 | Dashboards (auto-provisioned) |
@@ -87,6 +89,10 @@ sudo docker compose logs influxdb | grep -i "Setup complete"
 | `ruview/bridge` (retained) | mqtt-bridge | every 10 s and on change | WS connected, source, age of the last new tick, message rates |
 | `ruview/watchdog/state` (retained) | analytics | every 30 s | full watchdog report; HA entities read it |
 | `ruview/watchdog/metrics` | analytics | every 30 s | flat numbers for Telegraf (`watchdog` measurement) |
+| `ruview/recorder/status` (retained) | csi-recorder | every 30 s | datagram rates per kind and node, ring size and age, free disk, keep budget (`recorder` measurement) |
+| `ruview/recorder/keep` | HA label buttons, analytics | on request | keep a time range of raw CSI permanently |
+| `ruview/recorder/keep/result` | csi-recorder | per request | accepted / rejected / kept / empty / failed (`recorder_keep` measurement) |
+| `ruview/annotation` | HA label buttons | on press | alcohol, sick, travel, quiet sitting, changes, ... (`annotation` measurement, stored at the press time) |
 
 The sensing-server re-sends its latest update at 10 Hz even when the ESP32s
 are gone (as `esp32:offline`). The bridge drops those repeats, so a stalled

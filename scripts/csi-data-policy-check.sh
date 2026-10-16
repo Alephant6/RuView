@@ -12,6 +12,7 @@
 # WHAT IT FLAGS:
 #   * `*.csi.jsonl`      — raw CSI capture stream (person data)
 #   * `*.csi.meta.json`  — capture sidecar metadata
+#   * `*.csi.raw.gz`     — raw datagram recording (docker/csi-recorder)
 #   * `*.jsonl` larger than CSI_POLICY_MAX_JSONL_BYTES (~5 MB default) — a
 #     capture-sized JSONL blob that almost never belongs in git.
 #
@@ -117,6 +118,8 @@ classify() {
   case "$f" in
     *.csi.jsonl)     echo "CSI capture stream (*.csi.jsonl)"; return 0 ;;
     *.csi.meta.json) echo "CSI capture metadata (*.csi.meta.json)"; return 0 ;;
+    *.csi.raw.gz|*.csi.raw.gz.part)
+                     echo "raw CSI datagram recording (*.csi.raw.gz)"; return 0 ;;
   esac
   case "$f" in
     *.jsonl)
@@ -205,6 +208,7 @@ self_test() {
   mkdir -p "$tmp/fixtures"
   printf '{"csi":[1,2,3]}\n' > "$tmp/real.csi.jsonl"
   printf '{"schema":1}\n'     > "$tmp/real.csi.meta.json"
+  printf 'RVCSIRAW'           > "$tmp/ring.csi.raw.gz"
   printf '{"note":"ok"}\n'    > "$tmp/small.jsonl"
   printf '{"synthetic":true}\n' > "$tmp/fixtures/synthetic.csi.jsonl"
   # Oversized JSONL: 40 bytes, checked against a 10-byte threshold below.
@@ -224,6 +228,10 @@ self_test() {
   # 2. A *.csi.meta.json must be blocked.
   rc=0; printf '%s\n' "$tmp/real.csi.meta.json" | scan_stdin >/dev/null 2>&1 || rc=$?
   assert "blocks *.csi.meta.json" 1 "$rc"
+
+  # 2b. A csi-recorder file (*.csi.raw.gz) must be blocked.
+  rc=0; printf '%s\n' "$tmp/ring.csi.raw.gz" | scan_stdin >/dev/null 2>&1 || rc=$?
+  assert "blocks *.csi.raw.gz" 1 "$rc"
 
   # 3. A small, ordinary .jsonl must pass.
   rc=0; printf '%s\n' "$tmp/small.jsonl" | scan_stdin >/dev/null 2>&1 || rc=$?

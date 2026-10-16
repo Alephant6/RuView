@@ -1,9 +1,10 @@
-name: Docker service tests (bridge, analytics)
+name: Docker service tests (bridge, analytics, csi-recorder)
 
-# Unit tests of the Python services the home NAS runs: the WS -> MQTT bridge
-# and the data watchdog (docker/analytics, WP0.4). Each folder is a
-# standalone container, so the tests run from inside it with its own
-# requirements; the repository-wide pytest settings do not apply.
+# Unit tests of the Python services the home NAS runs: the WS -> MQTT bridge,
+# the data watchdog (docker/analytics, WP0.4) and the raw CSI recorder
+# (docker/csi-recorder, WP0.5). Each folder is a standalone container, so the
+# tests run from inside it with its own requirements; the repository-wide
+# pytest settings do not apply.
 
 on:
   push:
@@ -11,11 +12,15 @@ on:
     paths:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
+      - 'docker/csi-recorder/**'
+      - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
   pull_request:
     paths:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
+      - 'docker/csi-recorder/**'
+      - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
   workflow_dispatch: {}
 
@@ -30,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [bridge, analytics]
+        service: [bridge, analytics, csi-recorder]
     defaults:
       run:
         working-directory: docker/${{ matrix.service }}

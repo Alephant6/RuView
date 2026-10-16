@@ -20,6 +20,7 @@ It only reads: MQTT topics from the bridge, the sensing-server REST API
 | `ruview/bridge` | bridge stream health: WS connected, source, age of the last new tick, rates |
 | `ruview/state` | room state: HR/BR (null when withheld), presence, calibrated person count |
 | `ruview/nodes/<id>` | per-node fps / stale flag (fallback for old servers) |
+| `ruview/recorder/status`, `ruview/recorder/availability` | csi-recorder health (WP0.5) |
 | `GET /health`, `/api/v1/status`, `/api/v1/stream/status`, `/api/v1/nodes`, `/api/v1/calibration/status` | server reachability, source state, per-node CSI fps, calibration state |
 | `GET <HA_URL>/api/states/<person>` | optional: who is home |
 
@@ -35,11 +36,18 @@ It only reads: MQTT topics from the bridge, the sensing-server REST API
 | Vitals Frozen | ≥ 100 samples over ≥ 10 min with ≤ 2 distinct values | warning | — |
 | Vitals Range | > 5 % of HR outside 35–180 or BR outside 4–40 | warning | — |
 | Calibration | stale (info), or none/expired/bootstrap-only (warning) | info / warning | — |
+| Recorder | csi-recorder offline, status silent > 90 s, disk low (recording paused), write errors, or no datagrams for > 60 s while nodes are sending | warning | 120 s |
 | Presence vs Phones | all phones away ≥ 1 h but occupied > 80 % of the last 30 min | warning | — |
 
 Node checks are held while the server or the source is down, so one outage
 sends one notification. Every check also needs its condition to be gone for
-a while before it clears.
+a while before it clears. The Recorder check stays unknown until a
+csi-recorder has published once.
+
+When Vitals Frozen, Vitals Range or Presence vs Phones is raised and a
+csi-recorder is running, the watchdog asks it (`ruview/recorder/keep`) to
+keep the raw CSI of the previous `KEEP_ON_RAISE_MIN` minutes, so the data
+behind the problem can be replayed after a fix.
 
 ## Outputs
 
@@ -47,12 +55,15 @@ a while before it clears.
   issues, each check's state, summary, severity and start time.
 - `ruview/watchdog/metrics`: flat numbers for Telegraf / Grafana.
 - `ruview/watchdog/availability`: `online` / `offline` (LWT).
+- `ruview/recorder/keep`: keep requests for raised vitals/presence problems.
 - Home Assistant entities under the device **RuView Watchdog**: Problem,
   Status, Open Issues, Top Issue, CSI Vitals, Last Check, and one problem
   sensor per check.
 
 `ha/watchdog-notify.yaml` has example automations that push new problems
 and recoveries to a phone, and alert when the watchdog itself is offline.
+`ha/ruview-labels.yaml` is the Home Assistant package with the label
+buttons (alcohol, sick, quiet sitting, change log, ...), see WP0.6.
 
 ## Configuration
 
@@ -67,6 +78,7 @@ and recoveries to a phone, and alert when the watchdog itself is offline.
 | `CHECK_INTERVAL_S` | `30` | |
 | `HA_URL` / `HA_TOKEN` / `HA_PERSONS` | — | enable the phone check, e.g. `person.alice,person.bob` |
 | `WATCHDOG_LANG` | `zh` | `zh` or `en` for summaries |
+| `KEEP_ON_RAISE_MIN` | `20` | raw CSI minutes to keep on a vitals/presence problem; `0` = off |
 
 `HA_TOKEN` is a long-lived access token; keep it in `docker/.env` only.
 

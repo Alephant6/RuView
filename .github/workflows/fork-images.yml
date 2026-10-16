@@ -63,6 +63,11 @@ jobs:
             file: docker/analytics/Dockerfile
             submodules: false
             free_disk: false
+          - name: csi-recorder
+            context: docker/csi-recorder
+            file: docker/csi-recorder/Dockerfile
+            submodules: false
+            free_disk: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -151,6 +156,26 @@ jobs:
           rc=0
           docker run --rm -e RUVIEW_HTTP=ftp://example.invalid "$IMAGE" || rc=$?
           test "$rc" -eq 2
+
+      - name: Smoke-test csi-recorder
+        if: matrix.name == 'csi-recorder'
+        run: |
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          docker run --rm "$IMAGE" export --help >/dev/null
+          # The entrypoint must refuse a LAN-facing listen address with exit code 2.
+          rc=0
+          docker run --rm -e RECORDER_LISTEN=0.0.0.0:5006 "$IMAGE" || rc=$?
+          test "$rc" -eq 2
+          # As uid 65534 it records into the image's /data (no MQTT here).
+          docker run -d --name rec --network host -e MQTT_HOST= -e FLUSH_INTERVAL_S=1 \
+            -e RECORDER_LISTEN=127.0.0.1:5996 "$IMAGE"
+          sleep 2
+          python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); [s.sendto(b'\x01\x00\x11\xc5\x01' + bytes(20), ('127.0.0.1', 5996)) for _ in range(20)]"
+          sleep 4
+          docker exec rec python -m csi_recorder info --data-dir /data
+          docker exec rec python -m csi_recorder export /data/ring --all | wc -l | grep -qx 20
+          docker logs rec 2>&1 | tail -20
+          docker stop rec
 
       - name: Summary
         run: |
