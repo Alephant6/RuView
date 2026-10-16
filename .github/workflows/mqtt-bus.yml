@@ -54,6 +54,11 @@ jobs:
       - name: Install the MQTT client
         run: python -m pip install 'paho-mqtt>=2.1.0'
 
+      # The image has mosquitto.conf and start.sh baked in: build it from
+      # this checkout so compose does not pull the published one.
+      - name: Build the bus image
+        run: docker compose build mosquitto
+
       - name: Generate a throwaway password for the test broker
         run: |
           value="$(openssl rand -hex 24)"
@@ -68,9 +73,7 @@ jobs:
           refused() {
             name="$1"
             shift
-            docker run -d --name "$name" --user 1883:1883 \
-              -v "$PWD/mosquitto:/mosquitto/config:ro" "$@" \
-              "$image" sh /mosquitto/config/start.sh > /dev/null
+            docker run -d --name "$name" --user 1883:1883 "$@" "$image" > /dev/null
             code="$(timeout 20 docker wait "$name" || echo running)"
             docker logs "$name" 2>&1 | tail -n 1
             docker rm -f "$name" > /dev/null

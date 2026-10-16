@@ -13,10 +13,13 @@ services:
   # reach the bus as mosquitto:1883 on the ruview-bus network, host-network
   # services on 127.0.0.1:${MQTT_BUS_PORT:-1883}. See mosquitto/README.md.
   mosquitto:
-    image: eclipse-mosquitto:2.0.22
+    # eclipse-mosquitto with mosquitto.conf and start.sh baked in.
+    build:
+      context: ./mosquitto
+      dockerfile: Dockerfile
+    image: ghcr.io/alephant6/ruview-mosquitto:${IMAGE_TAG:-latest}
     container_name: ruview-mosquitto
     restart: unless-stopped
-    command: ["sh", "/mosquitto/config/start.sh"]
     networks:
       - ruview-bus
     ports:
@@ -32,7 +35,6 @@ services:
       - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
       - HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX:-homeassistant}
     volumes:
-      - ./mosquitto:/mosquitto/config:ro
       # Retained messages and queued messages for the bridge.
       - mosquitto-data:/mosquitto/data
     # The image's mosquitto user owns /mosquitto/data; start.sh writes the
@@ -233,8 +235,9 @@ services:
   # hourly .csi.raw.gz files, keeps the last RING_HOURS, and copies ranges
   # requested on ruview/recorder/keep (HA label buttons, watchdog) into
   # permanent clips. Raw CSI is person data (ADR-299): it stays on this
-  # volume. The directory must be writable by uid 65534 (nobody):
-  #   mkdir -p data/csi && sudo chown 65534:65534 data/csi
+  # volume. The directory must be writable by uid 65534 (nobody); without
+  # sudo, and with ./data owned by root (the sensing-server mounts it):
+  #   docker run --rm -v "$PWD/data:/d" alpine:3.20 sh -c 'mkdir -p /d/csi && chown 65534:65534 /d/csi'
   csi-recorder:
     build:
       context: ./csi-recorder
@@ -303,6 +306,7 @@ services:
   # unless PG_BIND says otherwise. This is the Timescale License build: the
   # -oss images lack compression, continuous aggregates and policies.
   timescaledb:
+    # Keep the tag in step with timescaledb/Dockerfile (db-migrate).
     image: timescale/timescaledb:2.30.2-pg17
     container_name: ruview-timescaledb
     restart: unless-stopped
@@ -341,13 +345,16 @@ services:
   # .env, then exits. Runs at every `docker compose up -d`; on its own:
   #   docker compose run --rm db-migrate
   db-migrate:
-    image: timescale/timescaledb:2.30.2-pg17
+    # The timescaledb image with migrate.sh and the migrations baked in.
+    build:
+      context: ./timescaledb
+      dockerfile: Dockerfile
+    image: ghcr.io/alephant6/ruview-db-migrate:${IMAGE_TAG:-latest}
     depends_on:
       timescaledb:
         condition: service_healthy
     networks:
       - ruview-data
-    entrypoint: ["bash", "/migrate/migrate.sh"]
     user: postgres
     environment:
       - PGHOST=timescaledb
@@ -357,8 +364,6 @@ services:
       - PG_ANALYTICS_PASSWORD
       - PG_GRAFANA_PASSWORD
       - PG_LLM_RO_PASSWORD
-    volumes:
-      - ./timescaledb:/migrate:ro
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     read_only: true

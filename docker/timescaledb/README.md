@@ -77,7 +77,7 @@ cd docker
 #   PG_TELEGRAF_PASSWORD=...
 #   PG_GRAFANA_PASSWORD=...
 # Optional, before the first start: PG_MEMORY=1GB, PG_CPUS=2 (see Sizing)
-docker compose pull timescaledb telegraf
+docker compose pull timescaledb db-migrate telegraf
 docker compose up -d timescaledb db-migrate telegraf
 ```
 
@@ -104,6 +104,11 @@ stops when a recorded file changed. Inside the transaction a continuous
 aggregate must be created `WITH NO DATA`. db-migrate runs at every
 `docker compose up -d`, or on its own with `docker compose run --rm db-migrate`.
 
+`migrate.sh` and the migrations are baked into the db-migrate image
+(`Dockerfile`, built by `fork-images.yml` as `ruview-db-migrate`), so a new
+migration reaches the NAS with the next `IMAGE_TAG`. Locally, run
+`docker compose build db-migrate` after changing one.
+
 ## Querying
 
 On the NAS: `docker compose exec timescaledb psql -U postgres ruview`.
@@ -111,9 +116,9 @@ From another machine, the port listens on the NAS loopback only
 (`PG_BIND=127.0.0.1`), so use a tunnel and the read-only role:
 
 ```bash
-# The NAS end is PG_PORT from docker/.env (5434 on the home NAS, whose own
-# PostgreSQL holds 5432 and 5433).
-ssh -N -L 5432:127.0.0.1:5434 <user>@192.168.1.195
+# The NAS end is PG_PORT from docker/.env (5455 on the home NAS, whose own
+# services hold 5432 to 5434, 5437 and 5440).
+ssh -N -L 5432:127.0.0.1:5455 <user>@192.168.1.195
 psql "host=127.0.0.1 dbname=ruview user=grafana"
 ```
 
