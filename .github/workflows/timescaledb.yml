@@ -53,6 +53,11 @@ jobs:
       - name: Start TimescaleDB (compose service)
         run: docker compose up -d --wait timescaledb
 
+      # The image has migrate.sh and the migrations baked in: build it from
+      # this checkout so compose does not pull the published one.
+      - name: Build the db-migrate image
+        run: docker compose build db-migrate
+
       - name: Apply migrations
         run: docker compose run --rm db-migrate
 
@@ -64,6 +69,7 @@ jobs:
       - name: Refuse an edited migration
         run: |
           echo "-- edited after it was applied" >> timescaledb/migrations/001_roles_and_schemas.sql
+          docker compose build db-migrate
           if docker compose run --rm db-migrate; then
             echo "an edited migration was accepted"
             exit 1

@@ -15,6 +15,10 @@ broker from `MQTT_HOST`, `MQTT_PORT`, `MQTT_USER` and `MQTT_PASS` in
 the values cannot change the generated config. An empty `MQTT_HOST` runs the
 bus without the bridge.
 
+Both files are baked into the `ruview-mosquitto` image (`Dockerfile`, built
+by `fork-images.yml`), so the broker reads nothing from the NAS checkout and a
+change reaches the NAS with the next `IMAGE_TAG`.
+
 ## What crosses the bridge
 
 | Direction | Topics |
