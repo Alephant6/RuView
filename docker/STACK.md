@@ -1,8 +1,8 @@
 # RuView docker stack
 
-Seven containers, the host network for the sensing-server and the
-csi-recorder, and one bridge network (`ruview-data`) for the persistence +
-visualisation layer.
+Nine containers (db-migrate exits once the database migrations are
+applied), the host network for the sensing-server and the csi-recorder, and
+one bridge network (`ruview-data`) for the persistence + visualisation layer.
 
 ```
 ┌─ host network ─────────────────────────────────────────┐
@@ -14,15 +14,16 @@ visualisation layer.
 └────────────────────────────────────│────────────────────┘
                                      │ MQTT subscribe
                                      ▼
-                              ┌─ ruview-data ─────────┐
-                              │  telegraf             │
-                              │     │ writes          │
-                              │     ▼                 │
-                              │  influxdb:8086 ──────┼──▶ exposed on host:8086
-                              │     ▲                 │
-                              │     │ reads           │
-                              │  grafana:3000  ──────┼──▶ exposed on host:3030
-                              └───────────────────────┘
+                              ┌─ ruview-data ─────────────────────┐
+                              │  telegraf                         │
+                              │     │ writes both (until WP1.5)   │
+                              │     ▼                             │
+                              │  influxdb:8086 ──────────────────┼──▶ exposed on host:8086
+                              │  timescaledb:5432 ◀── db-migrate ┼──▶ NAS loopback PG_PORT
+                              │     ▲                             │
+                              │     │ reads                       │
+                              │  grafana:3000  ──────────────────┼──▶ exposed on host:3030
+                              └───────────────────────────────────┘
 ```
 
 ## Services
@@ -33,8 +34,10 @@ visualisation layer.
 | `mqtt-bridge` | local build (bridge/Dockerfile) | — | WS → MQTT translator + HA Discovery |
 | `analytics` | local build (analytics/Dockerfile) | — | Data watchdog: nodes, CSI source, frozen vitals, calibration, recorder → HA "RuView Watchdog" entities |
 | `csi-recorder` | local build (csi-recorder/Dockerfile) | — (loopback 5006/udp) | Raw datagrams from the server's UDP tee: 72 h rolling files plus permanent labelled clips (`docker/data/csi`) |
-| `influxdb` | `influxdb:2.7` | 8086 | Time-series store |
-| `telegraf` | `telegraf:1.30` | — | MQTT → InfluxDB ingest |
+| `influxdb` | `influxdb:2.7` | 8086 | Time-series store, retired after WP1.5 |
+| `timescaledb` | `timescale/timescaledb:2.30.2-pg17` | 127.0.0.1:`PG_PORT` (5432) | Long-term SQL store: raw rows 14 days, per-minute and per-hour aggregates forever ([timescaledb/README.md](timescaledb/README.md)) |
+| `db-migrate` | same image | — | Applies `timescaledb/migrations` and the roles' passwords, then exits |
+| `telegraf` | `telegraf:1.39.3` | — | MQTT → InfluxDB + TimescaleDB ingest |
 | `grafana` | `grafana/grafana:11.2.0` | 3030 | Dashboards (auto-provisioned) |
 
 ## First-time bringup
@@ -61,13 +64,18 @@ INFLUXDB_TOKEN=ruview-local-dev-token-CHANGE-ME
 GRAFANA_USER=admin
 GRAFANA_PASSWORD=ruview-admin-CHANGE-ME
 GRAFANA_PORT=3030
+
+# TimescaleDB (required): generate each with `openssl rand -hex 24`
+POSTGRES_PASSWORD=
+PG_TELEGRAF_PASSWORD=
+PG_GRAFANA_PASSWORD=
 EOF
 
 # 2. Bring everything up
 sudo docker compose up -d --build
 
 # 3. First-boot verification
-sudo docker compose ps              # all five should be "running"
+sudo docker compose ps -a           # all "running" except db-migrate, "exited (0)"
 sudo docker compose logs telegraf | grep -i "Successfully connected"
 sudo docker compose logs influxdb | grep -i "Setup complete"
 
@@ -111,6 +119,15 @@ curl -sG --data-urlencode 'org=ruview' \
      http://<nas-ip>:8086/api/v2/query
 ```
 
+## Querying TimescaleDB
+
+```bash
+sudo docker compose exec timescaledb psql -U postgres ruview \
+  -c "SELECT bucket, n_live, hr_med, br_med FROM agg.state_1m ORDER BY bucket DESC LIMIT 10"
+```
+
+Tables, roles, retention and remote access: [timescaledb/README.md](timescaledb/README.md).
+
 ## Adding a custom dashboard
 
 1. Build it in Grafana UI.
@@ -121,9 +138,9 @@ curl -sG --data-urlencode 'org=ruview' \
 
 ## Persistence
 
-InfluxDB and Grafana use **named docker volumes** (`influxdb-data`,
-`influxdb-config`, `grafana-data`) so a `docker compose down` keeps your
-data. `docker compose down -v` will wipe them — don't do that if you care
+InfluxDB, TimescaleDB and Grafana use **named docker volumes**
+(`influxdb-data`, `influxdb-config`, `timescaledb-data`, `grafana-data`) so a
+`docker compose down` keeps your data. `docker compose down -v` will wipe them — don't do that if you care
 about history.
 
 ## Troubleshooting

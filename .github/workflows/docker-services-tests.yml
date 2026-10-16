@@ -4,7 +4,8 @@ name: Docker service tests (bridge, analytics, csi-recorder)
 # the data watchdog (docker/analytics, WP0.4) and the raw CSI recorder
 # (docker/csi-recorder, WP0.5). Each folder is a standalone container, so the
 # tests run from inside it with its own requirements; the repository-wide
-# pytest settings do not apply.
+# pytest settings do not apply. The bridge tests also check that the
+# TimescaleDB migrations have a column for every field it publishes (WP1.1).
 
 on:
   push:
@@ -13,6 +14,7 @@ on:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
       - 'docker/csi-recorder/**'
+      - 'docker/timescaledb/migrations/**'
       - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
   pull_request:
@@ -20,6 +22,7 @@ on:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
       - 'docker/csi-recorder/**'
+      - 'docker/timescaledb/migrations/**'
       - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
   workflow_dispatch: {}

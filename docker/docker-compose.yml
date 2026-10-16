@@ -233,11 +233,87 @@ services:
       - influxdb-data:/var/lib/influxdb2
       - influxdb-config:/etc/influxdb2
 
-  # ── Telegraf MQTT → InfluxDB ──────────────────────────────────────────────
-  # Subscribes to ruview/# on the same MQTT broker the HA bridge writes to,
-  # parses each JSON payload, and writes line-protocol points into InfluxDB.
+  # ── TimescaleDB (WP1.1) ──────────────────────────────────────────────────
+  # PostgreSQL 17 with TimescaleDB, the store that replaces InfluxDB; Telegraf
+  # writes to both until InfluxDB is retired (WP1.5). Tables, roles,
+  # aggregates and retention come from ./timescaledb/migrations, applied by
+  # db-migrate below (see timescaledb/README.md). Containers on ruview-data
+  # reach it as timescaledb:5432; on the NAS it listens on 127.0.0.1 only
+  # unless PG_BIND says otherwise. This is the Timescale License build: the
+  # -oss images lack compression, continuous aggregates and policies.
+  timescaledb:
+    image: timescale/timescaledb:2.30.2-pg17
+    container_name: ruview-timescaledb
+    restart: unless-stopped
+    networks:
+      - ruview-data
+    ports:
+      - "${PG_BIND:-127.0.0.1}:${PG_PORT:-5432}:5432"
+    environment:
+      # Superuser password, fixed when the volume is first created.
+      - POSTGRES_PASSWORD
+      - POSTGRES_DB=ruview
+      - TIMESCALEDB_TELEMETRY=off
+      # timescaledb-tune sizes Postgres for this much memory and CPU when the
+      # volume is first created.
+      - TS_TUNE_MEMORY=${PG_MEMORY:-1GB}
+      - TS_TUNE_NUM_CPUS=${PG_CPUS:-2}
+      - TS_TUNE_MAX_CONNS=40
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    shm_size: 256m
+    # The image's postgres user (uid 70) owns the data volume, so the server
+    # needs neither root nor any capability.
+    user: postgres
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # TCP, so the temporary server of the first start does not count.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "ruview"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    stop_grace_period: 60s
+
+  # Applies new ./timescaledb/migrations and the service roles' passwords from
+  # .env, then exits. Runs at every `docker compose up -d`; on its own:
+  #   docker compose run --rm db-migrate
+  db-migrate:
+    image: timescale/timescaledb:2.30.2-pg17
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - ruview-data
+    entrypoint: ["bash", "/migrate/migrate.sh"]
+    user: postgres
+    environment:
+      - PGHOST=timescaledb
+      - PGDATABASE=ruview
+      - POSTGRES_PASSWORD
+      - PG_TELEGRAF_PASSWORD
+      - PG_ANALYTICS_PASSWORD
+      - PG_GRAFANA_PASSWORD
+      - PG_LLM_RO_PASSWORD
+    volumes:
+      - ./timescaledb:/migrate:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    # A one-shot job: it exits once the migrations are applied.
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  # ── Telegraf MQTT → InfluxDB + TimescaleDB ───────────────────────────────
+  # Subscribes to ruview/# and the built-in publisher's topics on the same
+  # MQTT broker the HA bridge writes to, parses each JSON payload, and writes
+  # it to InfluxDB and to TimescaleDB (schema ingest). It does not wait for
+  # the database: if TimescaleDB is down, Telegraf keeps writing InfluxDB and
+  # retries it at every flush.
   telegraf:
-    image: telegraf:1.30
+    image: telegraf:1.39.3
     container_name: ruview-telegraf
     restart: unless-stopped
     depends_on:
@@ -256,6 +332,10 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-ruview-local-dev-token-change-me}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-sensing}
+      - PG_HOST=timescaledb
+      - PG_PORT=5432
+      - PG_DATABASE=ruview
+      - PG_TELEGRAF_PASSWORD
     volumes:
       - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
 
@@ -296,3 +376,4 @@ volumes:
   influxdb-data:
   influxdb-config:
   grafana-data:
+  timescaledb-data:

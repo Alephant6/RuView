@@ -1,0 +1,126 @@
+name: TimescaleDB schema and Telegraf ingest
+
+# WP1.1: the database service in docker/docker-compose.yml, its migrations
+# (docker/timescaledb) and the Telegraf config that writes to it. Starts the
+# compose timescaledb service, applies the migrations through the db-migrate
+# service twice (the second run must apply nothing) and checks that an edited
+# migration is refused. Then the pinned Telegraf image reads one synthetic
+# payload of every topic from a Mosquitto broker, and check.sql verifies the
+# rows, the continuous aggregates and the role privileges.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/timescaledb/**'
+      - 'docker/telegraf/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/timescaledb.yml'
+  pull_request:
+    paths:
+      - 'docker/timescaledb/**'
+      - 'docker/telegraf/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/timescaledb.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    name: migrations and ingest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: docker
+    env:
+      PG_PORT: '55432'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Generate throwaway passwords for the test database
+        run: |
+          for var in POSTGRES_PASSWORD PG_TELEGRAF_PASSWORD PG_GRAFANA_PASSWORD; do
+            value="$(openssl rand -hex 24)"
+            echo "::add-mask::$value"
+            echo "$var=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Start TimescaleDB (compose service)
+        run: docker compose up -d --wait timescaledb
+
+      - name: Apply migrations
+        run: docker compose run --rm db-migrate
+
+      - name: Re-run migrations (nothing left to apply)
+        run: |
+          docker compose run --rm db-migrate | tee "$RUNNER_TEMP/rerun.log"
+          grep -q " 0 migration(s) applied" "$RUNNER_TEMP/rerun.log"
+
+      - name: Refuse an edited migration
+        run: |
+          echo "-- edited after it was applied" >> timescaledb/migrations/001_roles_and_schemas.sql
+          if docker compose run --rm db-migrate; then
+            echo "an edited migration was accepted"
+            exit 1
+          fi
+          git checkout -- timescaledb/migrations/001_roles_and_schemas.sql
+
+      - name: Start Mosquitto and Telegraf
+        run: |
+          docker run -d --name mosquitto -p 127.0.0.1:1883:1883 eclipse-mosquitto:2.0.22 \
+            mosquitto -c /mosquitto-no-auth.conf
+          # Telegraf exits if the broker is not up when it starts.
+          for _ in $(seq 1 30); do
+            docker logs mosquitto 2>&1 | grep -q " running" && break
+            sleep 1
+          done
+          python3 timescaledb/tests/telegraf_test_conf.py telegraf/telegraf.conf > "$RUNNER_TEMP/telegraf.conf"
+          image="$(docker compose config --format json | jq -r '.services.telegraf.image')"
+          docker run -d --name telegraf --network host \
+            -v "$RUNNER_TEMP/telegraf.conf:/etc/telegraf/telegraf.conf:ro" \
+            -e MQTT_HOST=127.0.0.1 -e MQTT_PORT=1883 -e MQTT_USER= -e MQTT_PASS= \
+            -e MQTT_PREFIX=ruview -e HA_DISCOVERY_PREFIX=homeassistant \
+            -e PG_HOST=127.0.0.1 -e PG_PORT -e PG_DATABASE=ruview -e PG_TELEGRAF_PASSWORD \
+            "$image"
+          want="$(grep -c '^\[\[inputs.mqtt_consumer\]\]' telegraf/telegraf.conf)"
+          for _ in $(seq 1 60); do
+            [ "$(docker logs telegraf 2>&1 | grep -c 'Connected \[tcp://127.0.0.1:1883\]')" -ge "$want" ] && break
+            sleep 1
+          done
+          docker logs telegraf 2>&1 | tail -n 5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Publish one payload of every topic
+        run: |
+          python -m pip install 'paho-mqtt>=2.1.0'
+          python timescaledb/tests/publish_samples.py --port 1883 --seconds 5
+          # Telegraf flushes every second in the test config.
+          sleep 5
+
+      - name: Telegraf logged no errors or deprecated options
+        run: |
+          docker logs telegraf 2>&1 | tail -n 20
+          # A deprecated option is removed in a later Telegraf version, where
+          # the config would no longer load.
+          if docker logs telegraf 2>&1 | grep -E " E! | W! Deprecat"; then
+            exit 1
+          fi
+
+      - name: Check rows, aggregates and roles
+        run: >
+          docker compose exec -T timescaledb
+          psql -X -U postgres -d ruview -v ON_ERROR_STOP=1 -f - < timescaledb/tests/check.sql
+
+      - name: Logs
+        if: failure()
+        run: |
+          docker compose logs timescaledb | tail -n 50
+          docker logs telegraf 2>&1 | tail -n 50
