@@ -344,6 +344,27 @@ def rule_recorder(ctx: Ctx) -> Result:
     return Result(False, detail=detail)
 
 
+def rule_backup(ctx: Ctx) -> Result:
+    status = ctx.store.backup_status
+    if status is None:
+        return UNKNOWN                  # no backup service deployed
+    last_ok = as_number(status.get("last_ok_ts"))
+    # Before its first success, the service counts from its first start.
+    reference = last_ok if last_ok is not None else as_number(status.get("since_ts"))
+    if reference is None:
+        return UNKNOWN
+    detail = {key: status.get(key) for key in ("ok", "step", "snapshot", "last_ok_ts", "next_run_ts")
+              if key in status}
+    age = ctx.now - reference
+    if age <= ctx.cfg.backup_max_age_s:
+        return Result(False, detail=detail)
+    text = ctx.t("backup_old" if last_ok is not None else "backup_never", age=ctx.duration(age))
+    if status.get("ok") is False:
+        text += ctx.t("backup_error", step=str(status.get("step") or "?"),
+                      error=str(status.get("error") or "?")[:120])
+    return Result(True, "warning", text, detail)
+
+
 def rule_presence(ctx: Ctx) -> Result:
     cfg, persons = ctx.cfg, ctx.store.persons
     if not persons:
@@ -388,6 +409,7 @@ def default_checks(cfg: Config) -> list[Check]:
         Check("vitals_range", "Vitals Range", rule_vitals_range, clear_after_s=300),
         Check("calibration", "Calibration", rule_calibration, suppressed_by=("server",)),
         Check("recorder", "Recorder", rule_recorder, raise_after_s=120, clear_after_s=60),
+        Check("backup", "Backup", rule_backup),
     ]
     if cfg.presence_enabled:
         checks.append(Check("presence", "Presence vs Phones", rule_presence, clear_after_s=600))

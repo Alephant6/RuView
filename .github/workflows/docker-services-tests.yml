@@ -1,11 +1,12 @@
-name: Docker service tests (bridge, analytics, csi-recorder)
+name: Docker service tests (bridge, analytics, csi-recorder, backup)
 
 # Unit tests of the Python services the home NAS runs: the WS -> MQTT bridge,
-# the data watchdog (docker/analytics, WP0.4) and the raw CSI recorder
-# (docker/csi-recorder, WP0.5). Each folder is a standalone container, so the
-# tests run from inside it with its own requirements; the repository-wide
-# pytest settings do not apply. The bridge tests also check that the
-# TimescaleDB migrations have a column for every field it publishes (WP1.1).
+# the data watchdog (docker/analytics, WP0.4), the raw CSI recorder
+# (docker/csi-recorder, WP0.5) and the offsite backup (docker/backup, WP1.1).
+# Each folder is a standalone container, so the tests run from inside it with
+# its own requirements; the repository-wide pytest settings do not apply. The
+# bridge tests also check that the TimescaleDB migrations have a column for
+# every field it publishes (WP1.1).
 
 on:
   push:
@@ -14,6 +15,7 @@ on:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
       - 'docker/csi-recorder/**'
+      - 'docker/backup/**'
       - 'docker/timescaledb/migrations/**'
       - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
@@ -22,6 +24,7 @@ on:
       - 'docker/bridge/**'
       - 'docker/analytics/**'
       - 'docker/csi-recorder/**'
+      - 'docker/backup/**'
       - 'docker/timescaledb/migrations/**'
       - 'scripts/record-csi-udp.py'
       - '.github/workflows/docker-services-tests.yml'
@@ -38,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [bridge, analytics, csi-recorder]
+        service: [bridge, analytics, csi-recorder, backup]
     defaults:
       run:
         working-directory: docker/${{ matrix.service }}

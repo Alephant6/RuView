@@ -23,6 +23,7 @@ windows in memory and writes nothing to disk.
 | `ruview/state` | room state: HR/BR (null when withheld), presence, calibrated person count, motion level |
 | `ruview/nodes/<id>` | per-node fps / stale flag (fallback for old servers) |
 | `ruview/recorder/status`, `ruview/recorder/availability` | csi-recorder health (WP0.5) |
+| `ruview/backup/state` | result of the last offsite backup ([docker/backup](../backup/README.md)) |
 | `GET /health`, `/api/v1/status`, `/api/v1/stream/status`, `/api/v1/nodes`, `/api/v1/calibration/status` | server reachability, source state, per-node CSI fps, calibration state |
 | `GET <HA_URL>/api/states/<person>` | optional: who is home |
 
@@ -39,12 +40,14 @@ windows in memory and writes nothing to disk.
 | Vitals Range | > 5 % of HR outside 35–180 or BR outside 4–40 | warning | — |
 | Calibration | stale (info), or none/expired/bootstrap-only, or a CSI sequence fault on a bound node (warning) | info / warning | — |
 | Recorder | csi-recorder offline, status silent > 90 s, disk low (recording paused), write errors, or no datagrams for > 60 s while nodes are sending | warning | 120 s |
+| Backup | the last successful offsite backup is older than `BACKUP_MAX_AGE_H` (48 h), or the backup service has run that long without one; names the step the last run failed at | warning | — |
 | Presence vs Phones | all phones away ≥ 1 h but occupied > 80 % of the last 30 min | warning | — |
 
 Node checks are held while the server or the source is down, so one outage
 sends one notification. Every check also needs its condition to be gone for
 a while before it clears. The Recorder check stays unknown until a
-csi-recorder has published once.
+csi-recorder has published once, the Backup check until the backup service
+has.
 
 When Vitals Frozen, Vitals Range or Presence vs Phones is raised and a
 csi-recorder is running, the watchdog asks it (`ruview/recorder/keep`) to
@@ -131,6 +134,7 @@ buttons (alcohol, sick, quiet sitting, change log, ...), see WP0.6.
 | `HA_URL` / `HA_TOKEN` / `HA_PERSONS` | — | enable the phone check, e.g. `person.alice,person.bob` |
 | `WATCHDOG_LANG` | `zh` | `zh` or `en` for summaries |
 | `KEEP_ON_RAISE_MIN` | `20` | raw CSI minutes to keep on a vitals/presence problem; `0` = off |
+| `BACKUP_MAX_AGE_H` | `48` | hours since the last successful offsite backup before Backup is raised (1–720) |
 | `AUTOCAL_SOURCE_NODE` | — | node to take the automatic calibration from, one of `EXPECTED_NODES`; unset = off. Needs `HA_URL` / `HA_TOKEN` / `HA_PERSONS` |
 | `AUTOCAL_AWAY_MIN` | `10` | minutes every phone must be away before a capture (1–240) |
 | `AUTOCAL_REFRESH_H` | `6` | replace a fresh calibration this old (1–12; `12` = only once it is stale) |

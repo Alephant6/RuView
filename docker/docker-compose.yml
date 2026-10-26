@@ -214,6 +214,9 @@ services:
       # Minutes of raw CSI the csi-recorder keeps when a vitals or presence
       # problem is raised (0 = off).
       - KEEP_ON_RAISE_MIN=${KEEP_ON_RAISE_MIN:-20}
+      # Hours since the last successful offsite backup before "Backup" is
+      # raised (docker/backup).
+      - BACKUP_MAX_AGE_H=${BACKUP_MAX_AGE_H:-48}
       # Automatic empty-room calibration (off unless AUTOCAL_SOURCE_NODE is
       # set; needs the phone-presence settings above and RUVIEW_API_TOKEN).
       - AUTOCAL_SOURCE_NODE=${AUTOCAL_SOURCE_NODE:-}
@@ -356,6 +359,7 @@ services:
       - PG_TELEGRAF_PASSWORD
       - PG_ANALYTICS_PASSWORD
       - PG_GRAFANA_PASSWORD
+      - PG_BACKUP_PASSWORD
       - PG_LLM_RO_PASSWORD
     volumes:
       - ./timescaledb:/migrate:ro
@@ -436,6 +440,64 @@ services:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  # ── Offsite backup (docker/backup, WP1.1) ───────────────────────────────
+  # Every night: pg_dump of TimescaleDB and the Apple Health data of
+  # InfluxDB, encrypted by restic and uploaded to Backblaze B2; old snapshots
+  # are pruned and the repository is checked weekly. The result goes to
+  # ruview/backup/state, where the watchdog raises "Backup" when the last
+  # success is too old. Off unless COMPOSE_PROFILES includes backup; setup
+  # and restore in backup/README.md. The directory must be writable by
+  # uid 65534 (nobody), like the csi-recorder's.
+  backup:
+    profiles: [backup]
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    image: ghcr.io/alephant6/ruview-backup:${IMAGE_TAG:-latest}
+    container_name: ruview-backup
+    depends_on:
+      - timescaledb
+      - mosquitto
+    networks:
+      - ruview-data
+      - ruview-bus
+    environment:
+      - BACKUP_AT=${BACKUP_AT:-07:30}
+      - BACKUP_KEEP_DAILY=${BACKUP_KEEP_DAILY:-7}
+      - BACKUP_KEEP_WEEKLY=${BACKUP_KEEP_WEEKLY:-5}
+      - BACKUP_KEEP_MONTHLY=${BACKUP_KEEP_MONTHLY:-6}
+      - BACKUP_CHECK_SUBSET=${BACKUP_CHECK_SUBSET-5%}
+      # restic reads these itself: the repository in the B2 bucket, its
+      # password and the bucket's application key (S3 API).
+      - RESTIC_REPOSITORY
+      - RESTIC_PASSWORD
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_DEFAULT_REGION
+      # The read-only backup role (db-migrate gives it this password).
+      - PGHOST=timescaledb
+      - PGDATABASE=ruview
+      - PG_BACKUP_PASSWORD
+      # Apple Health export, off while the read token is empty.
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-sensing}
+      - INFLUXDB_BACKUP_TOKEN
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_PREFIX=${MQTT_PREFIX:-ruview}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ${BACKUP_DATA_DIR:-./data/backup}:/backup
+    # Writes only to /backup.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    # A run cut short by a stop leaves dump.partial and a stale restic lock;
+    # the next run removes both.
+    stop_grace_period: 30s
+    restart: unless-stopped
 
 networks:
   ruview-data:

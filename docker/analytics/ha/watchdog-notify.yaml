@@ -10,8 +10,9 @@
 # differ, check Settings -> Devices & services -> MQTT -> RuView Watchdog.
 # Node entities follow EXPECTED_NODES; the "Presence vs Phones" entity only
 # exists when HA_URL / HA_TOKEN / HA_PERSONS are set for the watchdog,
-# "Recorder" stays unknown until the csi-recorder runs, and "NAS Link" stays
-# unknown until the NAS bus (docker/mosquitto) runs.
+# "Recorder" stays unknown until the csi-recorder runs, "Backup" until the
+# offsite backup (docker/backup) runs, and "NAS Link" until the NAS bus
+# (docker/mosquitto) runs.
 
 - id: ruview_watchdog_problem
   alias: "RuView: data problem"
@@ -31,6 +32,7 @@
         - binary_sensor.ruview_watchdog_vitals_range
         - binary_sensor.ruview_watchdog_calibration
         - binary_sensor.ruview_watchdog_recorder
+        - binary_sensor.ruview_watchdog_backup
         - binary_sensor.ruview_watchdog_presence_vs_phones
       to: "on"
       not_from: "unavailable"

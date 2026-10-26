@@ -124,4 +124,17 @@ EXCEPTION WHEN insufficient_privilege THEN
 END
 $$;
 RESET ROLE;
-SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN ('telegraf', 'analytics', 'grafana', 'llm_ro') ORDER BY 1;
+-- backup reads everything, TimescaleDB's catalog included, and cannot write.
+SET ROLE backup;
+SELECT count(*) AS backup_reads_hypertables FROM _timescaledb_catalog.hypertable;
+SELECT count(*) AS backup_reads_ingest FROM ingest.state;
+DO $$
+BEGIN
+    INSERT INTO ingest.annotation (time) VALUES (now());
+    RAISE EXCEPTION 'backup could insert into ingest.annotation';
+EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+END
+$$;
+RESET ROLE;
+SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname IN ('telegraf', 'analytics', 'grafana', 'llm_ro', 'backup') ORDER BY 1;
