@@ -3,7 +3,7 @@
 Subscribes to `sensing-server`'s WebSocket (`/ws/sensing`), translates each
 `SensingUpdate` into MQTT topics, and publishes Home Assistant MQTT
 **Discovery** configs so HA auto-creates entities (presence, fall, vitals,
-person count, per-node RSSI, ...) without any YAML edits.
+person count, per-person slots, ...) without any YAML edits.
 
 ## Environment variables
 
@@ -23,10 +23,12 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `Z_MAX`                | `100.0`                                 | Drop persons whose median keypoint z > Z_MAX (m). Defaults effectively disable gating until sensing-server emits real floor-relative z. |
 | `STATE_MAX_HZ`         | `10`                                    | Max rate of `<prefix>/state` (one message per new server tick at most); `0` = no limit |
 | `NODE_MAX_HZ`          | `1`                                     | Max rate of each `<prefix>/nodes/<id>`             |
-| `PERSON_MAX_HZ`        | `1`                                     | Max rate of each person topic while its payload keeps changing |
+| `PERSON_MAX_HZ`        | `0.2`                                   | Max rate of each person topic, whatever changed (a person appearing or leaving included); a change inside the interval goes out at its end if it still holds |
 | `PERSON_HEARTBEAT_S`   | `30`                                    | Re-send an unchanged person payload this often     |
 | `STATUS_INTERVAL_S`    | `10`                                    | Period of the retained `<prefix>/bridge` status    |
 | `EDGE_VITALS_TTL_S`    | `60`                                    | How long an `edge_vitals` message describes the vitals gate |
+| `HA_PERSON_DETAIL`     | `false`                                 | Announce per-person Confidence and X/Y/Z entities; off retracts them (the values stay on the person topics) |
+| `HA_NODE_RSSI`         | `false`                                 | Announce a `Node <id> RSSI` entity per node; off retracts it (the sensing-server's built-in publisher has one) |
 
 ## Topics published
 
@@ -36,8 +38,8 @@ person count, per-node RSSI, ...) without any YAML edits.
 | `<prefix>/state`                   | no       | Flat JSON consumed by all entity templates; one message per new server tick, at most `STATE_MAX_HZ` |
 | `<prefix>/nodes/<id>`              | no       | Per-node health: RSSI, `csi_fps`, `stale`, `last_seen_ms`, position |
 | `<prefix>/event`                   | no       | One-shot fall events (HA `event` entity)         |
-| `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, x/y/z, conf), sent on change plus a heartbeat |
-| `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise (sent on transitions) |
+| `<prefix>/person/<slot>`           | no       | Per-slot person state (occupied, track id, x/y/z, conf, zone), sent on change at most `PERSON_MAX_HZ`, plus a heartbeat |
+| `<prefix>/person/<slot>/avail`     | yes      | `online` when slot occupied, `offline` otherwise; sent with the state when it flips |
 | `<prefix>/person/<label>`          | no       | Per-name state (e.g. `ruview/person/alice`) when an enrolled profile matched |
 | `<prefix>/person/<label>/avail`    | yes      | `online` when that named person is detected      |
 | `<prefix>/bridge`                  | yes      | Bridge stream health: WS connected, source, age of the last new tick, message rates |
@@ -52,6 +54,31 @@ Heart and breathing rate are `null` whenever the server withholds them
 (no fresh calibration, not exactly one person, quality gate); Home Assistant
 then shows the sensors as unknown, and Telegraf stores no point, instead of
 a fake 0 bpm. `abstention_reason` says why, when the server reports it.
+
+## Load on Home Assistant
+
+Home Assistant's recorder writes a database row for every new state, and its
+MQTT integration renders every template of every message. Person tracks from
+the server flicker and change their id often, which used to send each slot
+topic, and its availability, up to 10 times a second, the likely cause of
+Home Assistant's disk filling up in June 2026. So:
+
+- every change of a person topic waits for `PERSON_MAX_HZ` (5 s by default);
+  a change that is undone within the interval is never sent;
+- the availability of a slot or name follows its published state, so it
+  cannot change faster than the state;
+- only Present and Zone are HA entities by default; Confidence and X/Y/Z
+  (positions of the server's synthesised pose, not a located person) need
+  `HA_PERSON_DETAIL=true`, and `Node <id> RSSI` needs `HA_NODE_RSSI=true`;
+- positions are rounded to 0.01 and confidence to 0.001 before the change
+  check, so noise below what HA shows is not a change;
+- every person template renders `None` (unknown) when a field is missing,
+  as in the `{"occupied": false}` payload of an empty slot, instead of
+  logging a template warning.
+
+The compose file also slows the sensing-server's built-in publisher (motion,
+presence score, fall risk and person count to every 5 s per node), see
+`RUVIEW_MQTT_RATE_MOTION` and `RUVIEW_MQTT_RATE_COUNT` in `docker/.env.example`.
 
 ## Enrolled profiles (named entities)
 
@@ -79,7 +106,7 @@ A profile is a small JSON file matching the schema below. Today (step A), it can
 3. Note the typical resting values and roughly their spread over 60 s.
 4. Write a JSON file like the one above, save as `data/profiles/<name>.json`.
 5. Restart sensing-server: `docker compose restart sensing-server`.
-6. The bridge will register `sensor.<name>_present`, `sensor.<name>_x` etc the first time that person is matched.
+6. The bridge will register "<Name> Present" and "<Name> Zone" (plus Confidence and X/Y with `HA_PERSON_DETAIL=true`) the first time that person is matched.
 
 **Matching today** runs only when **exactly one person** is in the sensing zone, because the upstream vitals are still a single global reading. Multi-person matching arrives with step B (ADR-100).
 

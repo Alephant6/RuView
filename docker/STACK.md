@@ -98,11 +98,11 @@ Home Assistant's broker (→) or from it (←); the list lives in
 
 | Topic | Writer | Rate | To HA | Notes |
 |---|---|---|---|---|
-| `homeassistant/…` | sensing-server, mqtt-bridge, analytics | per entity | → | entity configs (retained); the sensing-server's built-in publisher also sends its states and availability here |
+| `homeassistant/…` | sensing-server, mqtt-bridge, analytics | per entity | → | entity configs (retained); the sensing-server's built-in publisher also sends its states and availability here: motion, presence score, fall risk and person count ≤ 0.2 Hz per node (`RUVIEW_MQTT_RATE_MOTION`, `RUVIEW_MQTT_RATE_COUNT`), HR/BR ≤ 0.2 Hz, RSSI ≤ 0.1 Hz, presence and the semantic states on change |
 | `ruview/availability` (retained) | mqtt-bridge | on connect, will | → | online / offline |
 | `ruview/state` | mqtt-bridge | one per new server tick, ≤ `STATE_MAX_HZ` (10) | | withheld HR/BR are `null`, never 0; quality fields `vitals_present`, `stale_source`, `abstention_reason`, `cal_person_count`, ... |
 | `ruview/nodes/<id>` | mqtt-bridge | ≤ `NODE_MAX_HZ` (1) per node | → | `csi_fps`, `stale`, `last_seen_ms`, RSSI |
-| `ruview/person/<slot or label>` | mqtt-bridge | on change, ≤ 1 Hz, 30 s heartbeat | → | availability subtopics only on transitions |
+| `ruview/person/<slot or label>` | mqtt-bridge | on change, ≤ `PERSON_MAX_HZ` (0.2, every 5 s), 30 s heartbeat | → | availability subtopics sent with the state when it flips |
 | `ruview/event` | mqtt-bridge | per fall event | → | |
 | `ruview/bridge` (retained) | mqtt-bridge | every 10 s and on change | | WS connected, source, age of the last new tick, message rates |
 | `ruview/watchdog/state` (retained) | analytics | every 30 s | → | full watchdog report; HA entities read it |
