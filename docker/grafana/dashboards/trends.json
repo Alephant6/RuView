@@ -443,7 +443,7 @@
     {
       "type": "timeseries",
       "title": "Asleep per night (server)",
-      "description": "Hours the sensing server's someone_sleeping state was on per night (21:00 to 21:00, so naps count), on the node that reported most of it. Not checked against the watch yet (WP2.2). Kept for 90 days.",
+      "description": "Hours the sensing server's someone_sleeping state was on per night (21:00 to 21:00, so naps count), on the node that reported most of it. Not checked against a reference device yet (WP2.2). Kept for 90 days.",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "ruview-timescaledb"

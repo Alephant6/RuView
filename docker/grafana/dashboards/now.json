@@ -1203,7 +1203,7 @@
     {
       "type": "stat",
       "title": "Asleep (server)",
-      "description": "Hours the sensing server's someone_sleeping state was on, on the node that reported most of it. Not checked against the watch yet. Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "description": "Hours the sensing server's someone_sleeping state was on, on the node that reported most of it. Not checked against a reference device yet (WP2.2). Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "ruview-timescaledb"

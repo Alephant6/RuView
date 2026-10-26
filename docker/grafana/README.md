@@ -16,8 +16,8 @@ not medical measurements. Days and nights are counted in the home's time zone,
 the hidden `tz` variable of the Now and Trends dashboards
 (America/New_York).
 
-A comparison with the ground-truth devices (Apple Watch, bedside radar) comes
-once their data is in TimescaleDB (WP1.4, WP2.2).
+A comparison with the bedside radar, the reference for night heart and
+breathing rates, comes once its data is in TimescaleDB (WP1.4, WP2.2).
 
 ## Files
 
