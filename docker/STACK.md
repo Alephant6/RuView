@@ -84,10 +84,11 @@ sudo docker compose logs influxdb | grep -i "Setup complete"
 
 # 4. Open Grafana at http://<nas-ip>:3030
 #    Default login: admin / value of GRAFANA_PASSWORD
-#    Dashboards live under "RuView" folder (provisioned automatically):
-#      - Node Health   (use this NOW for diagnosing RSSI)
-#      - Vital Signs
-#      - Presence & People
+#    Dashboards live under "RuView" folder (provisioned automatically,
+#    SQL on TimescaleDB, see grafana/README.md):
+#      - Data Health          (is the data flowing and trustworthy?)
+#      - Now and Last Night
+#      - Trends               (day by day, kept for good)
 ```
 
 ## MQTT topics written by the stack
@@ -142,11 +143,13 @@ Tables, roles, retention and remote access: [timescaledb/README.md](timescaledb/
 
 ## Adding a custom dashboard
 
-1. Build it in Grafana UI.
+1. Build it in Grafana UI, on the TimescaleDB datasource.
 2. *Settings → JSON Model → Copy*, paste into a new file under
    `docker/grafana/dashboards/<name>.json`.
 3. Commit to the branch — Grafana picks it up within 30 s on next deploy
-   (provisioning re-scans the directory). No restart needed.
+   (provisioning re-scans the directory). No restart needed. CI runs every
+   query of every dashboard against synthetic data
+   ([grafana/README.md](grafana/README.md)).
 
 ## Persistence
 

@@ -1,0 +1,26 @@
+apiVersion: 1
+
+# TimescaleDB (WP1.1), the source of every RuView dashboard. Grafana logs in
+# as the read-only grafana role (60 s statement timeout); its password comes
+# from PG_GRAFANA_PASSWORD in docker/.env, the same variable db-migrate sets
+# the role's password from. The dashboards refer to this datasource by uid.
+datasources:
+  - name: TimescaleDB
+    uid: ruview-timescaledb
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: timescaledb:5432
+    user: grafana
+    isDefault: true
+    editable: false
+    jsonData:
+      database: ruview
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: true
+      maxOpenConns: 4
+      maxIdleConns: 2
+      maxIdleConnsAuto: false
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: ${PG_GRAFANA_PASSWORD}

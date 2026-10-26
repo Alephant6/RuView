@@ -409,9 +409,10 @@ services:
       - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
 
   # ── Grafana ──────────────────────────────────────────────────────────────
-  # Visualisation. Datasource + dashboards are provisioned on first start
+  # Visualisation. Datasources + dashboards are provisioned on first start
   # from ./grafana/provisioning so a fresh deploy comes up with working
-  # charts (Node RSSI / Vital Signs / Presence) — no manual import needed.
+  # charts (Data Health / Now and Last Night / Trends, all SQL on
+  # TimescaleDB) — no manual import needed. See grafana/README.md.
   # Port 3030 avoids the sensing-server's 3000/3001 (host-network mode).
   grafana:
     image: grafana/grafana:11.2.0
@@ -419,6 +420,7 @@ services:
     restart: unless-stopped
     depends_on:
       - influxdb
+      - timescaledb
     networks:
       - ruview-data
     ports:
@@ -432,6 +434,8 @@ services:
       - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-ruview-local-dev-token-change-me}
       - INFLUXDB_ORG=${INFLUXDB_ORG:-ruview}
       - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-sensing}
+      # The TimescaleDB datasource logs in as the read-only grafana role.
+      - PG_GRAFANA_PASSWORD
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
