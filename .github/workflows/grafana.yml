@@ -53,6 +53,9 @@ jobs:
 
       - name: Start TimescaleDB and apply migrations
         run: |
+          # db-migrate from this checkout where the compose file builds it,
+          # instead of pulling an image.
+          docker compose build db-migrate
           docker compose up -d --wait timescaledb
           docker compose run --rm db-migrate
 
