@@ -35,11 +35,12 @@
 # CSI permanently. If the recorder refuses (daily budget, too long, ...), a
 # notification appears in Home Assistant.
 #
-# person: whoever pressed, as the object id of their person entity
-# (person.sq -> "sq"). Give the person entities the ids sq and ml (Settings ->
-# People -> person -> entity id). Presses from an automation or a shared
-# account are stored with an empty person, meaning the whole household.
-# Change notes are stored as typed: write sq/ml rather than names.
+# person: whoever pressed, as the household id that health-ingest and the
+# reports use: person.sqiang -> "sq", person.mengqi -> "ml" (person_ids in the
+# first automation below); anyone else is stored under the object id of their
+# person entity. Presses from an automation or a shared account are stored
+# with an empty person, meaning the whole household. Change notes are stored
+# as typed: write sq/ml rather than names.
 
 input_button:
   ruview_alcohol:
@@ -86,6 +87,11 @@ automation:
     alias: "RuView: label button"
     description: "Publish an annotation when a RuView label button is pressed."
     mode: queued
+    variables:
+      # Home Assistant person object id -> household id (see the header).
+      person_ids: &person_ids
+        sqiang: sq
+        mengqi: ml
     triggers:
       - trigger: state
         entity_id:
@@ -109,7 +115,7 @@ automation:
             {%- set uid = trigger.to_state.context.user_id -%}
             {%- set ns = namespace(id='') -%}
             {%- for p in states.person if uid and p.attributes.user_id == uid -%}
-              {%- set ns.id = p.object_id -%}
+              {%- set ns.id = person_ids.get(p.object_id, p.object_id) -%}
             {%- endfor -%}
             {{ ns.id }}
           ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
@@ -136,6 +142,8 @@ automation:
     alias: "RuView: label switch"
     description: "Publish start/stop annotations; keep the raw CSI of a quiet-sitting session."
     mode: queued
+    variables:
+      person_ids: *person_ids
     triggers:
       - trigger: state
         entity_id: &ruview_switches
@@ -159,7 +167,7 @@ automation:
             {%- set uid = st.context.user_id -%}
             {%- set ns = namespace(id='') -%}
             {%- for p in states.person if uid and p.attributes.user_id == uid -%}
-              {%- set ns.id = p.object_id -%}
+              {%- set ns.id = person_ids.get(p.object_id, p.object_id) -%}
             {%- endfor -%}
             {{ ns.id }}
           ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
@@ -203,6 +211,8 @@ automation:
     alias: "RuView: log a change"
     description: "Publish the change note (moved a node, flashed firmware, ...) and clear it."
     mode: queued
+    variables:
+      person_ids: *person_ids
     triggers:
       - trigger: state
         entity_id: input_button.ruview_log_change
@@ -219,7 +229,7 @@ automation:
             {%- set uid = trigger.to_state.context.user_id -%}
             {%- set ns = namespace(id='') -%}
             {%- for p in states.person if uid and p.attributes.user_id == uid -%}
-              {%- set ns.id = p.object_id -%}
+              {%- set ns.id = person_ids.get(p.object_id, p.object_id) -%}
             {%- endfor -%}
             {{ ns.id }}
           ts: "{{ (as_timestamp(trigger.to_state.last_changed) * 1000) | int }}"
