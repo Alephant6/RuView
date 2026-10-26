@@ -135,8 +135,17 @@ services:
     depends_on:
       - mosquitto
     restart: unless-stopped
-    # No explicit command needed — docker-entrypoint.sh uses CSI_SOURCE.
-    # Override with: command: ["--source", "esp32", "--tick-ms", "500"]
+    # docker-entrypoint.sh puts the server binary and its defaults (CSI_SOURCE,
+    # ports, bind address) in front of flag-only commands. Home Assistant
+    # records every new value, so the built-in publisher sends motion level,
+    # motion energy, presence score, fall risk and person count at most every
+    # 5 s per node (upstream default: every second). Presence, fall and the
+    # semantic states still go out the moment they change.
+    command:
+      - --mqtt-rate-motion
+      - ${RUVIEW_MQTT_RATE_MOTION:-0.2}
+      - --mqtt-rate-count
+      - ${RUVIEW_MQTT_RATE_COUNT:-0.2}
 
   # ── Home Assistant MQTT bridge ──────────────────────────────────────────
   # Subscribes to sensing-server's WebSocket and translates SensingUpdate JSON
@@ -175,10 +184,16 @@ services:
       - ROOM_ENTITIES=${ROOM_ENTITIES:-false}
       # Publish limits: ruview/state per new tick up to STATE_MAX_HZ, each
       # ruview/nodes/<id> up to NODE_MAX_HZ, person slots on change (at most
-      # PERSON_MAX_HZ) plus a heartbeat. Bridge health goes to ruview/bridge.
+      # PERSON_MAX_HZ, 0.2 = every 5 s) plus a heartbeat. Bridge health goes
+      # to ruview/bridge.
       - STATE_MAX_HZ=${STATE_MAX_HZ:-10}
       - NODE_MAX_HZ=${NODE_MAX_HZ:-1}
-      - PERSON_MAX_HZ=${PERSON_MAX_HZ:-1}
+      - PERSON_MAX_HZ=${PERSON_MAX_HZ:-0.2}
+      # Extra HA entities, off by default (their configs are retracted):
+      # per-person Confidence/X/Y/Z, and the bridge's Node RSSI, which the
+      # sensing-server's built-in publisher already has.
+      - HA_PERSON_DETAIL=${HA_PERSON_DETAIL:-false}
+      - HA_NODE_RSSI=${HA_NODE_RSSI:-false}
     restart: unless-stopped
 
   # ── Data watchdog (docker/analytics, WP0.4) ─────────────────────────────
