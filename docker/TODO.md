@@ -114,7 +114,7 @@ timeout 30 sudo tcpdump -i any -n 'udp port 5005' 2>/dev/null | wc -l
 (`iperf3 -c <AP-IP> -t 0 -b 500K -u` from any always-on device). Pushes
 CSI frame rate from beacon-only (~10 Hz) to 30+ Hz with no hardware change.
 
-### 3. Polish Grafana dashboards
+### 3. Polish Grafana dashboards _(superseded 2026-10 by WP1.3 — the Flux dashboards below were replaced by SQL dashboards on TimescaleDB, see [grafana/README.md](grafana/README.md))_
 
 The auto-provisioned dashboards work end-to-end (data flows from MQTT
 through Telegraf into InfluxDB and Grafana renders it), but several panels
@@ -176,7 +176,7 @@ fingerprint expands that to ~10-15 dimensions that survive day-to-day drift.
 - TODO #1 done (so per-person labels are flowing into InfluxDB)
 - TODO #2 done with conclusion "step B viable" (per-track vitals available
   so fingerprint isn't blurred across multiple people)
-- RSSI stable σ ≤ 2 dB on Node Health dashboard (otherwise features are
+- RSSI stable σ ≤ 2 dB on the Data Health dashboard (otherwise features are
   noise, not biology)
 
 **Fingerprint dimensions (priority-ordered):**

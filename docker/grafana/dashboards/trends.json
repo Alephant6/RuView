@@ -1,0 +1,853 @@
+{
+  "uid": "ruview-trends",
+  "title": "RuView — Trends",
+  "description": "Day by day from the hourly aggregates, which are kept for good: presence, room state, night and day heart and breathing rates, vitals availability, sleep per the server, people, watchdog problems and node health.",
+  "tags": [
+    "ruview",
+    "timescaledb"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "refresh": "",
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "links": [
+    {
+      "title": "RuView",
+      "type": "dashboards",
+      "tags": [
+        "ruview"
+      ],
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Labels and calibrations",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "ruview-timescaledb"
+        },
+        "enable": true,
+        "iconColor": "purple",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time,\n       concat_ws(' ', tags ->> 'kind', tags ->> 'label', tags ->> 'action', tags ->> 'person')\n         || coalesce(': ' || (fields ->> 'text'), '') AS text,\n       concat_ws(',', tags ->> 'kind', tags ->> 'source') AS tags\nFROM ingest.annotation\nWHERE $__timeFilter(time)\nORDER BY time"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tz",
+        "type": "constant",
+        "label": "Home time zone",
+        "hide": 2,
+        "query": "America/New_York",
+        "skipUrlSync": true,
+        "current": {
+          "selected": false,
+          "text": "America/New_York",
+          "value": "America/New_York"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "America/New_York",
+            "value": "America/New_York"
+          }
+        ],
+        "description": "Days and nights are counted in this time zone (the home's)."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Hours with live CSI and hours present",
+      "description": "Hours of each day with a live CSI source, and hours with someone present (from the hourly aggregates). One bar per day in the home's time zone.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       sum(n_live::float / nullif(n, 0)) AS \"live CSI\",\n       sum(presence * n_live / nullif(n, 0)) AS \"present\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: h",
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": -1,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 24
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time by room state",
+      "description": "Hours of each day the room was still, moving or active (all rows, live or not). One bar per day in the home's time zone.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       sum(n_still::float / nullif(n, 0)) AS \"still\",\n       sum(n_moving::float / nullif(n, 0)) AS \"moving\",\n       sum(n_active::float / nullif(n, 0)) AS \"active\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: h",
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": -1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Heart rate, night and day",
+      "description": "Average of the hourly median heart rates at night and in the day. Room-level CSI estimate from the hourly medians, weighted by how many values each hour published; nights run 21:00 to 09:00 and count for the day they end. Not a medical measurement.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz' + interval '3 hours') AT TIME ZONE '$tz' AS time,\n       sum(hr_med * hr_n) FILTER (WHERE extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20)\n         / nullif(sum(hr_n) FILTER (WHERE extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20), 0) AS \"night\",\n       sum(hr_med * hr_n) FILTER (WHERE NOT extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20)\n         / nullif(sum(hr_n) FILTER (WHERE NOT extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20), 0) AS \"day\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket) AND hr_n > 0\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: bpm",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Breathing rate, night and day",
+      "description": "Average of the hourly median breathing rates at night and in the day. Room-level CSI estimate from the hourly medians, weighted by how many values each hour published; nights run 21:00 to 09:00 and count for the day they end. Not a medical measurement.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz' + interval '3 hours') AT TIME ZONE '$tz' AS time,\n       sum(br_med * br_n) FILTER (WHERE extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20)\n         / nullif(sum(br_n) FILTER (WHERE extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20), 0) AS \"night\",\n       sum(br_med * br_n) FILTER (WHERE NOT extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20)\n         / nullif(sum(br_n) FILTER (WHERE NOT extract(hour FROM bucket AT TIME ZONE '$tz') NOT BETWEEN 9 AND 20), 0) AS \"day\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket) AND br_n > 0\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: /min",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vitals availability",
+      "description": "Share of live rows with someone present that carried a heart rate, and the share of rows with a fresh calibration and with vitals authorized by the server. One bar per day in the home's time zone.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       sum(hr_n) / nullif(sum(presence * n_live), 0) AS \"heart rate published\",\n       sum(calibration_fresh * n) / nullif(sum(n), 0) AS \"calibration fresh\",\n       sum(vitals_authorized * n) / nullif(sum(n), 0) AS \"vitals authorized\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Asleep per night (server)",
+      "description": "Hours the sensing server's someone_sleeping state was on per night (21:00 to 21:00, so naps count), on the node that reported most of it. Not checked against a reference device yet (WP2.2). Kept for 90 days.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH s AS (\n    SELECT device, time, \"on\",\n           least(lead(time) OVER (PARTITION BY device ORDER BY time) - time,\n                 interval '5 minutes') AS dt\n    FROM ingest.ha_binary\n    WHERE entity = 'someone_sleeping' AND $__timeFilter(time)\n)\nSELECT time, max(h) AS \"asleep\"\nFROM (SELECT date_trunc('day', time AT TIME ZONE '$tz' + interval '3 hours') AT TIME ZONE '$tz' AS time,\n             device,\n             extract(epoch FROM sum(dt) FILTER (WHERE \"on\" = 1)) / 3600 AS h\n      FROM s\n      GROUP BY 1, 2) AS d\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: h",
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": -1,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 6,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "People (estimate)",
+      "description": "Highest people estimate of each day, and the average while someone was present. One bar per day in the home's time zone.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       max(n_persons_max) AS \"highest\",\n       sum(n_persons_avg * presence * n_live) / nullif(sum(presence * n_live), 0) AS \"average while present\"\nFROM agg.state_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Watchdog problems",
+      "description": "Hours each watchdog check was raised per day. Kept for 90 days. One bar per day in the home's time zone.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "WITH s AS (\n    SELECT time, fields,\n           least(lead(time) OVER (ORDER BY time) - time, interval '5 minutes') AS dt\n    FROM ingest.watchdog\n    WHERE $__timeFilter(time)\n)\nSELECT date_trunc('day', time AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       substr(key, 7) AS metric,\n       extract(epoch FROM sum(dt)) / 3600 AS value\nFROM s, jsonb_each_text(fields) AS f(key, value)\nWHERE key LIKE 'check\\_%' AND value = '1'\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: h",
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": -1,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CSI frames per second",
+      "description": "Daily average CSI frame rate per node. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       'node ' || node_id AS metric,\n       sum(csi_fps_avg * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "hertz",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "RSSI",
+      "description": "Daily average signal strength per node. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       'node ' || node_id AS metric,\n       sum(rssi_avg * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dBm",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Node offline share",
+      "description": "Share of each day's node reports marked stale. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', bucket AT TIME ZONE '$tz') AT TIME ZONE '$tz' AS time,\n       'node ' || node_id AS metric,\n       sum(stale * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1h\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1d",
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      }
+    }
+  ]
+}

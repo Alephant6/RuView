@@ -1,0 +1,1674 @@
+{
+  "uid": "ruview-now",
+  "title": "RuView — Now and Last Night",
+  "description": "The home right now and over the last day: room state, room-level heart and breathing rates when published, people estimate, person slots, the server's own states, last night's summary and the newest events.",
+  "tags": [
+    "ruview",
+    "timescaledb"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "links": [
+    {
+      "title": "RuView",
+      "type": "dashboards",
+      "tags": [
+        "ruview"
+      ],
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Labels and calibrations",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "ruview-timescaledb"
+        },
+        "enable": true,
+        "iconColor": "purple",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time,\n       concat_ws(' ', tags ->> 'kind', tags ->> 'label', tags ->> 'action', tags ->> 'person')\n         || coalesce(': ' || (fields ->> 'text'), '') AS text,\n       concat_ws(',', tags ->> 'kind', tags ->> 'source') AS tags\nFROM ingest.annotation\nWHERE $__timeFilter(time)\nORDER BY time"
+        }
+      },
+      {
+        "name": "Events (fall, bed exit)",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "ruview-timescaledb"
+        },
+        "enable": true,
+        "iconColor": "red",
+        "target": {
+          "refId": "Events",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time,\n       (tags ->> 'entity') || ' on ' || substring(tags ->> 'device' FROM 'node[0-9]+$')\n         || coalesce(', confidence ' || round((fields ->> 'confidence')::numeric, 2), '') AS text,\n       tags ->> 'entity' AS tags\nFROM ingest.ha_event\nWHERE $__timeFilter(time)\nORDER BY time"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tz",
+        "type": "constant",
+        "label": "Home time zone",
+        "hide": 2,
+        "query": "America/New_York",
+        "skipUrlSync": true,
+        "current": {
+          "selected": false,
+          "text": "America/New_York",
+          "value": "America/New_York"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "America/New_York",
+            "value": "America/New_York"
+          }
+        ],
+        "description": "Days and nights are counted in this time zone (the home's)."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Room now",
+      "description": "From the newest state row of the last 2 minutes: empty, still, moving or active; CSI offline while the server only re-sends its last frame.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE WHEN stale_source = 1 THEN 'CSI offline'\n            WHEN presence = 0 THEN 'empty'\n            ELSE motion_level END AS \"now\"\nFROM ingest.state\nWHERE time > now() - interval '2 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "absent": {
+                  "text": "Empty",
+                  "color": "text",
+                  "index": 0
+                },
+                "empty": {
+                  "text": "Empty",
+                  "color": "text",
+                  "index": 1
+                },
+                "present_still": {
+                  "text": "Still",
+                  "color": "green",
+                  "index": 2
+                },
+                "present_moving": {
+                  "text": "Moving",
+                  "color": "blue",
+                  "index": 3
+                },
+                "active": {
+                  "text": "Active",
+                  "color": "orange",
+                  "index": 4
+                },
+                "CSI offline": {
+                  "text": "CSI offline",
+                  "color": "red",
+                  "index": 5
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data in 2 min"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/.*/"
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 1,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "People (estimate)",
+      "description": "The server's estimate of how many people the CSI sees (newest live row). Person tracking is not reliable yet: treat it as a hint.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT n_persons AS \"people\"\nFROM ingest.state\nWHERE time > now() - interval '2 minutes' AND stale_source = 0\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no live data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Heart rate",
+      "description": "Median of the heart rates published in the last minute (live rows only). Room-level CSI estimate, published only with exactly one person in the room and a fresh empty-room calibration; not a medical measurement.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY heart_rate_bpm) AS \"heart rate\"\nFROM ingest.state\nWHERE time > now() - interval '1 minute' AND stale_source = 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: bpm",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "withheld"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Breathing rate",
+      "description": "Median of the breathing rates published in the last minute, under the same rules as the heart rate.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY breathing_rate_bpm) AS \"breathing rate\"\nFROM ingest.state\nWHERE time > now() - interval '1 minute' AND stale_source = 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: /min",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "withheld"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Vitals",
+      "description": "Whether the server publishes vitals now, and if not, why (newest row of the last 2 minutes).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE WHEN stale_source = 1 THEN 'CSI offline'\n            WHEN numeric_vitals_authorized = 1 THEN 'published'\n            ELSE coalesce(abstention_reason, 'none given') END AS \"vitals\"\nFROM ingest.state\nWHERE time > now() - interval '2 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "published": {
+                  "text": "published",
+                  "color": "green",
+                  "index": 0
+                },
+                "CSI offline": {
+                  "text": "CSI offline",
+                  "color": "red",
+                  "index": 1
+                },
+                "explicit_calibration_required": {
+                  "text": "needs empty-room calibration",
+                  "color": "orange",
+                  "index": 2
+                },
+                "exactly_one_occupant_required": {
+                  "text": "not exactly one person",
+                  "color": "blue",
+                  "index": 3
+                },
+                "vital_quality_gate_failed": {
+                  "text": "signal quality too low",
+                  "color": "yellow",
+                  "index": 4
+                },
+                "bootstrap_empty_background": {
+                  "text": "bootstrap baseline only",
+                  "color": "purple",
+                  "index": 5
+                },
+                "none given": {
+                  "text": "no reason given",
+                  "color": "text",
+                  "index": 6
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data in 2 min"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/.*/"
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Calibration",
+      "description": "Whether an empty-room calibration is fresh enough for vitals (newest row), and its age from the watchdog's automatic calibration.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT s.calibration_fresh AS \"fresh\",\n       (SELECT (fields ->> 'calibration_age_h')::float\n        FROM ingest.watchdog\n        WHERE time > now() - interval '5 minutes' AND fields ? 'calibration_age_h'\n        ORDER BY time DESC\n        LIMIT 1) AS \"age\"\nFROM ingest.state AS s\nWHERE s.time > now() - interval '2 minutes'\nORDER BY s.time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data in 2 min"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fresh"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "fresh",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "none or old",
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: h"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Room",
+      "description": "The most common state of each bucket: empty, still, moving or active, and CSI offline where no row had a live source.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       CASE WHEN sum(n_live) = 0 THEN 'CSI offline'\n            WHEN sum(n_active) > 0 AND sum(n_active) >= greatest(sum(n_absent), sum(n_still), sum(n_moving)) THEN 'active'\n            WHEN sum(n_moving) > 0 AND sum(n_moving) >= greatest(sum(n_absent), sum(n_still)) THEN 'present_moving'\n            WHEN sum(n_still) > 0 AND sum(n_still) >= sum(n_absent) THEN 'present_still'\n            ELSE 'absent' END AS \"room\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "absent": {
+                  "text": "Empty",
+                  "color": "text",
+                  "index": 0
+                },
+                "empty": {
+                  "text": "Empty",
+                  "color": "text",
+                  "index": 1
+                },
+                "present_still": {
+                  "text": "Still",
+                  "color": "green",
+                  "index": 2
+                },
+                "present_moving": {
+                  "text": "Moving",
+                  "color": "blue",
+                  "index": 3
+                },
+                "active": {
+                  "text": "Active",
+                  "color": "orange",
+                  "index": 4
+                },
+                "CSI offline": {
+                  "text": "CSI offline",
+                  "color": "red",
+                  "index": 5
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "custom": {
+            "fillOpacity": 75,
+            "lineWidth": 0,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 7,
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Heart rate (room level)",
+      "description": "Median heart rate per bucket from published values of live rows. Gaps mean the rate was withheld (Data Health shows why). Room-level CSI estimate, not a medical measurement.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval, NULL),\n       sum(hr_med * hr_n) / nullif(sum(hr_n), 0) AS \"heart rate\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: bpm",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Breathing rate (room level)",
+      "description": "Median breathing rate per bucket, as for the heart rate.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval, NULL),\n       sum(br_med * br_n) / nullif(sum(br_n), 0) AS \"breathing rate\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: /min",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "People (estimate)",
+      "description": "The server's people estimate per bucket: average and highest. Two people in the room withholds vitals.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval, NULL),\n       sum(n_persons_avg * n_live) / nullif(sum(n_live), 0) AS \"average\",\n       max(n_persons_max) AS \"highest\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 1,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 10,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Motion energy",
+      "description": "Median motion energy per bucket (live rows).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval, NULL),\n       avg(motion_energy_med) AS \"motion energy\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket) AND n_live > 0\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 11,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Person slots",
+      "description": "Zone of each person slot of the mqtt-bridge (ruview/person), the last one seen in each bucket. Slots follow tracks, not identities: slot 1 is whoever the server tracked first.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       'slot ' || person_key AS slot,\n       coalesce(last(zone, time) FILTER (WHERE occupied = 1), 'not seen') AS zone\nFROM ingest.person\nWHERE $__timeFilter(time)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "bedroom": {
+                  "text": "bedroom",
+                  "color": "purple",
+                  "index": 0
+                },
+                "study": {
+                  "text": "study",
+                  "color": "blue",
+                  "index": 1
+                },
+                "living": {
+                  "text": "living room",
+                  "color": "orange",
+                  "index": 2
+                },
+                "not seen": {
+                  "text": "not seen",
+                  "color": "transparent",
+                  "index": 3
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "custom": {
+            "fillOpacity": 75,
+            "lineWidth": 0,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "displayName": "${__field.labels.slot}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "transformations": [
+        {
+          "id": "partitionByValues",
+          "options": {
+            "fields": [
+              "slot"
+            ],
+            "keepFields": false,
+            "naming": {
+              "asLabels": true
+            }
+          }
+        }
+      ],
+      "id": 12,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Server states per node",
+      "description": "The sensing server's own states per node (built-in publisher, the same as the Home Assistant entities): presence, someone sleeping, room active and possible distress. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       substring(device FROM 'node[0-9]+$') || ' ' || replace(entity, '_', ' ') AS metric,\n       max(\"on\") AS value\nFROM ingest.ha_binary\nWHERE $__timeFilter(time)\n  AND entity IN ('presence', 'someone_sleeping', 'room_active', 'possible_distress')\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "off",
+                  "color": "transparent",
+                  "index": 0
+                },
+                "1": {
+                  "text": "on",
+                  "color": "blue",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "custom": {
+            "fillOpacity": 75,
+            "lineWidth": 0,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "alignValue": "left",
+        "rowHeight": 0.8,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 13,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      }
+    },
+    {
+      "type": "row",
+      "title": "Last night (21:00 to 09:00 at home)",
+      "collapsed": false,
+      "panels": [],
+      "id": 14,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Asleep (server)",
+      "description": "Hours the sensing server's someone_sleeping state was on, on the node that reported most of it. Not checked against a reference device yet (WP2.2). Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           , s AS (\n               SELECT device, \"on\",\n                      least(lead(time) OVER (PARTITION BY device ORDER BY time), w.t1) - time AS dt\n               FROM ingest.ha_binary, w\n               WHERE entity = 'someone_sleeping' AND time >= w.t0 AND time < w.t1\n           )\n           SELECT max(h) AS \"asleep\"\n           FROM (SELECT device, extract(epoch FROM sum(least(dt, interval '5 minutes'))\n                                               FILTER (WHERE \"on\" = 1)) / 3600 AS h\n                 FROM s GROUP BY device) AS d"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: h",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 15,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 31
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Heart rate",
+      "description": "Median of the heart rates published last night (live rows). Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY heart_rate_bpm) AS \"heart rate\"\n           FROM ingest.state, w\n           WHERE time >= w.t0 AND time < w.t1 AND stale_source = 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: bpm",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "withheld"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 16,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 31
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Breathing rate",
+      "description": "Median of the breathing rates published last night (live rows). Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY breathing_rate_bpm) AS \"breathing rate\"\n           FROM ingest.state, w\n           WHERE time >= w.t0 AND time < w.t1 AND stale_source = 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: /min",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "withheld"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 17,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 31
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Vitals published",
+      "description": "Share of last night's live rows with someone present that carried a heart rate. Two people in the bedroom withholds every value. Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           SELECT count(heart_rate_bpm)::float / nullif(count(*) FILTER (WHERE presence = 1), 0) AS \"published\"\n           FROM ingest.state, w\n           WHERE time >= w.t0 AND time < w.t1 AND stale_source = 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 18,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 31
+      }
+    },
+    {
+      "type": "stat",
+      "title": "People (estimate)",
+      "description": "Median of the per-minute people estimate last night. Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY n_persons_avg) AS \"people\"\n           FROM agg.state_1m, w\n           WHERE bucket >= w.t0 AND bucket < w.t1 AND n_live > 0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no data"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 19,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 31
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Bed exits",
+      "description": "bed_exit events from the sensing server last night. Last night is 21:00 to 09:00 in the home's time zone; before 09:00 it is the night in progress.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH w AS (\n    SELECT (date_trunc('day', now() AT TIME ZONE '$tz') - interval '3 hours') AT TIME ZONE '$tz' AS t0,\n           least(now(), (date_trunc('day', now() AT TIME ZONE '$tz') + interval '9 hours') AT TIME ZONE '$tz') AS t1\n)\n           SELECT count(*) AS \"bed exits\"\n           FROM ingest.ha_event, w\n           WHERE time >= w.t0 AND time < w.t1 AND tags ->> 'entity' = 'bed_exit'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 20,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 31
+      }
+    },
+    {
+      "type": "table",
+      "title": "Events, labels and kept clips",
+      "description": "Newest first: the sensing server's events (fall, bed exit, room transitions), the label buttons and automatic calibrations, and the raw CSI clips the recorder kept.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time, kind, what, \"where\", detail\nFROM (\n    SELECT time, 'event' AS kind, tags ->> 'entity' AS what,\n           substring(tags ->> 'device' FROM 'node[0-9]+$') AS \"where\",\n           coalesce('confidence ' || round((fields ->> 'confidence')::numeric, 2), '') AS detail\n    FROM ingest.ha_event\n    WHERE $__timeFilter(time)\n    UNION ALL\n    SELECT time, 'label', concat_ws(' ', tags ->> 'kind', tags ->> 'label', tags ->> 'action'),\n           coalesce(tags ->> 'person', tags ->> 'source'), coalesce(fields ->> 'text', '')\n    FROM ingest.annotation\n    WHERE $__timeFilter(time)\n    UNION ALL\n    SELECT time, 'kept clip', tags ->> 'tag', tags ->> 'source',\n           concat_ws(', ', tags ->> 'status', (fields ->> 'duration_s') || ' s')\n    FROM ingest.recorder_keep\n    WHERE $__timeFilter(time)\n) AS e\nORDER BY time DESC\nLIMIT 200"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "minWidth": 50
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "id": 21,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 35
+      }
+    }
+  ]
+}
