@@ -61,6 +61,7 @@ fails until you do.
 | `analytics` | read `ingest` and `agg`, write `public` (WP1.2) | `PG_ANALYTICS_PASSWORD` |
 | `grafana` | read `ingest`, `agg` and `public`; read-only sessions, 60 s statement timeout | `PG_GRAFANA_PASSWORD` |
 | `llm_ro` | read the views in `llm`; read-only, 30 s timeout | `PG_LLM_RO_PASSWORD` |
+| `backup` | read everything (`pg_read_all_data`) for the nightly dump; read-only sessions | `PG_BACKUP_PASSWORD` |
 
 A role whose password is empty cannot log in; a set password needs at least
 16 characters. db-migrate re-applies the passwords at every run, so changing
@@ -160,6 +161,10 @@ docker compose up -d timescaledb db-migrate
 docker compose up -d
 ```
 
+The backup image is built on the same image: change the tag in
+[`../backup/Dockerfile`](../backup/Dockerfile) too.
+
 A new Postgres major version (the `-pg17` suffix) needs a dump and restore.
 The data lives in the `timescaledb-data` volume: `docker compose down -v`
-deletes it.
+deletes it. A copy goes offsite every night, see
+[`../backup/README.md`](../backup/README.md).

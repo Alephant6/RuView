@@ -63,6 +63,11 @@ jobs:
             file: docker/analytics/Dockerfile
             submodules: false
             free_disk: false
+          - name: backup
+            context: docker/backup
+            file: docker/backup/Dockerfile
+            submodules: false
+            free_disk: false
           - name: csi-recorder
             context: docker/csi-recorder
             file: docker/csi-recorder/Dockerfile
@@ -156,6 +161,18 @@ jobs:
           rc=0
           docker run --rm -e RUVIEW_HTTP=ftp://example.invalid "$IMAGE" || rc=$?
           test "$rc" -eq 2
+
+      - name: Smoke-test backup
+        if: matrix.name == 'backup'
+        run: |
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          docker run --rm --entrypoint sh "$IMAGE" -c \
+            'restic version && pg_dump --version && python3 -c "import paho.mqtt.publish, ruview_backup.service; print(\"backup image OK\")"'
+          # The entrypoint must start and refuse to run without a repository, with exit code 2.
+          rc=0
+          docker run --rm "$IMAGE" || rc=$?
+          test "$rc" -eq 2
+          docker run --rm "$IMAGE" status | grep -qx "no backup has run yet"
 
       - name: Smoke-test csi-recorder
         if: matrix.name == 'csi-recorder'

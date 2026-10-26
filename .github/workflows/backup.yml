@@ -1,0 +1,167 @@
+name: Offsite backup (dump, upload, restore)
+
+# WP1.1: the backup service in docker/docker-compose.yml (docker/backup).
+# Builds the image and backs up the compose timescaledb and influxdb services,
+# filled with sample rows and Apple Health points, into a local restic
+# repository standing in for the B2 bucket: twice, as on two nights. Then it
+# follows docker/backup/README.md: restores the latest snapshot into a
+# scratch server (the drill) and into a new timescaledb volume (the real
+# restore), and the health data into a new InfluxDB bucket, and compares each
+# copy with the original (docker/backup/tests/digest.sql).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/backup/**'
+      - 'docker/timescaledb/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/backup.yml'
+  pull_request:
+    paths:
+      - 'docker/backup/**'
+      - 'docker/timescaledb/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/backup.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: back up and restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: docker
+    env:
+      COMPOSE_PROFILES: backup
+      PG_PORT: '55432'
+      # A repository in the data directory stands in for the B2 bucket.
+      RESTIC_REPOSITORY: /backup/repo
+      # The check reads back all of it.
+      BACKUP_CHECK_SUBSET: 100%
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Generate throwaway passwords
+        run: |
+          for var in POSTGRES_PASSWORD PG_TELEGRAF_PASSWORD PG_ANALYTICS_PASSWORD PG_GRAFANA_PASSWORD \
+                     PG_BACKUP_PASSWORD RESTIC_PASSWORD INFLUXDB_PASSWORD INFLUXDB_TOKEN; do
+            value="$(openssl rand -hex 24)"
+            echo "::add-mask::$value"
+            echo "$var=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Build the images
+        # db-migrate and the bus too, where the compose file builds them from
+        # this checkout instead of pulling an image.
+        run: docker compose build backup db-migrate mosquitto
+
+      - name: Start the databases and the bus
+        run: |
+          docker compose up -d --wait timescaledb influxdb mosquitto
+          docker compose run --rm db-migrate
+          # InfluxDB sets itself up after it starts.
+          for _ in $(seq 1 60); do
+            docker compose exec -T influxdb influx bucket list --org ruview --name sensing > /dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Sample rows and Apple Health points
+        run: |
+          docker compose exec -T timescaledb psql -X -q -U postgres -d ruview -v ON_ERROR_STOP=1 \
+            -v from_s=432000 -v to_s=7200 -f - < backup/tests/seed.sql
+          python3 backup/tests/health_samples.py |
+            docker compose exec -T influxdb influx write --org ruview --bucket sensing --precision s
+
+      - name: Read-only InfluxDB token (README)
+        run: |
+          bucket="$(docker compose exec -T influxdb influx bucket list --org ruview --name sensing --hide-headers | cut -f1)"
+          token="$(docker compose exec -T influxdb influx auth create --org ruview --read-bucket "$bucket" \
+            --description ruview-backup --json | jq -r .token)"
+          echo "::add-mask::$token"
+          echo "INFLUXDB_BACKUP_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: First run (README)
+        run: |
+          docker run --rm -v "$PWD/data:/d" alpine:3.20 sh -c 'mkdir -p /d/backup && chown 65534:65534 /d/backup'
+          docker compose run --rm backup init
+          docker compose run --rm backup run
+
+      - name: Second run, after new rows
+        run: |
+          docker compose exec -T timescaledb psql -X -q -U postgres -d ruview -v ON_ERROR_STOP=1 \
+            -v from_s=5400 -v to_s=3600 -f - < backup/tests/seed.sql
+          docker compose run --rm backup run
+          docker compose run --rm backup check
+          docker compose run --rm --entrypoint restic backup snapshots
+          # restic keeps the newest snapshot and, while there are fewer days
+          # than BACKUP_KEEP_DAILY, the oldest.
+          test "$(docker compose run --rm -T --entrypoint restic backup snapshots --json | jq length)" -eq 2
+
+      - name: Status, also on the bus
+        run: |
+          docker compose run --rm -T backup status | tee "$RUNNER_TEMP/status.json"
+          jq -e '.ok == true and .health_rows > 0 and (.snapshot | length) == 8' "$RUNNER_TEMP/status.json"
+          docker compose exec -T mosquitto mosquitto_sub -h 127.0.0.1 -t ruview/backup/state -C 1 -W 10 |
+            jq -e --slurpfile file "$RUNNER_TEMP/status.json" '.ok == true and .snapshot == $file[0].snapshot'
+
+      - name: The original database
+        run: >
+          docker compose exec -T timescaledb psql -X -At -U postgres -d ruview -v ON_ERROR_STOP=1
+          -f - < backup/tests/digest.sql > "$RUNNER_TEMP/original.txt"
+
+      - name: Copy the latest snapshot back (README)
+        run: docker compose run --rm --entrypoint restic backup restore latest --target /backup/restore
+
+      - name: Drill (README)
+        run: |
+          docker run -d --name ruview-restore-drill --network docker_ruview-data \
+            -e POSTGRES_DB=ruview -e POSTGRES_PASSWORD=drill-only-password timescale/timescaledb:2.30.2-pg17
+          docker compose run --rm -e PGHOST=ruview-restore-drill -e PGPASSWORD=drill-only-password \
+            --entrypoint /app/restore-db.sh backup /backup/restore/backup/dump
+          docker exec -i ruview-restore-drill psql -X -At -U postgres -d ruview -v ON_ERROR_STOP=1 \
+            -f - < backup/tests/digest.sql > "$RUNNER_TEMP/drill.txt"
+          diff "$RUNNER_TEMP/original.txt" "$RUNNER_TEMP/drill.txt"
+          docker rm -f ruview-restore-drill
+
+      - name: Restore into a new timescaledb volume (README)
+        run: |
+          docker compose rm --stop --force timescaledb
+          docker volume rm docker_timescaledb-data
+          docker compose up -d timescaledb
+          PGPASSWORD="$POSTGRES_PASSWORD" docker compose run --rm -e PGPASSWORD \
+            --entrypoint /app/restore-db.sh backup /backup/restore/backup/dump
+          docker compose run --rm db-migrate | tee "$RUNNER_TEMP/migrate.log"
+          grep -q " 0 migration(s) applied" "$RUNNER_TEMP/migrate.log"
+          docker compose exec -T timescaledb psql -X -At -U postgres -d ruview -v ON_ERROR_STOP=1 \
+            -f - < backup/tests/digest.sql > "$RUNNER_TEMP/restored.txt"
+          diff "$RUNNER_TEMP/original.txt" "$RUNNER_TEMP/restored.txt"
+
+      - name: Restore the health data into a new bucket (README)
+        run: |
+          docker compose exec -T influxdb influx bucket create --org ruview --name restored > /dev/null
+          for m in apple_health apple_sleep_stage apple_sleep_daily apple_workout; do
+            docker compose run -T --rm --entrypoint cat backup /backup/restore/backup/dump/health/$m.csv |
+              docker compose exec -T influxdb influx write --org ruview --bucket restored --format csv
+          done
+          query() {
+            docker compose exec -T influxdb influx query --org ruview --raw \
+              "from(bucket: \"$1\") |> range(start: 0) |> drop(columns: [\"_start\", \"_stop\"])"
+          }
+          query sensing > "$RUNNER_TEMP/health-original.csv"
+          query restored > "$RUNNER_TEMP/health-restored.csv"
+          wc -l "$RUNNER_TEMP/health-original.csv"
+          cmp "$RUNNER_TEMP/health-original.csv" "$RUNNER_TEMP/health-restored.csv"
+
+      - name: Logs
+        if: failure()
+        run: |
+          docker compose logs timescaledb influxdb | tail -n 80
+          docker logs ruview-restore-drill 2>&1 | tail -n 40 || true
