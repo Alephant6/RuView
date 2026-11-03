@@ -102,14 +102,29 @@ def _epoch(iso: Any) -> float | None:
         return None
 
 
-def poll_ha_persons(cfg: Config, get: Getter = http_get_json) -> tuple[dict[str, PersonState] | None, str | None]:
-    """States of the configured `person.*` entities, or (None, error)."""
+def poll_ha_states(cfg: Config, entities: tuple[str, ...],
+                   get: Getter = http_get_json) -> tuple[dict[str, PersonState] | None, str | None]:
+    """States of Home Assistant entities, or (None, error) when any of them
+    cannot be read."""
     out: dict[str, PersonState] = {}
-    for entity in cfg.ha_persons:
+    for entity in entities:
         url = f"{cfg.ha_url}/api/states/{urllib.parse.quote(entity)}"
         status, body, error = get(url, cfg.ha_token, cfg.http_timeout_s)
         if error or not isinstance(body, dict):
             return None, f"{entity}: {error or 'unexpected response'}"
+        attributes = body.get("attributes")
+        name = attributes.get("friendly_name") if isinstance(attributes, dict) else None
         out[entity] = PersonState(state=str(body.get("state", "unknown")),
-                                  since=_epoch(body.get("last_changed")))
+                                  since=_epoch(body.get("last_changed")),
+                                  name=name if isinstance(name, str) and name else None)
     return out, None
+
+
+def poll_ha_persons(cfg: Config, get: Getter = http_get_json) -> tuple[dict[str, PersonState] | None, str | None]:
+    """States of the configured `person.*` entities, or (None, error)."""
+    return poll_ha_states(cfg, cfg.ha_persons, get)
+
+
+def poll_ha_blockers(cfg: Config, get: Getter = http_get_json) -> tuple[dict[str, PersonState] | None, str | None]:
+    """States of the AUTOCAL_BLOCK_ENTITIES, or (None, error)."""
+    return poll_ha_states(cfg, cfg.autocal_block, get)

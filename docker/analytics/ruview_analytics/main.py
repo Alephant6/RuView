@@ -16,7 +16,7 @@ from .autocal import AutoCalibrator
 from .checks import Watchdog, keep_requests, metrics
 from .config import Config, ConfigError
 from .ha import discovery_messages
-from .rest import poll_ha_persons, poll_sensing_server
+from .rest import poll_ha_blockers, poll_ha_persons, poll_sensing_server
 from .store import Store
 
 LOG = logging.getLogger("ruview-analytics")
@@ -65,10 +65,14 @@ def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdo
               client: mqtt.Client, autocal: AutoCalibrator | None = None) -> dict:
     snap = poll_sensing_server(cfg, time.time())
     persons, persons_error = poll_ha_persons(cfg) if cfg.presence_enabled else (None, None)
+    blocking = autocal is not None and bool(cfg.autocal_block)
+    blockers, blockers_error = poll_ha_blockers(cfg) if blocking else (None, None)
     with lock:
         store.rest = snap
         if cfg.presence_enabled:
             store.persons, store.persons_error = persons, persons_error
+        if blocking:
+            store.blockers, store.blockers_error = blockers, blockers_error
         report, transitions = watchdog.evaluate(store, time.time())
         keeps = keep_requests(cfg, store, report, transitions)
         view = autocal.observe(store, time.time()) if autocal else None
@@ -89,6 +93,8 @@ def run_round(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watchdo
             LOG.info("cleared %s", check_id)
     if persons_error:
         LOG.debug("HA persons: %s", persons_error)
+    if blockers_error:
+        LOG.debug("HA calibration blockers: %s", blockers_error)
     client.publish(cfg.topics["report"], json.dumps(report, ensure_ascii=False), qos=1, retain=True)
     client.publish(cfg.topics["metrics"], json.dumps(metrics(report)))
     for request in keeps:
@@ -114,7 +120,8 @@ def run() -> None:
     LOG.info("  nodes:   %s", ",".join(map(str, cfg.expected_nodes)) or "-")
     LOG.info("  phones:  %s", ",".join(cfg.ha_persons) if cfg.presence_enabled else "off (set HA_URL, HA_TOKEN, HA_PERSONS)")
     LOG.info("  autocal: %s", f"node {cfg.autocal_source_node}, phones away {cfg.autocal_away_s / 60:g} min, "
-             f"refresh after {cfg.autocal_refresh_s / 3600:g} h" if cfg.autocal_enabled
+             f"refresh after {cfg.autocal_refresh_s / 3600:g} h, "
+             f"held back by {','.join(cfg.autocal_block) or '-'}" if cfg.autocal_enabled
              else "off (set AUTOCAL_SOURCE_NODE)")
 
     store = Store(cfg, started_at=time.time())

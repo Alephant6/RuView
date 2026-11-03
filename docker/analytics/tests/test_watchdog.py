@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ruview_analytics import checks as C  # noqa: E402
 from ruview_analytics.config import Config, ConfigError  # noqa: E402
 from ruview_analytics.ha import discovery_messages  # noqa: E402
-from ruview_analytics.rest import poll_ha_persons, poll_sensing_server  # noqa: E402
+from ruview_analytics.rest import poll_ha_blockers, poll_ha_persons, poll_sensing_server  # noqa: E402
 from ruview_analytics.store import PersonState, RestSnapshot, Store  # noqa: E402
 
 T0 = 1_792_000_000.0
@@ -550,6 +550,22 @@ def test_poll_ha_persons():
     assert persons["person.sq"].since == pytest.approx(1792033200.0)
     persons, error = poll_ha_persons(cfg, fake_get({}))
     assert persons is None and "person.sq" in error
+
+
+def test_poll_ha_blockers():
+    cfg = Config(ha_url="http://ha:8123", ha_token="x", autocal_block=("vacuum.robot", "input_boolean.ruview_guests"))
+    states, error = poll_ha_blockers(cfg, fake_get({
+        "/api/states/vacuum.robot": (200, {"state": "docked", "last_changed": "2026-10-15T03:00:00+00:00",
+                                           "attributes": {"friendly_name": "扫地机器人"}}, None),
+        "/api/states/input_boolean.ruview_guests": (200, {"state": "off", "attributes": []}, None),
+    }))
+    assert error is None
+    assert states["vacuum.robot"] == PersonState("docked", pytest.approx(1792033200.0), "扫地机器人")
+    assert states["input_boolean.ruview_guests"] == PersonState("off", None, None)
+    states, error = poll_ha_blockers(cfg, fake_get({
+        "/api/states/vacuum.robot": (200, {"state": "docked"}, None),
+    }))
+    assert states is None and error == "input_boolean.ruview_guests: HTTP 404"
 
 
 def test_store_ignores_oversized_and_non_object_payloads():

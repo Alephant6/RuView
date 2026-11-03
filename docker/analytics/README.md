@@ -64,19 +64,22 @@ renews that calibration whenever the home is empty:
 - **When.** The calibration is missing, stale, expired, only a startup
   baseline restored after a restart, broken by a CSI sequence fault, or
   fresh but older than `AUTOCAL_REFRESH_H`. Every `HA_PERSONS` entity has
-  been away (not `home`, not unknown) for `AUTOCAL_AWAY_MIN`, at most
-  `AUTOCAL_MAX_MOVING` of the room states of the last 10 minutes were
-  `present_moving`, and the source node is streaming.
+  been away (not `home`, not unknown) for `AUTOCAL_AWAY_MIN`, every
+  `AUTOCAL_BLOCK_ENTITIES` entity has been idle as long (a `vacuum` or
+  `lawn_mower` `docked`, anything else `off`), at most `AUTOCAL_MAX_MOVING`
+  of the room states of the last 10 minutes were `present_moving`, and the
+  source node is streaming.
 - **How.** A fresh calibration is first reset (`POST
   /api/v1/calibration/reset`, which the server requires before a new one).
   The capture binds `AUTOCAL_SOURCE_NODE` alone: the model is built from
   that node's CSI either way, and binding more nodes would only let a
   reboot of any of them block the vitals. The watchdog finalizes it
   (`stop`) once the server's targets are met, 1000 frames and 10 minutes.
-- **Cancel.** Someone comes home, more than `AUTOCAL_MAX_MOVING` of the last
-  2 minutes are `present_moving`, a sequence fault, no frames after 2
-  minutes, or no result after 30 minutes. The next try comes 30 minutes
-  later at the earliest.
+- **Cancel.** Someone comes home, a blocking entity turns busy (the robot
+  vacuum leaves its dock, the guests switch goes on), more than
+  `AUTOCAL_MAX_MOVING` of the last 2 minutes are `present_moving`, a
+  sequence fault, no frames after 2 minutes, or no result after 30
+  minutes. The next try comes 30 minutes later at the earliest.
 - **Never.** It does not touch a capture it did not start (another binding
   digest) and does not reset while a promoted startup baseline is stored,
   since a reset would delete it; such a calibration is renewed once it is
@@ -88,10 +91,21 @@ and ends (`kind` `calibration`, `label` `empty_room`, `action` `start`,
 next to the label buttons' annotations. The **Auto Calibration** entity shows
 what it is doing or waiting for.
 
-`AUTOCAL_MAX_MOVING` = 0.25 is a starting point, not a measured value: how
-often the uncalibrated motion level reads `present_moving` in an empty room
-is not known yet. While a calibration is due, the log names what it waits
-for, with the moving share of the last 10 minutes
+`AUTOCAL_MAX_MOVING` = 0.25 is a starting point, not a measured value. The
+motion level does not come from the calibration: the sensing-server derives
+it from the CSI motion score or the node firmware's motion flag, so a
+calibration does not change it. MEASURED in one home over 22 minutes with
+nobody in it: the room read `present_moving` in all 9384 `ingest.state`
+rows, and the source node in 91% of its `ingest.node` rows (8% `active`).
+Reproduce with
+`SELECT node_id, motion_level, count(*) FROM ingest.node WHERE time BETWEEN
+'<from>' AND '<to>' GROUP BY 1, 2` (and the same on `ingest.state` without
+`node_id`) for a time everyone was away. Where the empty home reads like
+that, set `AUTOCAL_MAX_MOVING=1`: the phones and `AUTOCAL_BLOCK_ENTITIES`
+then decide alone, so list there everything that can be in an empty home,
+such as the robot vacuum and the guests switch of `ha/ruview-labels.yaml`
+(`input_boolean.ruview_guests`). While a calibration is due, the log names
+what it waits for, with the moving share of the last 10 minutes
 (`docker logs ruview-analytics | grep "calibration due"`).
 
 ## Outputs
@@ -139,6 +153,7 @@ buttons (alcohol, sick, quiet sitting, change log, ...), see WP0.6.
 | `AUTOCAL_AWAY_MIN` | `10` | minutes every phone must be away before a capture (1–240) |
 | `AUTOCAL_REFRESH_H` | `6` | replace a fresh calibration this old (1–12; `12` = only once it is stale) |
 | `AUTOCAL_MAX_MOVING` | `0.25` | largest share of `present_moving` room states before and during a capture |
+| `AUTOCAL_BLOCK_ENTITIES` | — | Home Assistant entities that hold a capture back, e.g. `vacuum.robot,input_boolean.ruview_guests`: a `vacuum` or `lawn_mower` until it has been `docked`, anything else until it has been `off`, for `AUTOCAL_AWAY_MIN`. An unknown or unreadable state holds a start back; a busy one cancels a capture |
 
 `HA_TOKEN` is a long-lived access token; keep it in `docker/.env` only.
 

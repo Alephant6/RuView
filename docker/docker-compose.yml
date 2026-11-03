@@ -240,6 +240,7 @@ services:
       - AUTOCAL_AWAY_MIN=${AUTOCAL_AWAY_MIN:-10}
       - AUTOCAL_REFRESH_H=${AUTOCAL_REFRESH_H:-6}
       - AUTOCAL_MAX_MOVING=${AUTOCAL_MAX_MOVING:-0.25}
+      - AUTOCAL_BLOCK_ENTITIES=${AUTOCAL_BLOCK_ENTITIES:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     # Reads MQTT and REST (its only REST writes are the calibration calls)
     # and writes nothing to disk: no capabilities needed.

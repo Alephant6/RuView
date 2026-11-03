@@ -6,20 +6,22 @@ is in the room. Recalibrating by hand every day is not realistic, so the
 watchdog does it while the home is empty:
 
 1. It starts a capture once every phone has been away for AUTOCAL_AWAY_MIN
-   minutes, the room has been quiet for the last 10 minutes, the source
-   node is streaming, and the server's calibration is missing, stale, only
-   a startup baseline restored after a restart, broken by a CSI sequence
-   fault, or older than AUTOCAL_REFRESH_H hours. The server refuses a new
-   capture while one is fresh, so a fresh one is reset first, unless a
-   promoted startup baseline is stored: the reset would delete it too.
+   minutes, every AUTOCAL_BLOCK_ENTITIES entity (a robot vacuum, a guests
+   switch) has been idle as long, the room has been quiet for the last 10
+   minutes, the source node is streaming, and the server's calibration is
+   missing, stale, only a startup baseline restored after a restart, broken
+   by a CSI sequence fault, or older than AUTOCAL_REFRESH_H hours. The
+   server refuses a new capture while one is fresh, so a fresh one is reset
+   first, unless a promoted startup baseline is stored: the reset would
+   delete it too.
 2. It binds the capture to AUTOCAL_SOURCE_NODE alone and finalizes it once
    the server's frame and duration targets are met (1000 frames, 600 s).
    The model is built from that node's CSI either way; binding more nodes
    only makes the finalize wait for all of them and lets a reboot of any
    of them block the vitals.
-3. It cancels when someone comes home, the room gets busy, or the capture
-   faults, stalls or runs too long, and tries again 30 minutes later at
-   the earliest.
+3. It cancels when someone comes home, a blocking entity gets busy, the
+   room gets busy, or the capture faults, stalls or runs too long, and
+   tries again 30 minutes later at the earliest.
 4. Each capture publishes an annotation (`ruview/annotation`) when it
    starts and when it ends.
 
@@ -58,6 +60,10 @@ FRESH_S = 12 * 3600.0      # the server's fresh window; a refresh this late is o
 # Stop refusals that a later round can get past: the source node paused
 # (grid stale) or has not contributed yet.
 STOP_LATER = ("calibration_grid_stale", "calibration_source_nodes_missing")
+# A blocking vacuum or lawn mower is idle only on its dock, any other
+# blocking entity (input_boolean, binary_sensor, switch) only while off.
+DOCKED_DOMAINS = ("vacuum", "lawn_mower")
+UNKNOWN_STATES = ("unknown", "unavailable")
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ class View:
     calibration: dict[str, Any] | None      # GET /api/v1/calibration/status
     token_refused: bool                     # the server answered 401/403
     persons: dict[str, PersonState] | None
+    blockers: dict[str, PersonState] | None  # AUTOCAL_BLOCK_ENTITIES, None: unread
     quiet: tuple[float | None, int]         # share of "moving" samples, count
     recent: tuple[float | None, int]
     source_streaming: bool | None
@@ -93,6 +100,11 @@ def moving_share(store: Store, now: float, window_s: float) -> tuple[float | Non
 
 def _who(entity: str) -> str:
     return entity.split(".", 1)[-1]
+
+
+def _idle(entity: str, state: str) -> bool:
+    """Whether a blocking entity lets a capture run."""
+    return state == ("docked" if entity.split(".", 1)[0] in DOCKED_DOMAINS else "off")
 
 
 def _text(value: Any) -> str | None:
@@ -146,6 +158,7 @@ class AutoCalibrator:
             calibration=calibration,
             token_refused=recent and snap.auth_failed,
             persons=dict(store.persons) if store.persons is not None else None,
+            blockers=dict(store.blockers) if store.blockers is not None else None,
             quiet=moving_share(store, now, QUIET_WINDOW_S),
             recent=moving_share(store, now, RECENT_WINDOW_S),
             source_streaming=node_streaming(self.cfg, store, now, self.node),
@@ -235,6 +248,7 @@ class AutoCalibrator:
                 if away < self.cfg.autocal_away_s:
                     out.append(("away", self.t("autocal_wait_away", away=self.duration(away),
                                                need=self.duration(self.cfg.autocal_away_s))))
+        out += self._entity_blockers(view.blockers, now)
         share, count = view.quiet
         if share is None or count < MIN_QUIET_SAMPLES:
             out.append(("no_state", self.t("autocal_wait_no_state")))
@@ -242,6 +256,26 @@ class AutoCalibrator:
             out.append(("moving", self.t("autocal_wait_moving", pct=round(share * 100))))
         if view.source_streaming is not True:
             out.append(("node", self.t("autocal_wait_node", node=self.node)))
+        return out
+
+    def _entity_blockers(self, states: dict[str, PersonState] | None, now: float) -> list[tuple[str, str]]:
+        """A robot vacuum away from its dock, guests at home: anything in
+        AUTOCAL_BLOCK_ENTITIES that is busy, unread, or idle for less than
+        AUTOCAL_AWAY_MIN holds a capture back."""
+        out = []
+        for entity in self.cfg.autocal_block:
+            s = (states or {}).get(entity)
+            name = s.name if s is not None and s.name else entity
+            if s is None or s.state in UNKNOWN_STATES:
+                out.append(("block", self.t("autocal_wait_block_unknown", name=name)))
+            elif not _idle(entity, s.state):
+                out.append(("block", self.t("autocal_wait_block", name=name, state=s.state)))
+            elif s.since is None:
+                out.append(("block", self.t("autocal_wait_block_unknown", name=name)))
+            elif now - s.since < self.cfg.autocal_away_s:
+                out.append(("block", self.t("autocal_wait_block_idle", name=name,
+                                            idle=self.duration(now - s.since),
+                                            need=self.duration(self.cfg.autocal_away_s))))
         return out
 
     def _retry_reason(self, now: float) -> tuple[str, str]:
@@ -367,6 +401,11 @@ class AutoCalibrator:
             home = [_who(e) for e, p in view.persons.items() if p.state == "home"]
             if home:
                 return self.t("autocal_reason_home", who=self._names(home))
+        for entity, blocker in (view.blockers or {}).items():
+            # An unread state does not cancel, as with the phones.
+            if (entity in self.cfg.autocal_block and blocker.state not in UNKNOWN_STATES
+                    and not _idle(entity, blocker.state)):
+                return self.t("autocal_reason_block", name=blocker.name or entity, state=blocker.state)
         share, count = view.recent
         if share is not None and count >= MIN_RECENT_SAMPLES and share > self.cfg.autocal_max_moving:
             return self.t("autocal_reason_moving", pct=round(share * 100))

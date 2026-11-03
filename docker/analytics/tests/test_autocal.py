@@ -282,6 +282,11 @@ class World:
             "person.sq": PersonState("not_home", t0 - HOUR),
             "person.ml": PersonState("work", t0 - 1800),
         }
+        # Read only with autocal_block set.
+        self.blockers: dict[str, PersonState] | None = {
+            "vacuum.robot": PersonState("docked", t0 - HOUR, "扫地机器人"),
+            "input_boolean.ruview_guests": PersonState("off", t0 - 2 * HOUR, "来客人"),
+        }
         self.motion: str | None = "absent"
         self.streaming = True
         self.notes: list[dict] = []
@@ -304,6 +309,7 @@ class World:
         if self.streaming:
             self.server.feed(dt)
         self.store.persons = dict(self.persons) if self.persons is not None else None
+        self.store.blockers = dict(self.blockers) if self.blockers is not None else None
         self.store.rest = rest(self.now, self.server.status(), streaming=self.streaming)
         notes = self.ac.step(self.ac.observe(self.store, self.now), self.now)
         self.notes += notes
@@ -384,6 +390,90 @@ def test_waits_for_enough_state_history():
     for _ in range(9):
         w.round()
     assert w.calls() == ["start"]                        # 300 quiet samples after 5 min
+
+
+# ── blocking entities (AUTOCAL_BLOCK_ENTITIES) ─────────────────────────────
+
+BLOCK = ("vacuum.robot", "input_boolean.ruview_guests")
+
+
+def test_capture_starts_when_the_blocking_entities_are_idle():
+    w = World(autocal_block=BLOCK)
+    (note,) = w.round()
+    assert note["action"] == "start" and w.calls() == ["start"]
+
+
+@pytest.mark.parametrize("setup, reason", [
+    (lambda w: w.blockers.update({"vacuum.robot": PersonState("cleaning", T0 - 60, "扫地机器人")}),
+     "等 扫地机器人 结束（现在是 cleaning）"),
+    (lambda w: w.blockers.update({"vacuum.robot": PersonState("idle", T0 - HOUR, "扫地机器人")}),
+     "等 扫地机器人 结束（现在是 idle）"),                 # off its dock
+    (lambda w: w.blockers.update({"vacuum.robot": PersonState("docked", T0 - 60, "扫地机器人")}),
+     "扫地机器人 停下才 3 分钟，要满 10 分钟"),
+    (lambda w: w.blockers.update({"input_boolean.ruview_guests": PersonState("on", T0 - HOUR, "来客人")}),
+     "等 来客人 结束（现在是 on）"),
+    (lambda w: w.blockers.update({"vacuum.robot": PersonState("unavailable", T0, "扫地机器人")}),
+     "不知道 扫地机器人 的状态"),
+    (lambda w: w.blockers.update({"vacuum.robot": PersonState("docked", None)}), "不知道 vacuum.robot 的状态"),
+    (lambda w: w.blockers.pop("input_boolean.ruview_guests"), "不知道 input_boolean.ruview_guests 的状态"),
+    (lambda w: setattr(w, "blockers", None), "不知道 vacuum.robot 的状态"),     # HA unreadable
+])
+def test_blocking_entities_hold_a_capture_back(setup, reason):
+    w = World(autocal_block=BLOCK)
+    setup(w)
+    for _ in range(4):
+        assert w.round() == []
+    assert w.calls() == []
+    assert reason in w.status()["waiting_for"], w.status()["waiting_for"]
+
+
+def test_unconfigured_entities_are_ignored():
+    w = World()
+    w.blockers = None
+    w.round()
+    assert w.calls() == ["start"]
+
+
+def test_capture_waits_for_the_vacuum_to_settle_on_its_dock():
+    w = World(autocal_block=("vacuum.robot",))
+    w.blockers["vacuum.robot"] = PersonState("docked", T0, "扫地机器人")
+    w.round()
+    assert w.calls() == [] and w.status()["waiting_for"] == ["扫地机器人 停下才 30 秒，要满 10 分钟"]
+    for _ in range(18):
+        w.round()
+    assert w.calls() == []                               # 9.5 minutes after docking
+    w.round()
+    assert w.calls() == ["start"]                        # 10 minutes
+
+
+def test_capture_is_cancelled_when_a_blocking_entity_turns_busy():
+    w = World(autocal_block=BLOCK)
+    w.round()
+    w.round()
+    w.blockers["vacuum.robot"] = PersonState("cleaning", w.now, "扫地机器人")
+    note = w.until_note()
+    assert note["action"] == "cancelled"
+    assert note["text"] == "自动空房标定已取消：扫地机器人 开始了（cleaning）"
+    assert w.calls() == ["start", "cancel"]
+
+
+@pytest.mark.parametrize("unread", [
+    lambda w: setattr(w, "blockers", None),
+    lambda w: w.blockers.update({"vacuum.robot": PersonState("unavailable", w.now, "扫地机器人")}),
+])
+def test_an_unread_blocking_entity_does_not_cancel_a_capture(unread):
+    w = World(autocal_block=BLOCK)
+    w.round()
+    unread(w)
+    assert w.until_note()["action"] == "done"
+    assert w.calls() == ["start", "stop"]
+
+
+def test_english_blocking_status():
+    w = World(lang="en", autocal_block=("vacuum.robot",))
+    w.blockers["vacuum.robot"] = PersonState("returning", T0, "Robot")
+    w.round()
+    assert w.status()["text"] == "due, waiting: waiting for Robot (returning)"
 
 
 def test_fresh_calibration_is_left_alone():
@@ -652,6 +742,12 @@ def test_autocal_config():
             Config.from_env({**env, **bad})
     with pytest.raises(ConfigError, match="HA_PERSONS"):
         Config.from_env({"AUTOCAL_SOURCE_NODE": "1"})
+    blocked = Config.from_env({**env, "AUTOCAL_SOURCE_NODE": "2",
+                               "AUTOCAL_BLOCK_ENTITIES": " vacuum.robot, input_boolean.ruview_guests ,"})
+    assert blocked.autocal_block == ("vacuum.robot", "input_boolean.ruview_guests")
+    assert off.autocal_block == ()
+    with pytest.raises(ConfigError, match="AUTOCAL_BLOCK_ENTITIES entries must be entity ids"):
+        Config.from_env({**env, "AUTOCAL_SOURCE_NODE": "2", "AUTOCAL_BLOCK_ENTITIES": "Vacuum Robot"})
     with pytest.raises(ValueError):
         AutoCalibrator(Config())
 
@@ -779,6 +875,26 @@ def test_run_round_publishes_the_annotation_and_status(monkeypatch):
     assert report["autocal"]["state"] == "collecting"
     assert by_topic["ruview/watchdog/state"][0]["autocal"]["state"] == "collecting"
     assert by_topic["ruview/watchdog/metrics"][0]["autocal_collecting"] == 1
+
+
+def test_run_round_reads_the_blocking_entities(monkeypatch):
+    pytest.importorskip("paho.mqtt")
+    from ruview_analytics import main
+
+    w = World(t0=time.time(), autocal_block=("vacuum.robot",))
+    busy = {"vacuum.robot": PersonState("cleaning", w.now, "扫地机器人")}
+    monkeypatch.setattr(main, "poll_sensing_server", lambda cfg, now: rest(now, w.server.status()))
+    monkeypatch.setattr(main, "poll_ha_persons", lambda cfg: (dict(w.persons), None))
+    monkeypatch.setattr(main, "poll_ha_blockers", lambda cfg: (dict(busy), None))
+    client = FakeClient()
+    report = main.run_round(w.cfg, w.store, threading.Lock(), C.Watchdog(w.cfg), client, w.ac)
+    assert w.store.blockers == busy
+    assert report["autocal"]["state"] == "waiting"
+    assert "等 扫地机器人 结束（现在是 cleaning）" in report["autocal"]["waiting_for"]
+    assert "ruview/annotation" not in [topic for topic, *_ in client.published]
+    monkeypatch.setattr(main, "poll_ha_blockers", lambda cfg: (None, "vacuum.robot: HTTP 404"))
+    main.run_round(w.cfg, w.store, threading.Lock(), C.Watchdog(w.cfg), client, w.ac)
+    assert w.store.blockers is None and w.store.blockers_error == "vacuum.robot: HTTP 404"
 
 
 def test_run_round_reports_even_when_autocal_breaks(monkeypatch):
