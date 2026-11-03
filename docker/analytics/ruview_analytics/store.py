@@ -78,8 +78,12 @@ class RestSnapshot:
 
 @dataclass
 class PersonState:
+    """A Home Assistant entity's state: a person, or an entity that holds
+    automatic calibration back (AUTOCAL_BLOCK_ENTITIES)."""
+
     state: str
     since: float | None                 # last_changed, epoch seconds
+    name: str | None = None             # friendly_name
 
 
 @dataclass
@@ -94,6 +98,8 @@ class Store:
     rest: RestSnapshot | None = None
     persons: dict[str, PersonState] | None = None
     persons_error: str | None = None
+    blockers: dict[str, PersonState] | None = None    # AUTOCAL_BLOCK_ENTITIES
+    blockers_error: str | None = None
     recorder_avail: str | None = None
     recorder_status: dict[str, Any] | None = None
     backup_status: dict[str, Any] | None = None

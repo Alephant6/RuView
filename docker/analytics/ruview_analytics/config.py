@@ -46,14 +46,14 @@ def _nodes(raw: str) -> tuple[int, ...]:
     return tuple(sorted(set(nodes)))
 
 
-def _entities(raw: str) -> tuple[str, ...]:
+def _entities(raw: str, name: str = "HA_PERSONS", example: str = "person.alice") -> tuple[str, ...]:
     out = []
     for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
         if not _ENTITY_ID.match(part):
-            raise ConfigError(f"HA_PERSONS entries must be entity ids like person.alice, got {part!r}")
+            raise ConfigError(f"{name} entries must be entity ids like {example}, got {part!r}")
         out.append(part)
     return tuple(out)
 
@@ -111,6 +111,9 @@ class Config:
     autocal_away_s: float = 600.0       # every phone away at least this long
     autocal_refresh_s: float = 6 * 3600.0   # recalibrate a fresh one this old
     autocal_max_moving: float = 0.25    # largest share of "moving" CSI states
+    # Home Assistant entities that hold a capture back while they are busy:
+    # a vacuum or lawn mower unless docked, anything else unless off.
+    autocal_block: tuple[str, ...] = ()
 
     @property
     def topics(self) -> dict[str, str]:
@@ -181,6 +184,8 @@ class Config:
             autocal_away_s=60 * _float(env, "AUTOCAL_AWAY_MIN", cls.autocal_away_s / 60, 1, 240),
             autocal_refresh_s=3600 * _float(env, "AUTOCAL_REFRESH_H", cls.autocal_refresh_s / 3600, 1, 12),
             autocal_max_moving=_float(env, "AUTOCAL_MAX_MOVING", cls.autocal_max_moving, 0, 1),
+            autocal_block=_entities(env.get("AUTOCAL_BLOCK_ENTITIES", ""), "AUTOCAL_BLOCK_ENTITIES",
+                                    "vacuum.robot"),
         )
         if cfg.autocal_enabled and not cfg.presence_enabled:
             raise ConfigError("AUTOCAL_SOURCE_NODE needs HA_URL, HA_TOKEN and HA_PERSONS: "

@@ -127,6 +127,9 @@ MESSAGES: dict[str, dict[str, str]] = {
     "autocal_wait_phones_unknown": {"zh": "不知道手机在不在家", "en": "phone locations unknown"},
     "autocal_wait_home": {"zh": "{who} 在家", "en": "{who} at home"},
     "autocal_wait_away": {"zh": "离家才 {away}，要满 {need}", "en": "away for {away} of {need}"},
+    "autocal_wait_block": {"zh": "等 {name} 结束（现在是 {state}）", "en": "waiting for {name} ({state})"},
+    "autocal_wait_block_idle": {"zh": "{name} 停下才 {idle}，要满 {need}", "en": "{name} idle for {idle} of {need}"},
+    "autocal_wait_block_unknown": {"zh": "不知道 {name} 的状态", "en": "state of {name} unknown"},
     "autocal_wait_no_state": {"zh": "CSI 状态数据不够", "en": "not enough CSI state data"},
     "autocal_wait_moving": {
         "zh": "房间里有动静（{pct}% 的时间在动）",
@@ -164,6 +167,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "en": "The previous calibration was cleared, but a new one could not start: {reason}",
     },
     "autocal_reason_home": {"zh": "{who} 回家了", "en": "{who} came home"},
+    "autocal_reason_block": {"zh": "{name} 开始了（{state}）", "en": "{name} started ({state})"},
     "autocal_reason_moving": {
         "zh": "房间里有动静（最近 2 分钟 {pct}% 的时间在动）",
         "en": "movement in the room ({pct}% of the last 2 min)",
