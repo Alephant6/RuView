@@ -11,7 +11,8 @@
 #   POSTGRES_PASSWORD     superuser password (required)
 #   PGHOST / PGPORT / PGDATABASE   default timescaledb / 5432 / ruview
 #   PG_TELEGRAF_PASSWORD, PG_ANALYTICS_PASSWORD, PG_GRAFANA_PASSWORD,
-#   PG_LLM_RO_PASSWORD    a role whose password is empty cannot log in
+#   PG_LLM_RO_PASSWORD, PG_BACKUP_PASSWORD
+#                         a role whose password is empty cannot log in
 
 set -euo pipefail
 
@@ -78,7 +79,7 @@ log "$applied migration(s) applied, schema at version $(psql_ -Atc 'SELECT coale
 
 # Logins: the password comes from the environment through \getenv, so it is
 # never on a command line.
-for role in telegraf analytics grafana llm_ro; do
+for role in telegraf analytics grafana llm_ro backup; do
     var="PG_$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')_PASSWORD"
     password="${!var:-}"
     if [ -z "$password" ]; then

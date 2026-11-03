@@ -445,6 +445,57 @@ def test_recorder_offline_and_silent():
     assert report["checks"]["recorder"]["summary"].startswith("No status from the raw CSI recorder")
 
 
+# ── offsite backup ───────────────────────────────────────────────────────
+
+def backup_status(**over) -> bytes:
+    status = {"since_ts": T0 - 10 * 86400, "last_ok_ts": T0 - 3600, "ok": True, "step": None,
+              "error": None, "snapshot": "0123abcd", "next_run_ts": T0 + 20 * 3600, **over}
+    return json.dumps(status).encode()
+
+
+def test_backup_check_is_unknown_until_the_service_publishes():
+    cfg, store, wd = make()
+    report, _ = run(wd, store, T0)
+    assert report["checks"]["backup"]["state"] == "unknown"
+    store.on_message("ruview/backup/state", backup_status(), T0)
+    report, _ = run(wd, store, T0)
+    assert report["checks"]["backup"]["state"] == "ok"
+    assert report["checks"]["backup"]["detail"]["snapshot"] == "0123abcd"
+    # One failed night is not a problem yet: the service retries.
+    store.on_message("ruview/backup/state", backup_status(ok=False, step="upload", error="timeout"), T0)
+    report, _ = run(wd, store, T0 + 1)
+    assert report["checks"]["backup"]["state"] == "ok"
+
+
+def test_backup_too_old_raises_and_clears():
+    cfg, store, wd = make()
+    store.on_message("ruview/backup/state", backup_status(
+        last_ok_ts=T0 - 49 * 3600, ok=False, step="upload", error="Fatal: unable to open repository"), T0)
+    report, transitions = run(wd, store, T0)
+    assert transitions == {"backup": "raised"}
+    assert report["checks"]["backup"]["severity"] == "warning"
+    assert report["checks"]["backup"]["summary"] == (
+        "距上次成功的异地备份已有 2.0 天（最近一次在 upload 这一步出错：Fatal: unable to open repository）")
+    store.on_message("ruview/backup/state", backup_status(last_ok_ts=T0 + 50), T0 + 60)
+    _, transitions = run(wd, store, T0 + 60)
+    assert transitions == {"backup": "cleared"}
+
+
+def test_backup_that_never_succeeded():
+    cfg, store, wd = make(lang="en", backup_max_age_s=24 * 3600)
+    store.on_message("ruview/backup/state", backup_status(
+        since_ts=T0 - 3600, last_ok_ts=None, ok=False, step="repository", error="no restic repository"), T0)
+    report, _ = run(wd, store, T0)
+    assert report["checks"]["backup"]["state"] == "ok"  # started an hour ago
+    report, _ = run(wd, store, T0 + 24 * 3600)
+    assert report["checks"]["backup"]["summary"] == (
+        "The offsite backup service has run for 25.0 h without a single success"
+        " (the last run failed at repository: no restic repository)")
+    assert Config.from_env({"BACKUP_MAX_AGE_H": "72"}).backup_max_age_s == 72 * 3600
+    with pytest.raises(ConfigError):
+        Config.from_env({"BACKUP_MAX_AGE_H": "0"})
+
+
 def test_keep_requests_for_new_vitals_problems_only_with_a_recorder():
     cfg, store, wd = make()
     report = {"ts": T0, "checks": {"vitals_frozen": {"since_ts": T0 - 30, "summary": "心率冻结"},

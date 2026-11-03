@@ -1,7 +1,8 @@
 # RuView docker stack
 
 Ten containers (db-migrate exits once the database migrations are
-applied). The sensing-server and the csi-recorder use the host network. The
+applied), and an eleventh, `backup`, when `COMPOSE_PROFILES` includes
+`backup`. The sensing-server and the csi-recorder use the host network. The
 NAS message bus and its clients share the `ruview-bus` network, the databases
 and Grafana the `ruview-data` network; Telegraf is on both.
 
@@ -41,6 +42,7 @@ The host-network services reach the bus on the NAS loopback
 | `db-migrate` | same image | — | Applies `timescaledb/migrations` and the roles' passwords, then exits |
 | `telegraf` | `telegraf:1.39.3` | — | MQTT → InfluxDB + TimescaleDB ingest |
 | `grafana` | `grafana/grafana:11.2.0` | 3030 | Dashboards (auto-provisioned) |
+| `backup` | local build (backup/Dockerfile), profile `backup` | — | Nightly dump of TimescaleDB and the Apple Health data, encrypted by restic and uploaded to Backblaze B2 ([backup/README.md](backup/README.md)) |
 
 ## First-time bringup
 
@@ -111,6 +113,7 @@ Home Assistant's broker (→) or from it (←); the list lives in
 | `ruview/recorder/status` (retained) | csi-recorder | every 30 s | | datagram rates per kind and node, ring size and age, free disk, keep budget (`recorder` measurement) |
 | `ruview/recorder/keep` | HA label buttons, analytics | on request | ← | keep a time range of raw CSI permanently |
 | `ruview/recorder/keep/result` | csi-recorder | per request | → | accepted / rejected / kept / empty / failed (`recorder_keep` measurement) |
+| `ruview/backup/state` (retained) | backup | after each run, and hourly | | result of the last offsite backup, last success, next run; the watchdog's Backup check reads it |
 | `ruview/annotation` | HA label buttons, analytics | on press | ← | alcohol, sick, travel, quiet sitting, changes, ...; the start and end of each automatic calibration (`annotation` measurement, stored at the press time) |
 | `ruview/bus/ha_connected` (retained) | the bus bridge | on connect and drop | both | 1 / 0, shown in HA as "NAS Link"; HA's broker writes the 0 itself |
 
@@ -154,7 +157,8 @@ InfluxDB, TimescaleDB, Grafana and the bus use **named docker volumes**
 (`influxdb-data`, `influxdb-config`, `timescaledb-data`, `grafana-data`,
 `mosquitto-data`) so a `docker compose down` keeps your data.
 `docker compose down -v` will wipe them — don't do that if you care about
-history.
+history. The database and the health data also go offsite every night; the
+restore is in [backup/README.md](backup/README.md).
 
 ## Troubleshooting
 

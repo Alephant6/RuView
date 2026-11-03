@@ -101,6 +101,8 @@ class Config:
     # On a newly raised vitals or presence problem, ask the csi-recorder to
     # keep the raw CSI of this many seconds before it (0 = off).
     keep_on_raise_s: float = 1200.0
+    # The offsite backup's last success may be this old (docker/backup).
+    backup_max_age_s: float = 48 * 3600.0
 
     # ── automatic empty-room calibration (autocal.py) ───────────────────
     # The node whose CSI the calibration is taken from; None switches
@@ -128,6 +130,8 @@ class Config:
             "ha_link": f"{p}/bus/ha_connected",
             # Same topic as the HA label buttons; Telegraf stores both.
             "annotation": f"{p}/annotation",
+            # The offsite backup's last result (docker/backup), retained.
+            "backup_status": f"{p}/backup/state",
         }
 
     @property
@@ -172,6 +176,7 @@ class Config:
             lang=lang,
             min_node_fps=_float(env, "MIN_NODE_FPS", cls.min_node_fps, 0, 1000),
             keep_on_raise_s=60 * _float(env, "KEEP_ON_RAISE_MIN", cls.keep_on_raise_s / 60, 0, 120),
+            backup_max_age_s=3600 * _float(env, "BACKUP_MAX_AGE_H", cls.backup_max_age_s / 3600, 1, 720),
             autocal_source_node=source_node,
             autocal_away_s=60 * _float(env, "AUTOCAL_AWAY_MIN", cls.autocal_away_s / 60, 1, 240),
             autocal_refresh_s=3600 * _float(env, "AUTOCAL_REFRESH_H", cls.autocal_refresh_s / 3600, 1, 12),

@@ -44,7 +44,7 @@ def make_client(cfg: Config, store: Store, lock: threading.Lock, watchdog: Watch
             c.publish(topic, payload, qos=1, retain=True)
         c.subscribe([(topics[key], 0) for key in
                      ("bridge_avail", "bridge_status", "state", "nodes", "report",
-                      "recorder_avail", "recorder_status", "ha_link")])
+                      "recorder_avail", "recorder_status", "ha_link", "backup_status")])
 
     def on_disconnect(_c, _userdata, _flags, reason_code, _props=None):
         LOG.warning("MQTT disconnected, reason=%s; paho will reconnect", reason_code)

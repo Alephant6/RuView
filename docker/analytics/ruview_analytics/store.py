@@ -96,6 +96,7 @@ class Store:
     persons_error: str | None = None
     recorder_avail: str | None = None
     recorder_status: dict[str, Any] | None = None
+    backup_status: dict[str, Any] | None = None
     ha_link: bool | None = None         # bus bridge to HA's broker up (None: no bus)
     hr: Series = field(init=False)
     br: Series = field(init=False)
@@ -137,6 +138,8 @@ class Store:
             self.bridge_status = data
         elif topic == topics["recorder_status"]:
             self.recorder_status = data
+        elif topic == topics["backup_status"]:
+            self.backup_status = data
         elif topic == topics["state"]:
             self.on_state(data, now)
         elif topic.startswith(f"{self.cfg.mqtt_prefix}/nodes/"):

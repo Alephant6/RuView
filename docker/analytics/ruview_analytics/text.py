@@ -107,6 +107,18 @@ MESSAGES: dict[str, dict[str, str]] = {
         "zh": "节点在发数据，但录制器一个数据包都没收到（检查 sensing-server 的 RUVIEW_UDP_TEE）",
         "en": "Nodes are sending, but the recorder has not received a single datagram (check RUVIEW_UDP_TEE on the sensing-server)",
     },
+    "backup_old": {
+        "zh": "距上次成功的异地备份已有 {age}",
+        "en": "The last successful offsite backup was {age} ago",
+    },
+    "backup_never": {
+        "zh": "异地备份服务已运行 {age}，还没有成功过一次",
+        "en": "The offsite backup service has run for {age} without a single success",
+    },
+    "backup_error": {
+        "zh": "（最近一次在 {step} 这一步出错：{error}）",
+        "en": " (the last run failed at {step}: {error})",
+    },
     "autocal_wait_server": {"zh": "感知服务器连不上", "en": "sensing server unreachable"},
     "autocal_wait_old_server": {
         "zh": "感知服务器版本太旧，不支持自动标定",
