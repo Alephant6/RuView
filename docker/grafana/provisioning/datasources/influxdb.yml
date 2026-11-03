@@ -2,14 +2,15 @@ apiVersion: 1
 
 # Pre-configured InfluxDB v2 datasource. Token/org/bucket come from the
 # Grafana container's env (which docker-compose populates from .env or the
-# defaults in docker-compose.yml).
+# defaults in docker-compose.yml). No dashboard uses it since WP1.3; it stays
+# for Explore until InfluxDB is retired (WP1.5).
 datasources:
   - name: InfluxDB
     uid: ruview-influxdb
     type: influxdb
     access: proxy
     url: http://influxdb:8086
-    isDefault: true
+    isDefault: false
     editable: true
     jsonData:
       version: Flux

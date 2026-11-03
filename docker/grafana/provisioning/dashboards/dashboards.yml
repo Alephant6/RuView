@@ -13,4 +13,5 @@ providers:
     allowUiUpdates: true
     options:
       path: /var/lib/grafana/dashboards
-      foldersFromFilesStructure: true
+      # false, or Grafana ignores `folder` and files them under General.
+      foldersFromFilesStructure: false

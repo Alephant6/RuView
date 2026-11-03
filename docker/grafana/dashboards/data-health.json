@@ -1,0 +1,1755 @@
+{
+  "uid": "ruview-data-health",
+  "title": "RuView — Data Health",
+  "description": "Is the data flowing and trustworthy? Nodes, the CSI source, the bridge, the recorder, the watchdog's checks, why vitals were withheld, and the TimescaleDB tables and jobs.",
+  "tags": [
+    "ruview",
+    "timescaledb"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "links": [
+    {
+      "title": "RuView",
+      "type": "dashboards",
+      "tags": [
+        "ruview"
+      ],
+      "asDropdown": false,
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "icon": "external link",
+      "tooltip": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Labels and calibrations",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "ruview-timescaledb"
+        },
+        "enable": true,
+        "iconColor": "purple",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time,\n       concat_ws(' ', tags ->> 'kind', tags ->> 'label', tags ->> 'action', tags ->> 'person')\n         || coalesce(': ' || (fields ->> 'text'), '') AS text,\n       concat_ws(',', tags ->> 'kind', tags ->> 'source') AS tags\nFROM ingest.annotation\nWHERE $__timeFilter(time)\nORDER BY time"
+        }
+      }
+    ]
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Newest state row",
+      "description": "Seconds since the newest ruview/state row reached TimescaleDB. The bridge publishes up to 10 rows per second while the sensing server has new ticks. A growing age means the server, the bridge, the bus or Telegraf stopped.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT extract(epoch FROM now() - max(time)) AS \"age\"\nFROM ingest.state\nWHERE time > now() - interval '1 day'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "none in 24 h"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 1,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Live CSI, last 10 min",
+      "description": "Share of state rows with a live CSI source (stale_source = 0). While the ESP32 source is offline the server keeps re-sending its last frame; those rows are not live and are left out of every presence, motion and vitals statistic.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT sum(n_live)::float / nullif(sum(n), 0) AS \"live\"\nFROM agg.state_1m\nWHERE bucket > now() - interval '10 minutes'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no rows"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Fresh nodes",
+      "description": "ESP32 nodes the server heard from recently, of the nodes it knows (newest state row of the last 5 minutes).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT fresh_nodes AS \"fresh\", active_nodes AS \"known\"\nFROM ingest.state\nWHERE time > now() - interval '5 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "green",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no rows"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "known"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Watchdog",
+      "description": "Overall state in the newest watchdog round (docker/analytics), the same as the RuView Watchdog device in Home Assistant.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (fields ->> 'status_level')::int AS \"status\"\nFROM ingest.watchdog\nWHERE time > now() - interval '5 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "OK",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "Info",
+                  "color": "blue",
+                  "index": 1
+                },
+                "2": {
+                  "text": "Warning",
+                  "color": "orange",
+                  "index": 2
+                },
+                "3": {
+                  "text": "Critical",
+                  "color": "red",
+                  "index": 3
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no round in 5 min"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Open issues",
+      "description": "Watchdog checks raised in the newest round; the timeline below shows which.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (fields ->> 'open_issues')::int AS \"open issues\"\nFROM ingest.watchdog\nWHERE time > now() - interval '5 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no round in 5 min"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Raw CSI recorder",
+      "description": "Hours of raw CSI in the csi-recorder's ring and the free space on its disk (newest status of the last 5 minutes).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (fields ->> 'ring_hours')::float AS \"ring\",\n       (fields ->> 'disk_free_gb')::float AS \"disk free\"\nFROM ingest.recorder\nWHERE time > now() - interval '5 minutes'\nORDER BY time DESC\nLIMIT 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "noValue": "no status in 5 min"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ring"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: h"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "disk free"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "decgbytes"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "showPercentChange": false,
+        "wideLayout": true
+      },
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Watchdog checks",
+      "description": "One row per watchdog check (docker/analytics): red while the check was raised. A check that is missing had no data to judge (unknown).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       substr(key, 7) AS metric,\n       max(value::float) AS value\nFROM ingest.watchdog, jsonb_each_text(fields) AS f(key, value)\nWHERE $__timeFilter(time) AND key LIKE 'check\\_%'\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "OK",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "problem",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "custom": {
+            "fillOpacity": 75,
+            "lineWidth": 0,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "mergeValues": true,
+        "showValue": "never",
+        "alignValue": "left",
+        "rowHeight": 0.8,
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 7,
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "State rows per minute",
+      "description": "Rows in ruview/state per minute: all, and those with a live CSI source. The bridge writes one row per new server tick, at most 10 per second.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       sum(n)::float / ($__interval_ms / 60000.0) AS \"all\",\n       sum(n_live)::float / ($__interval_ms / 60000.0) AS \"live\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 8,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Bridge stream",
+      "description": "What the mqtt-bridge sees from the sensing server, per second (ruview/bridge, every 10 s). Repeated ticks with no new ones mean the server is re-sending its last frame: the CSI source has stalled.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       avg((fields ->> 'new_ticks_hz')::float) AS \"new ticks\",\n       avg((fields ->> 'duplicates_hz')::float) AS \"repeated ticks\",\n       avg((fields ->> 'state_published_hz')::float) AS \"published\"\nFROM ingest.bridge\nWHERE $__timeFilter(time)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "hertz",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "CSI frames per second",
+      "description": "Average CSI frame rate per node, from ruview/nodes. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       'node ' || node_id AS metric,\n       sum(csi_fps_avg * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "hertz",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 21
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "RSSI",
+      "description": "Average signal strength per node. Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       'node ' || node_id AS metric,\n       sum(rssi_avg * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dBm",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 21
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Node offline share",
+      "description": "Share of node reports marked stale (the server has not heard from the node recently). Node 1 is in the bedroom, node 2 at the study desk, node 3 beside the living-room sofa.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       'node ' || node_id AS metric,\n       sum(stale * n) / nullif(sum(n), 0) AS value\nFROM agg.node_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 12,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 21
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Raw CSI datagrams per node",
+      "description": "Datagrams per second the csi-recorder receives from each node (ruview/recorder/status, every 30 s).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       'node ' || substring(key FROM '^nodes_(.+)_csi_hz$') AS metric,\n       avg(value::float) AS value\nFROM ingest.recorder, jsonb_each_text(fields) AS f(key, value)\nWHERE $__timeFilter(time) AND key ~ '^nodes_.+_csi_hz$'\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "hertz",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 13,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Recorder ring and disk",
+      "description": "Hours of raw CSI kept in the ring (at most RING_HOURS) and the free space on the recorder's disk.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, $__interval),\n       avg((fields ->> 'ring_hours')::float) AS \"ring\",\n       avg((fields ->> 'disk_free_gb')::float) AS \"disk free\"\nFROM ingest.recorder\nWHERE $__timeFilter(time)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ring"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: h"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "disk free"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "decgbytes"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 14,
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Why vitals were withheld",
+      "description": "Minutes with a live CSI source but no published heart rate, by the reason the server gave (the most common reason in each minute).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT coalesce(abstention_reason, 'none given') AS reason,\n       count(*) AS minutes\nFROM agg.state_1m\nWHERE $__timeFilter(bucket) AND n_live > 0 AND hr_n = 0\nGROUP BY 1\nORDER BY 2 DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "explicit_calibration_required": {
+                  "text": "needs empty-room calibration",
+                  "color": "orange",
+                  "index": 0
+                },
+                "exactly_one_occupant_required": {
+                  "text": "not exactly one person",
+                  "color": "blue",
+                  "index": 1
+                },
+                "vital_quality_gate_failed": {
+                  "text": "signal quality too low",
+                  "color": "yellow",
+                  "index": 2
+                },
+                "bootstrap_empty_background": {
+                  "text": "bootstrap baseline only",
+                  "color": "purple",
+                  "index": 3
+                },
+                "none given": {
+                  "text": "no reason given",
+                  "color": "text",
+                  "index": 4
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "valueMode": "color",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "maxVizHeight": 300,
+        "minVizWidth": 8,
+        "reduceOptions": {
+          "values": true,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "/^minutes$/"
+        }
+      },
+      "id": 15,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 36
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Vitals published",
+      "description": "Share of live state rows with a published heart rate and breathing rate, and of rows with a fresh empty-room calibration. Rates are withheld unless exactly one person is in the room, a calibration is fresh and the signal is good.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval),\n       sum(hr_n)::float / nullif(sum(n_live), 0) AS \"heart rate\",\n       sum(br_n)::float / nullif(sum(n_live), 0) AS \"breathing rate\",\n       sum(calibration_fresh * n) / nullif(sum(n), 0) AS \"calibration fresh\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 16,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 36
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Distinct vitals values per minute",
+      "description": "How many different heart-rate and breathing-rate values were published per minute. One or two over many minutes means frozen values (the September 83.37 / 19.28 incident); the watchdog's Vitals Frozen check watches the same.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(bucket, $__interval, NULL),\n       avg(hr_distinct) FILTER (WHERE hr_n > 0) AS \"heart rate\",\n       avg(br_distinct) FILTER (WHERE br_n > 0) AS \"breathing rate\"\nFROM agg.state_1m\nWHERE $__timeFilter(bucket)\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "gradientMode": "none",
+            "pointSize": 4
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "interval": "1m",
+      "id": 17,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      }
+    },
+    {
+      "type": "table",
+      "title": "Rows in the last hour",
+      "description": "Rows each ingest table received in the last hour, and the age of the newest. A table with no rows means its topic stopped or Telegraf skipped it (docker compose logs telegraf).",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT 'ingest.' || t AS \"table\", rows, extract(epoch FROM now() - newest) AS \"newest\"\nFROM (\n    SELECT 'state' AS t, count(*) AS rows, max(time) AS newest FROM ingest.state WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'node', count(*), max(time) FROM ingest.node WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'person', count(*), max(time) FROM ingest.person WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'ha_binary', count(*), max(time) FROM ingest.ha_binary WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'ha_sensor', count(*), max(time) FROM ingest.ha_sensor WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'ha_event', count(*), max(time) FROM ingest.ha_event WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'bridge', count(*), max(time) FROM ingest.bridge WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'watchdog', count(*), max(time) FROM ingest.watchdog WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'recorder', count(*), max(time) FROM ingest.recorder WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'recorder_keep', count(*), max(time) FROM ingest.recorder_keep WHERE time > now() - interval '1 hour'\n    UNION ALL SELECT 'annotation', count(*), max(time) FROM ingest.annotation WHERE time > now() - interval '1 hour'\n) AS c\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "minWidth": 50
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "newest"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "displayName",
+                "value": "newest row (age)"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rows"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "id": 18,
+      "gridPos": {
+        "h": 13,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      }
+    },
+    {
+      "type": "table",
+      "title": "Storage",
+      "description": "Size of each hypertable and continuous aggregate with its indexes, and how many of its chunks are compressed. Raw tables keep 14 or 90 days; the aggregates are kept for good.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT format('%I.%I', h.hypertable_schema, h.hypertable_name) AS \"table\",\n       hypertable_size(format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass) AS \"size\",\n       count(c.chunk_name) AS \"chunks\",\n       count(c.chunk_name) FILTER (WHERE c.is_compressed) AS \"compressed\"\nFROM timescaledb_information.hypertables AS h\nLEFT JOIN timescaledb_information.chunks AS c USING (hypertable_schema, hypertable_name)\nGROUP BY 1, 2\nUNION ALL\nSELECT format('%I.%I', a.view_schema, a.view_name),\n       hypertable_size(format('%I.%I', a.view_schema, a.view_name)::regclass),\n       count(c.chunk_name),\n       count(c.chunk_name) FILTER (WHERE c.is_compressed)\nFROM timescaledb_information.continuous_aggregates AS a\nLEFT JOIN timescaledb_information.chunks AS c\n       ON c.hypertable_schema = a.materialization_hypertable_schema\n      AND c.hypertable_name = a.materialization_hypertable_name\nGROUP BY 1, 2\nORDER BY 2 DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "minWidth": 50
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "size"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "chunks"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "compressed"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 108
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "id": 19,
+      "gridPos": {
+        "h": 13,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      }
+    },
+    {
+      "type": "table",
+      "title": "Background jobs",
+      "description": "TimescaleDB's own jobs: aggregate refresh, compression and retention. A failed last run or a growing failure count needs a look at docker compose logs timescaledb.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ruview-timescaledb"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ruview-timescaledb"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT CASE j.proc_name WHEN 'policy_refresh_continuous_aggregate' THEN 'refresh'\n                        WHEN 'policy_compression' THEN 'compress'\n                        WHEN 'policy_retention' THEN 'retention'\n                        ELSE j.proc_name END AS \"policy\",\n       coalesce(a.view_schema || '.' || a.view_name,\n                j.hypertable_schema || '.' || j.hypertable_name) AS \"table\",\n       s.last_run_status AS \"last run\",\n       s.last_successful_finish AS \"last success\",\n       s.total_failures AS \"failures\"\nFROM timescaledb_information.jobs AS j\nLEFT JOIN timescaledb_information.job_stats AS s USING (job_id)\nLEFT JOIN timescaledb_information.continuous_aggregates AS a\n       ON a.materialization_hypertable_schema = j.hypertable_schema\n      AND a.materialization_hypertable_name = j.hypertable_name\nWHERE j.job_id >= 1000\nORDER BY 2, 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "minWidth": 50
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "policy"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 75
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last run"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "Success": {
+                        "text": "Success",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "Failed": {
+                        "text": "Failed",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 75
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "last success"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeFromNow"
+              },
+              {
+                "id": "custom.width",
+                "value": 118
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failures"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 62
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "id": 20,
+      "gridPos": {
+        "h": 13,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      }
+    }
+  ]
+}

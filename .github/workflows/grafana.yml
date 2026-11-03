@@ -1,0 +1,87 @@
+name: Grafana dashboards
+
+# WP1.3: the SQL dashboards in docker/grafana and their TimescaleDB
+# datasource. Starts the compose timescaledb and grafana services, applies
+# the migrations, loads 35 days of SYNTHETIC household data
+# (grafana/tests/seed.sql), then sends every panel and annotation query
+# through Grafana's query API, which logs in to the database as the read-only
+# grafana role. A query error fails the job, and so does a panel that follows
+# the time picker but finds nothing in the seed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/grafana/**'
+      - 'docker/timescaledb/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/grafana.yml'
+  pull_request:
+    paths:
+      - 'docker/grafana/**'
+      - 'docker/timescaledb/**'
+      - 'docker/docker-compose.yml'
+      - '.github/workflows/grafana.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dashboards:
+    name: dashboard queries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: docker
+    env:
+      PG_PORT: '55432'
+      GRAFANA_PORT: '3030'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Generate throwaway passwords
+        run: |
+          for var in POSTGRES_PASSWORD PG_TELEGRAF_PASSWORD PG_GRAFANA_PASSWORD GRAFANA_PASSWORD; do
+            value="$(openssl rand -hex 24)"
+            echo "::add-mask::$value"
+            echo "$var=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Start TimescaleDB and apply migrations
+        run: |
+          # db-migrate from this checkout where the compose file builds it,
+          # instead of pulling an image.
+          docker compose build db-migrate
+          docker compose up -d --wait timescaledb
+          docker compose run --rm db-migrate
+
+      - name: Start Grafana (compose service, without InfluxDB)
+        run: |
+          docker compose up -d --no-deps grafana
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${GRAFANA_PORT}/api/health"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Grafana did not become healthy"
+          exit 1
+
+      # Right before the check: the panels of the last 2 minutes need fresh rows.
+      - name: Load the synthetic data
+        run: >
+          docker compose exec -T timescaledb
+          psql -X -q -U postgres -d ruview -v ON_ERROR_STOP=1 -f - < grafana/tests/seed.sql
+
+      - name: Run every dashboard query
+        run: python3 grafana/tests/check_dashboards.py --url "http://127.0.0.1:${GRAFANA_PORT}" grafana/dashboards
+
+      - name: Logs
+        if: failure()
+        run: |
+          docker compose logs grafana | tail -n 80
+          docker compose logs timescaledb | tail -n 30
