@@ -136,7 +136,8 @@ commit's `sha-<7>` once `fork-images.yml` has finished for it:
 
 ```bash
 cd /volume1/docker/RuView/docker
-mkdir -p data/csi && sudo chown 65534:65534 data/csi
+# No sudo needed, and ./data may be root-owned (the sensing-server mounts it).
+docker run --rm -v "$PWD/data:/d" alpine:3.20 sh -c 'mkdir -p /d/csi && chown 65534:65534 /d/csi'
 docker compose pull csi-recorder sensing-server analytics
 docker compose up -d sensing-server csi-recorder analytics   # server picks up RUVIEW_UDP_TEE
 docker compose restart telegraf

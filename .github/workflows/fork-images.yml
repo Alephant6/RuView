@@ -68,6 +68,16 @@ jobs:
             file: docker/csi-recorder/Dockerfile
             submodules: false
             free_disk: false
+          - name: mosquitto
+            context: docker/mosquitto
+            file: docker/mosquitto/Dockerfile
+            submodules: false
+            free_disk: false
+          - name: db-migrate
+            context: docker/timescaledb
+            file: docker/timescaledb/Dockerfile
+            submodules: false
+            free_disk: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -176,6 +186,45 @@ jobs:
           docker exec rec python -m csi_recorder export /data/ring --all | wc -l | grep -qx 20
           docker logs rec 2>&1 | tail -20
           docker stop rec
+
+      - name: Smoke-test mosquitto
+        if: matrix.name == 'mosquitto'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          # As docker-compose.yml runs it: uid 1883, read-only, no capabilities.
+          opts=(--user 1883:1883 --read-only --tmpfs /tmp --cap-drop ALL)
+          # start.sh reads its files and refuses a setting that would change
+          # the generated config with exit code 1.
+          rc=0
+          docker run --rm "${opts[@]}" -e 'MQTT_HOST=bad host' "$IMAGE" || rc=$?
+          test "$rc" -eq 1
+          # Without MQTT_HOST it runs the bus alone.
+          docker run -d --name bus "${opts[@]}" -e MQTT_HOST= "$IMAGE"
+          for _ in $(seq 1 20); do
+            docker exec bus mosquitto_sub -h 127.0.0.1 -t '$SYS/broker/uptime' -C 1 -W 2 && break
+            sleep 1
+          done
+          docker exec bus mosquitto_sub -h 127.0.0.1 -t '$SYS/broker/uptime' -C 1 -W 5
+          docker logs bus 2>&1 | tail -5
+          docker rm -fv bus
+
+      - name: Smoke-test db-migrate
+        if: matrix.name == 'db-migrate'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.name }}:sha-${GITHUB_SHA::7}"
+          base="$(sed -n 's/^FROM //p' docker/timescaledb/Dockerfile)"
+          pw="$(openssl rand -hex 24)"
+          echo "::add-mask::$pw"
+          docker network create smoke
+          docker run -d --name db --network smoke -e POSTGRES_PASSWORD="$pw" "$base"
+          # As docker-compose.yml runs it: postgres, read-only, no capabilities.
+          docker run --rm --network smoke --read-only --cap-drop ALL \
+            -e PGHOST=db -e PGDATABASE=ruview -e POSTGRES_PASSWORD="$pw" \
+            "$IMAGE" | tee "$RUNNER_TEMP/migrate.log"
+          grep -q "migration(s) applied" "$RUNNER_TEMP/migrate.log"
+          docker rm -fv db
 
       - name: Summary
         run: |
