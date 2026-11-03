@@ -16,8 +16,10 @@ recent builds emit one update per CSI frame. The bridge therefore:
 - publishes `${MQTT_PREFIX}/state` only for new ticks, at most STATE_MAX_HZ;
 - writes missing heart/breathing rates as JSON null instead of 0.0, and
   adds quality fields (vitals_present, stale_source, abstention_reason, ...);
-- publishes per-node health at most NODE_MAX_HZ and person slots only when
-  they change (plus a heartbeat), and availability topics only on transitions;
+- publishes per-node health at most NODE_MAX_HZ, and person slots only when
+  they change, at most PERSON_MAX_HZ (plus a heartbeat), each with an
+  availability topic that follows the published state, so flickering tracks
+  cannot flood Home Assistant's recorder;
 - reports its own view of the stream on `${MQTT_PREFIX}/bridge` (retained)
   every STATUS_INTERVAL_S, so a stalled source is visible even though the
   state topic goes quiet.
@@ -57,13 +59,27 @@ HA_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
 DEVICE_NAME = os.getenv("DEVICE_NAME", "RuView Sensing")
 DEVICE_ID = os.getenv("DEVICE_ID", "ruview")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # Room-level HA entities (presence, HR/BR, person count, motion, fall, ...).
 # Set ROOM_ENTITIES=false when the sensing-server's built-in MQTT publisher
 # (`--mqtt`, ADR-115) owns those entities: the bridge then retracts its own
 # retained room-level discovery configs and only announces the per-person
 # slot / enrolled-label entities, which upstream does not publish. The
 # ruview/* state topics keep flowing either way for Telegraf.
-ROOM_ENTITIES = os.getenv("ROOM_ENTITIES", "true").strip().lower() in ("1", "true", "yes", "on")
+ROOM_ENTITIES = _env_flag("ROOM_ENTITIES", "true")
+# Per-person Confidence and X/Y/Z entities. Off by default: the positions
+# come from the server's pose synthesiser, not from a located person, and
+# change on nearly every message, each of which Home Assistant records. Off
+# retracts their discovery configs; the values stay on ruview/person/<key>.
+HA_PERSON_DETAIL = _env_flag("HA_PERSON_DETAIL", "false")
+# The bridge's "Node <id> RSSI" entities. Off by default (configs retracted):
+# the sensing-server's built-in publisher has an RSSI entity per node.
+HA_NODE_RSSI = _env_flag("HA_NODE_RSSI", "false")
 
 # Per-person fixed-slot publishing. `MAX_TRACKED_PERSONS` slots are registered
 # in HA Discovery; each tick the bridge sorts detected persons by `bbox.x`
@@ -78,7 +94,10 @@ Z_MAX = float(os.getenv("Z_MAX", "100.0"))
 # Publish-rate limits. 0 disables the limit for that topic family.
 STATE_MAX_HZ = float(os.getenv("STATE_MAX_HZ", "10"))
 NODE_MAX_HZ = float(os.getenv("NODE_MAX_HZ", "1"))
-PERSON_MAX_HZ = float(os.getenv("PERSON_MAX_HZ", "1"))
+# Every change of a person topic, appearing and leaving included, waits for
+# this interval (5 s by default), so a track that flickers or changes id on
+# every tick costs one message per interval instead of one per tick.
+PERSON_MAX_HZ = float(os.getenv("PERSON_MAX_HZ", "0.2"))
 # Unchanged person payloads are re-sent this often so consumers can tell
 # "nothing changed" from "bridge gone".
 PERSON_HEARTBEAT_S = float(os.getenv("PERSON_HEARTBEAT_S", "30"))
@@ -145,6 +164,20 @@ def _optional_number(field: str, expr: str, prefix: str = "") -> str:
     return f"{{{{ {prefix}{ref} {expr} if {ref} is number else None }}}}"
 
 
+def _optional_text(field: str) -> str:
+    """Value template that renders `None` (HA: unknown) unless `field` is a
+    non-empty string. The `is string` test does not touch a missing field, so
+    a payload without it (an empty slot) logs no template warning in HA."""
+    ref = f"value_json.{field}"
+    return f"{{{{ {ref} if {ref} is string and {ref} else None }}}}"
+
+
+def _retract_unless(enabled: bool, msgs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`msgs`, or empty retained payloads on the same config topics, which
+    make Home Assistant remove those entities."""
+    return msgs if enabled else [(topic, "") for topic, _ in msgs]
+
+
 def _discovery(component: str, object_id: str, payload: dict) -> tuple[str, str]:
     """Build (topic, payload) for HA MQTT Discovery."""
     topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
@@ -205,10 +238,7 @@ def discovery_messages() -> list[tuple[str, str]]:
     With ROOM_ENTITIES off, room-level configs are replaced by empty retained
     payloads, which makes Home Assistant remove those entities.
     """
-    room = room_discovery_messages()
-    if not ROOM_ENTITIES:
-        room = [(topic, "") for topic, _ in room]
-    return room + slot_discovery_messages()
+    return _retract_unless(ROOM_ENTITIES, room_discovery_messages()) + slot_discovery_messages()
 
 
 def room_discovery_messages() -> list[tuple[str, str]]:
@@ -312,81 +342,76 @@ def room_discovery_messages() -> list[tuple[str, str]]:
     return msgs
 
 
-def slot_discovery_messages() -> list[tuple[str, str]]:
-    """Per-person slot entities (person_1 .. person_N)."""
-    msgs: list[tuple[str, str]] = []
+def person_discovery_messages(object_prefix: str, name: str, state_topic: str,
+                              avail_topic: str, axes: str = "xyz") -> list[tuple[str, str]]:
+    """Entities of one person slot or enrolled label.
 
-    # ── Per-person fixed slots ─────────────────────────────────────────
-    # Each slot gets its own state + availability topic so HA entities
-    # cleanly drop to "unavailable" when nobody is in that slot, rather
-    # than displaying stale numbers.
-    #
-    # NOTE: per-slot heart rate / breathing rate is intentionally absent.
-    # `SensingUpdate.vital_signs` is currently a single global reading; until
-    # the sensing-server attaches per-track vitals to `PersonDetection`,
-    # publishing per-slot HR/BR would just produce broken entities.
-    for slot in range(1, MAX_TRACKED_PERSONS + 1):
-        state_topic = person_state_topic(slot)
-        avail_topic = person_avail_topic(slot)
-        slot_avail = [
-            {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
-            {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
-        ]
+    Each has its own state + availability topic so HA entities cleanly drop
+    to "unavailable" when nobody is in that slot, rather than displaying
+    stale numbers. Present and Zone are always announced; Confidence and the
+    `axes` positions only with HA_PERSON_DETAIL (otherwise retracted). Every
+    template accepts the `{"occupied": false}` payload of an empty slot.
+    """
+    availability = [
+        {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
+        {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
+    ]
 
-        def _slot(component: str, object_id: str, payload: dict) -> tuple[str, str]:
-            """Build a per-slot discovery message with chained availability."""
-            topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
-            base = {
-                "device": DEVICE_BLOCK,
-                "availability": slot_avail,
-                "availability_mode": "all",
-                "unique_id": f"{DEVICE_ID}_{object_id}",
-            }
-            base.update(payload)
-            return topic, json.dumps(base)
-
-        msgs.append(_slot("binary_sensor", f"person_{slot}_present", {
-            "name": f"Person {slot} Present",
+    def _entity(component: str, suffix: str, payload: dict) -> tuple[str, str]:
+        """Build a discovery message with chained availability."""
+        object_id = f"{object_prefix}_{suffix}"
+        topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
+        base = {
+            "device": DEVICE_BLOCK,
+            "availability": availability,
+            "availability_mode": "all",
+            "unique_id": f"{DEVICE_ID}_{object_id}",
             "state_topic": state_topic,
+        }
+        base.update(payload)
+        return topic, json.dumps(base)
+
+    msgs = [
+        _entity("binary_sensor", "present", {
+            "name": f"{name} Present",
             "value_template": "{{ 'ON' if value_json.occupied else 'OFF' }}",
             "device_class": "occupancy",
-        }))
-        msgs.append(_slot("sensor", f"person_{slot}_confidence", {
-            "name": f"Person {slot} Confidence",
-            "state_topic": state_topic,
-            "value_template": "{{ (value_json.confidence * 100) | round(1) }}",
-            "unit_of_measurement": "%",
-            "state_class": "measurement",
-            "icon": "mdi:percent",
-        }))
-        msgs.append(_slot("sensor", f"person_{slot}_x", {
-            "name": f"Person {slot} X",
-            "state_topic": state_topic,
-            "value_template": "{{ value_json.x | round(2) }}",
-            "icon": "mdi:axis-x-arrow",
-            "entity_category": "diagnostic",
-        }))
-        msgs.append(_slot("sensor", f"person_{slot}_y", {
-            "name": f"Person {slot} Y",
-            "state_topic": state_topic,
-            "value_template": "{{ value_json.y | round(2) }}",
-            "icon": "mdi:axis-y-arrow",
-            "entity_category": "diagnostic",
-        }))
-        msgs.append(_slot("sensor", f"person_{slot}_z", {
-            "name": f"Person {slot} Z",
-            "state_topic": state_topic,
-            "value_template": "{{ value_json.z | round(2) }}",
-            "icon": "mdi:axis-z-arrow",
-            "entity_category": "diagnostic",
-        }))
-        msgs.append(_slot("sensor", f"person_{slot}_zone", {
-            "name": f"Person {slot} Zone",
-            "state_topic": state_topic,
-            "value_template": "{{ value_json.zone }}",
+        }),
+        _entity("sensor", "zone", {
+            "name": f"{name} Zone",
+            "value_template": _optional_text("zone"),
             "icon": "mdi:map-marker",
+        }),
+    ]
+    detail = [_entity("sensor", "confidence", {
+        "name": f"{name} Confidence",
+        "value_template": _optional_number("confidence", "* 100) | round(1)", prefix="("),
+        "unit_of_measurement": "%",
+        "state_class": "measurement",
+        "icon": "mdi:percent",
+    })]
+    for axis in axes:
+        detail.append(_entity("sensor", axis, {
+            "name": f"{name} {axis.upper()}",
+            "value_template": _optional_number(axis, "| round(2)"),
+            "icon": f"mdi:axis-{axis}-arrow",
+            "entity_category": "diagnostic",
         }))
+    return msgs + _retract_unless(HA_PERSON_DETAIL, detail)
 
+
+def slot_discovery_messages() -> list[tuple[str, str]]:
+    """Per-person slot entities (person_1 .. person_N).
+
+    NOTE: per-slot heart rate / breathing rate is intentionally absent.
+    `SensingUpdate.vital_signs` is currently a single global reading; until
+    the sensing-server attaches per-track vitals to `PersonDetection`,
+    publishing per-slot HR/BR would just produce broken entities.
+    """
+    msgs: list[tuple[str, str]] = []
+    for slot in range(1, MAX_TRACKED_PERSONS + 1):
+        msgs += person_discovery_messages(f"person_{slot}", f"Person {slot}",
+                                          person_state_topic(slot), person_avail_topic(slot))
     return msgs
 
 
@@ -538,25 +563,26 @@ class RateGate:
 class ChangeGate:
     """Publish a topic when its payload changes, rate-limited, plus a heartbeat.
 
-    A change in `key` (occupied / track / zone) goes out immediately; other
-    changes (positions, confidence) at most every `min_interval_s`; an
-    unchanged payload only every `heartbeat_s`.
+    A changed payload goes out at most every `min_interval_s`, whatever
+    changed; an unchanged one only every `heartbeat_s`. A change inside the
+    interval is held, not lost: the first message after the interval goes
+    out if it still differs from the last one sent, so a value that flickers
+    and returns within the interval is never published.
     """
 
     def __init__(self, min_interval_s: float, heartbeat_s: float) -> None:
         self._min_interval_s = min_interval_s
         self._heartbeat_s = heartbeat_s
-        self._last: dict[str, tuple[float, str, Any]] = {}
+        self._last: dict[str, tuple[float, str]] = {}
 
-    def allow(self, topic: str, payload: str, key: Any, now: float) -> bool:
+    def allow(self, topic: str, payload: str, now: float) -> bool:
         prev = self._last.get(topic)
         if prev is not None:
-            last_t, last_payload, last_key = prev
-            if key == last_key:
-                wait = self._heartbeat_s if payload == last_payload else self._min_interval_s
-                if now - last_t < wait:
-                    return False
-        self._last[topic] = (now, payload, key)
+            last_t, last_payload = prev
+            wait = self._heartbeat_s if payload == last_payload else self._min_interval_s
+            if now - last_t < wait:
+                return False
+        self._last[topic] = (now, payload)
         return True
 
     def reset(self) -> None:
@@ -635,62 +661,10 @@ class LabelRegistry:
             return
         self._seen.add(label)
 
-        object_prefix = _safe_object_id(label)
-        state_topic = label_state_topic(label)
-        avail_topic = label_avail_topic(label)
-        slot_avail = [
-            {"topic": AVAIL_TOPIC, "payload_available": "online", "payload_not_available": "offline"},
-            {"topic": avail_topic, "payload_available": "online", "payload_not_available": "offline"},
-        ]
-
-        def _entity(component: str, suffix: str, payload: dict) -> tuple[str, str]:
-            object_id = f"person_{object_prefix}_{suffix}"
-            topic = f"{HA_PREFIX}/{component}/{DEVICE_ID}/{object_id}/config"
-            base = {
-                "device": DEVICE_BLOCK,
-                "availability": slot_avail,
-                "availability_mode": "all",
-                "unique_id": f"{DEVICE_ID}_{object_id}",
-            }
-            base.update(payload)
-            return topic, json.dumps(base)
-
-        entities = [
-            _entity("binary_sensor", "present", {
-                "name": f"{label.title()} Present",
-                "state_topic": state_topic,
-                "value_template": "{{ 'ON' if value_json.occupied else 'OFF' }}",
-                "device_class": "occupancy",
-            }),
-            _entity("sensor", "confidence", {
-                "name": f"{label.title()} Confidence",
-                "state_topic": state_topic,
-                "value_template": "{{ (value_json.confidence * 100) | round(1) }}",
-                "unit_of_measurement": "%",
-                "state_class": "measurement",
-                "icon": "mdi:percent",
-            }),
-            _entity("sensor", "x", {
-                "name": f"{label.title()} X",
-                "state_topic": state_topic,
-                "value_template": "{{ value_json.x | round(2) }}",
-                "icon": "mdi:axis-x-arrow",
-                "entity_category": "diagnostic",
-            }),
-            _entity("sensor", "y", {
-                "name": f"{label.title()} Y",
-                "state_topic": state_topic,
-                "value_template": "{{ value_json.y | round(2) }}",
-                "icon": "mdi:axis-y-arrow",
-                "entity_category": "diagnostic",
-            }),
-            _entity("sensor", "zone", {
-                "name": f"{label.title()} Zone",
-                "state_topic": state_topic,
-                "value_template": "{{ value_json.zone }}",
-                "icon": "mdi:map-marker",
-            }),
-        ]
+        entities = person_discovery_messages(
+            f"person_{_safe_object_id(label)}", label.title(),
+            label_state_topic(label), label_avail_topic(label), axes="xy",
+        )
         for topic, payload in entities:
             self._client.publish(topic, payload, retain=True)
         LOG.info("registered profile label %r with HA discovery", label)
@@ -727,7 +701,8 @@ def node_payloads(update: dict[str, Any]) -> dict[int, dict[str, Any]]:
 
 
 class NodeRegistry:
-    """Auto-publishes discovery configs the first time a node id appears."""
+    """Publishes (or, without HA_NODE_RSSI, retracts) a node's RSSI entity
+    the first time its id appears."""
 
     def __init__(self, client: mqtt.Client) -> None:
         self._client = client
@@ -747,8 +722,8 @@ class NodeRegistry:
                 "state_class": "measurement",
                 "entity_category": "diagnostic",
             })
-            self._client.publish(topic, discovery, retain=True)
-            LOG.info("registered node %s with HA discovery", nid)
+            self._client.publish(topic, discovery if HA_NODE_RSSI else "", retain=True)
+            LOG.info("%s node %s RSSI entity", "registered" if HA_NODE_RSSI else "retracted", nid)
 
         self._client.publish(f"{MQTT_PREFIX}/nodes/{nid}", json.dumps(payload))
 
@@ -772,8 +747,9 @@ def make_mqtt(on_connected: threading.Event | None = None) -> mqtt.Client:
             for topic, payload in discovery_messages():
                 c.publish(topic, payload, retain=True)
             LOG.info(
-                "HA discovery configs published (room entities %s)",
+                "HA discovery configs published (room entities %s, person detail %s)",
                 "on" if ROOM_ENTITIES else "retracted",
+                "on" if HA_PERSON_DETAIL else "retracted",
             )
             # Change-only topics are re-sent in full after a (re)connect.
             if on_connected is not None:
@@ -811,12 +787,13 @@ def _person_payload(person: dict[str, Any], label: str | None = None) -> dict[st
     payload: dict[str, Any] = {"occupied": True}
     if label is not None:
         payload["label"] = label
+    # Rounded to the precision HA shows, so float noise below it is no change.
     payload.update({
         "track_id": int(person.get("id", 0)),
-        "confidence": float(person.get("confidence", 0.0)),
-        "x": cx,
-        "y": cy,
-        "z": 0.0 if z is None else z,
+        "confidence": round(float(person.get("confidence", 0.0)), 3),
+        "x": round(cx, 2),
+        "y": round(cy, 2),
+        "z": 0.0 if z is None else round(z, 2),
         "zone": str(person.get("zone", "")),
     })
     return payload
@@ -842,16 +819,19 @@ class Exporter:
         # A fall seen on a throttled tick is carried into the next state.
         self._pending_fall = False
 
-    def _publish_avail(self, topic: str, value: str) -> None:
-        if self._avail.get(topic) != value:
-            self._avail[topic] = value
-            self._client.publish(topic, value, retain=True)
-
-    def _publish_person(self, topic: str, payload: dict[str, Any], now: float) -> None:
+    def _publish_person(self, state_topic: str, avail_topic: str,
+                        payload: dict[str, Any], now: float) -> None:
+        """Send a slot or label state when the change gate allows it, preceded
+        by its availability if that differs from the last one sent, so the
+        availability can never change faster than the state."""
         body = json.dumps(payload)
-        key = (payload.get("occupied"), payload.get("track_id"), payload.get("zone"))
-        if self._person_gate.allow(topic, body, key, now):
-            self._client.publish(topic, body)
+        if not self._person_gate.allow(state_topic, body, now):
+            return
+        avail = "online" if payload.get("occupied") else "offline"
+        if self._avail.get(avail_topic) != avail:
+            self._avail[avail_topic] = avail
+            self._client.publish(avail_topic, avail, retain=True)
+        self._client.publish(state_topic, body)
 
     def handle(self, raw: str | bytes, now: float) -> None:
         """Process one WebSocket message. `now` is a monotonic clock."""
@@ -940,14 +920,14 @@ class Exporter:
         for person in labeled:
             label = str(person.get("label"))
             self._labels.ensure_registered(label)
-            self._publish_avail(label_avail_topic(label), "online")
-            self._publish_person(label_state_topic(label), _person_payload(person, label), now)
+            self._publish_person(label_state_topic(label), label_avail_topic(label),
+                                 _person_payload(person, label), now)
             published_labels.add(label)
 
         # Any previously-registered label not seen this tick goes offline.
         for label in self._labels._seen - published_labels:
-            self._publish_avail(label_avail_topic(label), "offline")
-            self._publish_person(label_state_topic(label), {"occupied": False, "label": label}, now)
+            self._publish_person(label_state_topic(label), label_avail_topic(label),
+                                 {"occupied": False, "label": label}, now)
 
         # Fixed slots — only used for unlabeled detections (multi-person
         # ticks today, or any tick before profiles are enrolled).
@@ -957,12 +937,8 @@ class Exporter:
         }
         for slot in range(1, MAX_TRACKED_PERSONS + 1):
             person = slot_assignments.get(slot)
-            if person is None:
-                self._publish_avail(person_avail_topic(slot), "offline")
-                self._publish_person(person_state_topic(slot), {"occupied": False}, now)
-                continue
-            self._publish_avail(person_avail_topic(slot), "online")
-            self._publish_person(person_state_topic(slot), _person_payload(person), now)
+            payload = {"occupied": False} if person is None else _person_payload(person)
+            self._publish_person(person_state_topic(slot), person_avail_topic(slot), payload, now)
 
 
 async def consume(stop: asyncio.Event, exporter: Exporter, status_now: asyncio.Event) -> None:
@@ -1028,7 +1004,7 @@ async def main() -> None:
     LOG.info("  HA:    discovery prefix=%r device_id=%r", HA_PREFIX, DEVICE_ID)
     LOG.info("  Slots: max_tracked_persons=%d z_gate=[%.2f, %.2f]",
              MAX_TRACKED_PERSONS, Z_MIN, Z_MAX)
-    LOG.info("  Rates: state<=%.1f Hz node<=%.1f Hz person<=%.1f Hz (heartbeat %.0fs)",
+    LOG.info("  Rates: state<=%g Hz node<=%g Hz person<=%g Hz (heartbeat %.0fs)",
              STATE_MAX_HZ, NODE_MAX_HZ, PERSON_MAX_HZ, PERSON_HEARTBEAT_S)
 
     stop = asyncio.Event()

@@ -13,7 +13,7 @@ import pytest
 
 os.environ.setdefault("STATE_MAX_HZ", "10")
 os.environ.setdefault("NODE_MAX_HZ", "1")
-os.environ.setdefault("PERSON_MAX_HZ", "1")
+os.environ.setdefault("PERSON_MAX_HZ", "0.2")
 os.environ.setdefault("PERSON_HEARTBEAT_S", "30")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -234,7 +234,7 @@ def person(pid: int, x: float, zone: str = "bed") -> dict:
             "bbox": {"x": x, "y": 1.0, "width": 0.4, "height": 1.0}}
 
 
-def test_person_avail_only_on_transitions_and_state_on_change():
+def test_person_changes_wait_for_the_interval():
     client = FakeClient()
     exp = bridge.Exporter(client)
     slot1 = bridge.person_state_topic(1)
@@ -244,25 +244,56 @@ def test_person_avail_only_on_transitions_and_state_on_change():
     assert client.topics(avail1) == ["offline"]
     assert len(client.topics(slot1)) == 1
 
+    # Someone appears: sent 1 / PERSON_MAX_HZ = 5 s after the last message.
     exp.handle(update(100, persons=[person(7, 1.0)]), now=2.0)
+    assert client.topics(avail1) == ["offline"]
+    exp.handle(update(101, persons=[person(7, 1.0)]), now=5.0)
     assert client.topics(avail1) == ["offline", "online"]
     assert json.loads(client.topics(slot1)[-1])["occupied"] is True
 
-    # Same person, moved slightly: rate-limited to PERSON_MAX_HZ.
-    exp.handle(update(101, persons=[person(7, 1.1)]), now=2.1)
-    exp.handle(update(102, persons=[person(7, 1.2)]), now=3.2)
+    # Moved: again at most once per interval.
+    exp.handle(update(102, persons=[person(7, 1.1)]), now=6.0)
+    assert len(client.topics(slot1)) == 2
+    exp.handle(update(103, persons=[person(7, 1.2)]), now=10.0)
     assert len(client.topics(slot1)) == 3
 
     # Unchanged payload: only the heartbeat.
-    exp.handle(update(103, persons=[person(7, 1.2)]), now=10.0)
+    exp.handle(update(104, persons=[person(7, 1.2)]), now=20.0)
     assert len(client.topics(slot1)) == 3
-    exp.handle(update(104, persons=[person(7, 1.2)]), now=40.0)
+    exp.handle(update(105, persons=[person(7, 1.2)]), now=40.0)
     assert len(client.topics(slot1)) == 4
 
-    # Zone change goes out immediately.
-    exp.handle(update(105, persons=[person(7, 1.2, zone="desk")]), now=40.1)
+    # A zone change waits like any other change.
+    exp.handle(update(106, persons=[person(7, 1.2, zone="desk")]), now=41.0)
+    assert len(client.topics(slot1)) == 4
+    exp.handle(update(107, persons=[person(7, 1.2, zone="desk")]), now=45.0)
     assert json.loads(client.topics(slot1)[-1])["zone"] == "desk"
     assert client.topics(avail1) == ["offline", "online"]
+
+
+def test_track_churn_and_ghosts_cost_one_message_per_interval():
+    client = FakeClient()
+    exp = bridge.Exporter(client)
+    # 30 s at 10 Hz: the track id changes on every tick, and a ghost second
+    # track comes and goes on alternate ticks.
+    for i in range(300):
+        persons = [person(i, 1.0)] + ([person(1000 + i, 3.0)] if i % 2 else [])
+        exp.handle(update(i + 1, persons=persons), now=i / 10)
+    for topic in (bridge.person_state_topic(1), bridge.person_state_topic(2),
+                  bridge.person_avail_topic(2)):
+        assert 1 <= len(client.topics(topic)) <= 7, topic
+
+
+def test_flicker_inside_the_interval_is_never_sent():
+    client = FakeClient()
+    exp = bridge.Exporter(client)
+    exp.handle(update(1, persons=[person(7, 1.0)]), now=0.0)
+    exp.handle(update(2), now=1.0)  # gone for one tick
+    # Back, with jitter below the 0.01 the payload is rounded to.
+    exp.handle(update(3, persons=[person(7, 1.001)]), now=1.1)
+    exp.handle(update(4, persons=[person(7, 1.0)]), now=6.0)
+    assert client.topics(bridge.person_avail_topic(1)) == ["online"]
+    assert len(client.topics(bridge.person_state_topic(1))) == 1
 
 
 def test_resync_republishes_availability():
@@ -304,3 +335,55 @@ def test_optional_number_templates_render_unknown_for_null():
     assert hr.render(value_json={"heart_rate_bpm": 61.6}) == "62.0"
     assert sq.render(value_json={"signal_quality": 0.4567}) == "45.7"
     assert sq.render(value_json={"signal_quality": None}) == "None"
+
+
+def config_topic(component: str, object_id: str) -> str:
+    return f"{bridge.HA_PREFIX}/{component}/{bridge.DEVICE_ID}/{object_id}/config"
+
+
+def test_person_templates_never_touch_a_missing_field(monkeypatch):
+    jinja2 = pytest.importorskip("jinja2")
+    monkeypatch.setattr(bridge, "HA_PERSON_DETAIL", True)
+    # StrictUndefined raises wherever HA's LoggingUndefined logs a warning or
+    # an error: printing, testing, iterating or computing with a missing field.
+    env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+    client = FakeClient()
+    bridge.LabelRegistry(client).ensure_registered("sq")
+    configs = [json.loads(p) for _, p in bridge.slot_discovery_messages()]
+    configs += [json.loads(p) for _, p, _ in client.published]
+    # Every payload the bridge sends on a slot or label topic.
+    payloads = [{"occupied": False}, {"occupied": False, "label": "sq"},
+                bridge._person_payload(person(7, 1.0), label="sq")]
+    rendered = {c["unique_id"]: [env.from_string(c["value_template"]).render(value_json=p)
+                                 for p in payloads] for c in configs}
+    prefix = f"{bridge.DEVICE_ID}_person"
+    assert rendered[f"{prefix}_1_present"] == ["OFF", "OFF", "ON"]
+    assert rendered[f"{prefix}_1_zone"] == ["None", "None", "bed"]
+    assert rendered[f"{prefix}_1_x"] == ["None", "None", "1.2"]
+    assert rendered[f"{prefix}_sq_confidence"] == ["None", "None", "80.0"]
+
+
+def test_detail_and_node_rssi_entities_are_opt_in(monkeypatch):
+    monkeypatch.setattr(bridge, "HA_PERSON_DETAIL", False)
+    monkeypatch.setattr(bridge, "HA_NODE_RSSI", False)
+    configs = dict(bridge.slot_discovery_messages())
+    assert json.loads(configs[config_topic("binary_sensor", "person_1_present")])
+    assert json.loads(configs[config_topic("sensor", "person_1_zone")])
+    for suffix in ("confidence", "x", "y", "z"):
+        assert configs[config_topic("sensor", f"person_1_{suffix}")] == ""
+    client = FakeClient()
+    bridge.LabelRegistry(client).ensure_registered("sq")
+    assert client.topics(config_topic("sensor", "person_sq_x")) == [""]
+    client = FakeClient()
+    bridge.Exporter(client).handle(update(1), now=0.0)
+    assert client.topics(config_topic("sensor", "node_1_rssi")) == [""]
+    # The node topic keeps flowing for Telegraf and the watchdog.
+    assert len(client.topics(f"{bridge.MQTT_PREFIX}/nodes/1")) == 1
+
+    monkeypatch.setattr(bridge, "HA_PERSON_DETAIL", True)
+    monkeypatch.setattr(bridge, "HA_NODE_RSSI", True)
+    configs = dict(bridge.slot_discovery_messages())
+    assert json.loads(configs[config_topic("sensor", "person_1_x")])["entity_category"] == "diagnostic"
+    client = FakeClient()
+    bridge.Exporter(client).handle(update(1), now=0.0)
+    assert json.loads(client.topics(config_topic("sensor", "node_1_rssi"))[0])["unit_of_measurement"] == "dBm"
