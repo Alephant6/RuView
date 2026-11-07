@@ -37,6 +37,17 @@ class Activity:
     kind: str                         # "moving" or "still"
 
 
+@dataclass
+class Step:
+    """A static change of one link's channel while nobody is home (an object
+    moved near a transmitter, a transmitter switching antennas)."""
+    start: float
+    end: float
+    rx: int
+    tx: str                           # "ap", "node1".., "neighbour"
+    size: float = 0.3                 # relative to the link's mean amplitude
+
+
 def _freq_block() -> np.ndarray:
     i = np.arange(64)
     return np.where(i < 32, i, i - 64)
@@ -61,7 +72,7 @@ def _coupling(room: str, rx_room: str, tx_room: str | None) -> float:
 
 
 def generate(path: Path, duration_s: float, activities: list[Activity], seed: int = 1,
-             body: float = 0.35) -> dict:
+             body: float = 0.35, steps: list[Step] | None = None) -> dict:
     """Write one .csi.raw.gz file; return frames per receiver<-transmitter link.
     The noise-floor byte carries -90 - transmitter index (ground truth for
     the clustering test; csi_lab does not use it)."""
@@ -88,6 +99,13 @@ def generate(path: Path, duration_s: float, activities: list[Activity], seed: in
             drift = 1.0 + 0.01 * np.sin(2 * np.pi * t / 1800.0 + rng.uniform(0, 6.28))
             h = h0[None, :] * drift[:, None]
             rssi = rssi_level + rng.normal(0, 0.8, size=n)
+            for st in steps or []:
+                if st.rx != rx or st.tx != tx:
+                    continue
+                inside = (t >= st.start) & (t < st.end)
+                sg, sdl = _channel(np.random.default_rng(zlib.crc32(f"step:{seed}:{rx}:{tx}".encode())), paths=2)
+                dh = _response(sg, sdl, f)
+                h[inside] += (st.size * np.abs(h0).mean() / max(np.abs(dh).mean(), 1e-9)) * dh[None, :]
             for act in activities:
                 c = _coupling(act.room, rx_room, tx_room)
                 inside = (t >= act.start) & (t < act.end)

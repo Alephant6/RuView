@@ -100,6 +100,12 @@ def test_labels_are_validated() -> None:
     with pytest.raises(L.LabError):
         L.parse_labels({"rooms": ROOMS, "segments": [
             {"name": "a", "start": "2026-10-14T18:00:00", "end": synth.iso(60), "occupied": []}]})
+    with pytest.raises(L.LabError):
+        L.parse_labels({"rooms": ROOMS, "segments": [
+            {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": [], "tags": ["no spaces"]}]})
+    tagged = L.parse_labels({"rooms": ROOMS, "segments": [
+        {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": [], "tags": ["vacuum:kitchen"]}]})
+    assert tagged.segments[0].role == "confounded"      # never an empty-home reference
     lab = L.parse_labels(LABELS)
     assert [s.role for s in lab.segments] == ["empty", "occupied", "occupied"]
     chunks = L.chunk_empty(lab.segments, 240)
@@ -144,6 +150,71 @@ def test_heldout_false_alarms_and_detection(recording: Path, capsys) -> None:
     assert loc["one_room_accuracy"] >= 0.9
 
 
+def test_links_keep_their_names_across_folds(recording: Path, capsys) -> None:
+    rep = run_json(recording, LABELS, capsys=capsys)
+    links = {d["link"]: d["folds"] for d in rep["evaluation"]["detectors"]
+             if d["kind"] == "link" and d["score"] == "fused" and d["horizon_s"] == 60}
+    inv = {s["stream"]: s["clusters"] for s in rep["inventory"]}
+    expected = {f"{k}c{j}" for k, n in inv.items() for j in range(n)}
+    assert set(links) == expected
+    assert set(links.values()) == {4}            # the same transmitter in every fold
+
+
+@pytest.fixture(scope="module")
+def stepped(tmp_path_factory) -> Path:
+    """One link (node 1 heard at node 2) changes its static channel in the
+    last empty chunk; the study is occupied afterwards, its second half
+    tagged as confounded."""
+    root = tmp_path_factory.mktemp("csi_step")
+    acts = [synth.Activity(16 * 60, 22 * 60, "study", "moving")]
+    steps = [synth.Step(12 * 60, 16 * 60, 2, "node1", 0.3)]
+    synth.generate(synth.ring_path(root), 22 * 60, acts, body=0.2, steps=steps)
+    return root
+
+
+STEP_LABELS = {"rooms": ROOMS, "segments": [
+    {"name": "empty", "start": synth.iso(0), "end": synth.iso(16 * 60), "occupied": []},
+    {"name": "study_moving", "start": synth.iso(16 * 60), "end": synth.iso(19 * 60), "occupied": ["study"]},
+    {"name": "study_vac", "start": synth.iso(19 * 60), "end": synth.iso(22 * 60), "occupied": ["study"],
+     "tags": ["vacuum:study"]}]}
+
+
+def test_one_drifting_link_is_found_and_outvoted(stepped: Path, capsys) -> None:
+    rep = run_json(stepped, STEP_LABELS, capsys=capsys)
+    ev = rep["evaluation"]
+    node2 = detector(ev, "node 2 fused@60s")
+    # the bad chunk is named, and it is the one with the step
+    assert max(node2["fa_by_chunk"], key=node2["fa_by_chunk"].get) == "empty#3"
+    assert node2["fa_by_chunk"]["empty#3"] >= 0.5
+    # the link table names the link: node 1 heard at node 2
+    lab = L.parse_labels(STEP_LABELS)
+    segs = L.chunk_empty(lab.segments, 240)
+    streams, _ = L.load_streams(stepped, segs, [])
+    stream = next(s for s in streams if s.key == "n2w128")
+    _c, gl, _far = L.global_links(streams, segs, 4)["n2w128"]
+    # (A fold whose reference holds the step may split that transmitter in
+    # two; the extra cluster is named "...+" and exists in that fold only.)
+    static = {d["link"]: d["fa_by_chunk"].get("empty#3", 0.0) for d in ev["detectors"]
+              if d["kind"] == "link" and d["score"] == "static" and d["horizon_s"] == 60
+              and d["link"].startswith("n2w128") and not d["link"].endswith("+")}
+    worst = max(static, key=static.get)
+    g = int(worst.split("c")[-1])
+    assert np.bincount(-stream.nf[gl == g] - 90).argmax() == 1      # transmitter node1
+    assert static[worst] >= 0.5
+    assert all(v <= 0.15 for k, v in static.items() if k != worst), static
+    # the median over links is not carried by one link; detection survives
+    for who in ("home", "node 2"):
+        mean, med = detector(ev, f"{who} fused@60s"), detector(ev, f"{who} fused_med@60s")
+        assert med["fa_heldout"] < mean["fa_heldout"], (who, med, mean)
+        assert med["detect"]["study_moving"] >= 0.9
+    assert detector(ev, "home fused_med@60s")["fa_heldout"] <= 0.1
+    # the tagged segment is scored but kept out of AUC and localization
+    assert ev["segment_roles"]["study_vac"] == "confounded"
+    assert "study_vac" in node2["detect"] and "study_vac" in node2["median_excess"]
+    loc = next(d for d in ev["localization"] if d["name"] == "fused@10s")
+    assert loc["one_room_windows"] == 35          # study_moving's windows only
+
+
 def test_separation_beats_mixed_links(recording: Path, capsys) -> None:
     rep = run_json(recording, LABELS, "--compare", capsys=capsys)
     sep, mixed = rep["evaluation"], rep["no_separation"]
@@ -178,6 +249,8 @@ def test_markdown_and_errors(recording: Path, capsys, tmp_path: Path) -> None:
                  "--chunk-min", "4"])
     out = capsys.readouterr().out
     assert rc == 0 and "## Streams" in out and "Localization" in out
+    assert "False alarms per held-out empty chunk" in out and "Links (@60s)" in out
+    assert "Median excess over the empty-home threshold" in out
     one_empty = labels_for([("empty", 0, 3 * 60, [])])
     rc = L.main(["evaluate", "--data", str(tmp_path), "--labels-json", json.dumps(one_empty)])
     assert rc == 2

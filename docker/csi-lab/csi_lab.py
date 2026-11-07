@@ -47,6 +47,7 @@ import re
 import struct
 import sys
 import time
+import warnings
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,7 +55,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-VERSION = 1
+VERSION = 2
 NS = 1_000_000_000
 
 # --- csi-recorder container (docker/csi-recorder/csi_recorder/rawfile.py) ---
@@ -71,6 +72,11 @@ _ADR018 = struct.Struct("<IBBHIIbbBB")   # magic node n_ant n_sub freq seq rssi 
 FLAG_FIRST_WORD_SANITIZED = 1 << 5
 
 SCORES = ("static", "motion", "phase", "rssi")
+# Combined scores: `fused` = mean exceedance of the four, `fused_mr` = of
+# motion and rssi only (the two that do not compare against a stored channel
+# shape), `fused_med` = median over links instead of the mean (node and
+# home only; one drifting link cannot carry it).
+COMBINED = ("fused", "fused_mr", "fused_med")
 
 
 class LabError(ValueError):
@@ -170,9 +176,15 @@ class Segment:
     occupied: list[str] | None      # [] = empty home, None = unknown
     note: str = ""
     parent: str = ""                # chunk of which labelled segment
+    tags: tuple[str, ...] = ()      # confounders, e.g. "vacuum:kitchen"
 
     @property
     def role(self) -> str:
+        # A tagged segment has something else moving in it (the robot vacuum,
+        # a fan): scored and reported, never part of the empty-home reference,
+        # the AUCs or the localization.
+        if self.tags:
+            return "confounded"
         if self.occupied is None:
             return "unknown"
         return "empty" if not self.occupied else "occupied"
@@ -223,7 +235,12 @@ def parse_labels(obj: Any) -> Labels:
             if not isinstance(occ, list) or any(r not in known for r in occ):
                 raise LabError(f"segment {name}: occupied must list rooms from {sorted(known)}")
             occ = sorted(set(occ))
-        segs.append(Segment(name, start, end, occ, str(raw.get("note", ""))[:200]))
+        tags = raw.get("tags") or []
+        if not isinstance(tags, list) or len(tags) > 4 or any(
+                not isinstance(t, str) or not _NAME_OK.match(t) for t in tags):
+            raise LabError(f"segment {name}: tags must be up to 4 short names")
+        segs.append(Segment(name, start, end, occ, str(raw.get("note", ""))[:200],
+                            tags=tuple(tags)))
     if not segs:
         raise LabError("labels need at least one segment")
     segs.sort(key=lambda s: s.start)
@@ -723,8 +740,31 @@ def _oos_scores(ws: WindowSummary, ref_segs: list[int], w_seg: np.ndarray,
     return sc
 
 
+def _agg(rows: list[np.ndarray], how: str = "mean") -> np.ndarray:
+    """NaN-aware mean or median across rows (all-NaN columns stay NaN, quietly)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        m = np.vstack(rows)
+        return np.nanmedian(m, axis=0) if how == "median" else np.nanmean(m, axis=0)
+
+
+def global_links(streams: list[Stream], segments: list[Segment], max_k: int) -> dict[str, tuple[Clusters, np.ndarray, np.ndarray]]:
+    """Transmitter clusters per stream fitted on every empty-home frame: the
+    names links keep across folds (and in the inventory table)."""
+    empty = [i for i, s in enumerate(segments) if s.role == "empty"]
+    out = {}
+    for stream in streams:
+        ref = np.flatnonzero(np.isin(stream.seg, empty)) if empty else np.arange(len(stream.t))
+        if len(ref) >= 50:
+            c = fit_clusters(stream, ref, max_k)
+            lab, far = assign(stream, c)
+            out[stream.key] = (c, lab, far)
+    return out
+
+
 def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
-             cfg: EvalConfig) -> dict[str, Any]:
+             cfg: EvalConfig, links: dict[str, tuple[Clusters, np.ndarray, np.ndarray]] | None = None
+             ) -> dict[str, Any]:
     w_start, w_seg = make_windows(segments, cfg.window_s, cfg.hop_s, labels.exclude)
     if not len(w_start):
         raise LabError("no complete window inside the segments")
@@ -738,12 +778,14 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
     loc: dict[str, dict[str, Any]] = {}
     cluster_info: dict[str, list[int]] = {}
     known = [i for i, sg in enumerate(segments) if sg.role == "occupied"]
+    scored = [i for i, sg in enumerate(segments) if sg.role in ("occupied", "unknown", "confounded")]
+    names = links if links is not None else global_links(streams, segments, cfg.max_k)
 
     def accumulate(values: np.ndarray, h: float) -> np.ndarray:
         return rolling(values, w_seg, 1 + int(round((h - cfg.window_s) / cfg.hop_s)))
 
     def add(name: str, meta: dict[str, Any], values: np.ndarray, ref_w: np.ndarray,
-            held_w: np.ndarray) -> None:
+            held_w: np.ndarray, held_name: str) -> None:
         held_mask = np.zeros(len(values), bool)
         held_mask[held_w] = True
         for h in horizons:
@@ -751,14 +793,16 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
             tau = _quant(acc_v[ref_w], cfg.q)
             if math.isnan(tau):
                 continue
-            rec = acc.setdefault(f"{name}@{int(h)}s", {**meta, "horizon_s": h, "fa": [], "det": {},
-                                                      "excess": {}, "auc_room": [], "auc_other": []})
+            rec = acc.setdefault(f"{name}@{int(h)}s", {**meta, "horizon_s": h, "fa": [], "fa_chunk": {},
+                                                      "det": {}, "excess": {}, "auc_room": [],
+                                                      "auc_other": []})
             held = acc_v[held_w]
             held = held[~np.isnan(held)]
             if len(held):
                 rec["fa"].append(float(np.mean(held > tau)))
+                rec["fa_chunk"][held_name] = rec["fa"][-1]
                 rec["excess"].setdefault("(held-out empty)", []).append(float(np.median(held) - tau))
-            for si in known + [i for i, sg in enumerate(segments) if sg.role == "unknown"]:
+            for si in scored:
                 v = acc_v[w_seg == si]
                 v = v[~np.isnan(v)]
                 if len(v):
@@ -803,6 +847,7 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
                     rec["two_rooms"].append((sum(t == set(occ) for t in top2), len(top2)))
 
     for held_seg, ref_segs in plans:
+        held_name = segments[held_seg].name
         ref_w = np.flatnonzero(np.isin(w_seg, ref_segs))
         held_w = np.flatnonzero(w_seg == held_seg)
         node_ex: dict[tuple[int, str], list[np.ndarray]] = {}
@@ -813,39 +858,55 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
             clus = fit_clusters(stream, ref_frames, cfg.max_k)
             cluster_info.setdefault(stream.key, []).append(clus.k)
             lab, _far = assign(stream, clus)
+            gid = names[stream.key][1] if stream.key in names else None
+            used: set[str] = set()
             for c in range(clus.k):
-                ws = summarise(stream, np.flatnonzero(lab == c), w_start, cfg.window_s, cfg.min_frames)
+                frames = np.flatnonzero(lab == c)
+                if not len(frames):
+                    continue
+                # Name the fold's cluster after the all-empty cluster most of
+                # its frames belong to, so a link keeps its name across folds.
+                g = int(np.bincount(gid[frames]).argmax()) if gid is not None else c
+                link = f"{stream.key}c{g}"
+                while link in used:
+                    link += "+"
+                used.add(link)
+                ws = summarise(stream, frames, w_start, cfg.window_s, cfg.min_frames)
                 sc = _oos_scores(ws, ref_segs, w_seg, cfg.n_modes)
                 if sc is None:
                     continue
-                link = f"{stream.key}c{c}"
-                exs = []
+                meta = {"kind": "link", "node": stream.node, "link": link}
+                exs: dict[str, np.ndarray] = {}
                 for score, vals in sc.items():
                     tau = _quant(vals[ref_w], cfg.q)
                     if math.isnan(tau):
                         continue
-                    ex = vals - tau
-                    exs.append(ex)
-                    node_ex.setdefault((stream.node, score), []).append(ex)
-                    add(f"link {link} {score}", {"kind": "link", "node": stream.node, "link": link,
-                                                 "score": score}, vals, ref_w, held_w)
+                    exs[score] = vals - tau
+                    node_ex.setdefault((stream.node, score), []).append(exs[score])
+                    add(f"link {link} {score}", {**meta, "score": score}, vals, ref_w, held_w, held_name)
                 if exs:
-                    with np.errstate(all="ignore"):
-                        fused = np.nanmean(np.vstack(exs), axis=0)
+                    fused = _agg(list(exs.values()))
                     node_ex.setdefault((stream.node, "fused"), []).append(fused)
+                    add(f"link {link} fused", {**meta, "score": "fused"}, fused, ref_w, held_w, held_name)
+                    mr = [exs[k] for k in ("motion", "rssi") if k in exs]
+                    if mr:
+                        node_ex.setdefault((stream.node, "fused_mr"), []).append(_agg(mr))
         by_score: dict[str, dict[int, np.ndarray]] = {}
         all_by_score: dict[str, list[np.ndarray]] = {}
-        for (node, score), exs in node_ex.items():
-            with np.errstate(all="ignore"):
-                mean_ex = np.nanmean(np.vstack(exs), axis=0)
+        for (node, score), exs in sorted(node_ex.items()):
             all_by_score.setdefault(score, []).extend(exs)
-            by_score.setdefault(score, {})[node] = mean_ex
-            add(f"node {node} {score}", {"kind": "node", "node": node, "room": room_of.get(node),
-                                         "score": score}, mean_ex, ref_w, held_w)
+            variants = [(score, _agg(exs))]
+            if score == "fused":
+                variants.append(("fused_med", _agg(exs, "median")))
+            for name, vals in variants:
+                by_score.setdefault(name, {})[node] = vals
+                add(f"node {node} {name}", {"kind": "node", "node": node, "room": room_of.get(node),
+                                            "score": name}, vals, ref_w, held_w, held_name)
         for score, exs in all_by_score.items():
-            with np.errstate(all="ignore"):
-                mean_ex = np.nanmean(np.vstack(exs), axis=0)
-            add(f"home {score}", {"kind": "home", "score": score}, mean_ex, ref_w, held_w)
+            add(f"home {score}", {"kind": "home", "score": score}, _agg(exs), ref_w, held_w, held_name)
+            if score == "fused":
+                add("home fused_med", {"kind": "home", "score": "fused_med"}, _agg(exs, "median"),
+                    ref_w, held_w, held_name)
         for score, node_vals in by_score.items():
             # Each node relative to its own empty-home threshold at this horizon.
             localize(score, node_vals)
@@ -853,11 +914,13 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
     detectors = []
     for key, rec in acc.items():
         fa = rec["fa"]
-        out = {k: v for k, v in rec.items() if k not in ("fa", "det", "excess", "auc_room", "auc_other")}
+        out = {k: v for k, v in rec.items()
+               if k not in ("fa", "fa_chunk", "det", "excess", "auc_room", "auc_other")}
         out["name"] = key
         out["folds"] = len(fa)
         out["fa_heldout"] = _r(float(np.mean(fa))) if fa else None
         out["fa_heldout_max"] = _r(float(np.max(fa))) if fa else None
+        out["fa_by_chunk"] = {k: _r(v) for k, v in rec["fa_chunk"].items()}
         out["detect"] = {k: _r(float(np.mean(v))) for k, v in rec["det"].items()}
         out["median_excess"] = {k: _r(float(np.nanmean(v))) for k, v in rec["excess"].items()}
         out["auc_room"] = _r(float(np.mean(rec["auc_room"]))) if rec["auc_room"] else None
@@ -886,23 +949,24 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
         "detectors": detectors,
         "localization": localization,
         "segments_scored": [sg.name for sg in segments],
+        "segment_roles": {sg.name: sg.role for sg in segments},
+        "heldout_chunks": [segments[i].name for i, _ in plans],
     }
 
 
-def inventory(streams: list[Stream], segments: list[Segment], max_k: int) -> list[dict[str, Any]]:
+def inventory(streams: list[Stream], segments: list[Segment], max_k: int,
+              links: dict[str, tuple[Clusters, np.ndarray, np.ndarray]] | None = None) -> list[dict[str, Any]]:
     """Rates and transmitter clusters per stream, clustering on all empty frames."""
-    empty = [i for i, s in enumerate(segments) if s.role == "empty"]
     dur = {i: s.end - s.start for i, s in enumerate(segments)}
+    links = links if links is not None else global_links(streams, segments, max_k)
     out = []
     for stream in streams:
-        ref = np.flatnonzero(np.isin(stream.seg, empty)) if empty else np.arange(len(stream.t))
         rec: dict[str, Any] = {"stream": stream.key, "node": stream.node, "width": stream.width,
                                "subcarriers_kept": int(len(stream.valid)), "frames": int(len(stream.t))}
         rec["hz"] = {segments[i].name: _r(np.sum(stream.seg == i) / dur[i], 2) for i in range(len(segments))}
         rec["rssi_p10_p50_p90"] = [_r(float(q), 1) for q in np.quantile(stream.rssi, [0.1, 0.5, 0.9])]
-        if len(ref) >= 50:
-            c = fit_clusters(stream, ref, max_k)
-            lab, far = assign(stream, c)
+        if stream.key in links:
+            c, lab, far = links[stream.key]
             rec["clusters"] = c.k
             rec["silhouette"] = _r(c.silhouette)
             per = []
@@ -918,65 +982,110 @@ def inventory(streams: list[Stream], segments: list[Segment], max_k: int) -> lis
             rec["per_cluster"] = per
             rec["far_share"] = {segments[i].name: _r(float(np.mean(far[stream.seg == i])), 3)
                                 for i in range(len(segments)) if np.any(stream.seg == i)}
+            # RSSI of the far frames: a new transmitter (phone, vacuum) has
+            # its own level; a person close to the node does not.
+            rec["far_rssi_median"] = {
+                segments[i].name: _r(float(np.median(stream.rssi[far & (stream.seg == i)])), 1)
+                for i in range(len(segments)) if np.sum(far & (stream.seg == i)) >= 20}
         out.append(rec)
     return out
 
 
 # ------------------------------------------------------------------ report
 
+def _table(header: list[str], rows: list[list[Any]]) -> list[str]:
+    out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    out += ["| " + " | ".join("" if v is None else str(v) for v in row) + " |" for row in rows]
+    return out
+
+
 def markdown(report: dict[str, Any]) -> str:
     lines = [f"# csi_lab report (v{VERSION}, MEASURED on the segments below only)", ""]
-    lines.append("| segment | start (UTC) | min | occupied |")
-    lines.append("|---|---|---|---|")
-    for s in report["segments"]:
-        occ = "unknown" if s["occupied"] is None else (", ".join(s["occupied"]) or "empty")
-        lines.append(f"| {s['name']} | {s['start']} | {s['minutes']} | {occ} |")
+    lines += _table(["segment", "start (UTC)", "min", "occupied", "tags"], [
+        [s["name"], s["start"], s["minutes"],
+         "unknown" if s["occupied"] is None else (", ".join(s["occupied"]) or "empty"),
+         ", ".join(s.get("tags") or [])] for s in report["segments"]])
     lines += ["", f"Frames: {report['counts']}", "", "## Streams", ""]
-    lines.append("| stream | frames | kept sc | RSSI p10/p50/p90 | clusters | cluster share / RSSI |")
-    lines.append("|---|---|---|---|---|---|")
-    for s in report["inventory"]:
-        per = "; ".join(f"c{p['cluster']} {p['share']} @ {p['rssi_median']} dBm"
-                        for p in s.get("per_cluster", []))
-        lines.append(f"| {s['stream']} | {s['frames']} | {s['subcarriers_kept']} | "
-                     f"{s['rssi_p10_p50_p90']} | {s.get('clusters', '-')} | {per} |")
+    lines += _table(["stream", "frames", "kept sc", "RSSI p10/p50/p90", "clusters", "cluster share / RSSI"], [
+        [s["stream"], s["frames"], s["subcarriers_kept"], s["rssi_p10_p50_p90"], s.get("clusters", "-"),
+         "; ".join(f"c{p['cluster']} {p['share']} @ {p['rssi_median']} dBm" for p in s.get("per_cluster", []))]
+        for s in report["inventory"]])
     lines += ["", "Frames far from every empty-home transmitter (new device, or a person very "
-              "close to the node), share per segment:", ""]
+              "close to the node), share per segment (RSSI median of those frames where >= 20):", ""]
     for s in report["inventory"]:
         if s.get("far_share"):
-            lines.append(f"- {s['stream']}: " + ", ".join(f"{k} {v}" for k, v in s["far_share"].items()))
+            fr = s.get("far_rssi_median", {})
+            lines.append(f"- {s['stream']}: " + ", ".join(
+                f"{k} {v}" + (f" @ {fr[k]} dBm" if k in fr else "") for k, v in s["far_share"].items()))
+    clus = {(s["stream"], p["cluster"]): p for s in report["inventory"] for p in s.get("per_cluster", [])}
     for title, ev in (("Evaluation (transmitters separated)", report["evaluation"]),
                       ("Evaluation (no separation, for comparison)", report.get("no_separation"))):
-        if not ev:
-            continue
-        lines += ["", f"## {title}", "",
-                  f"Folds: {ev['folds']} held-out empty chunks; guard relaxed: {ev['guard_relaxed']}; "
-                  f"clusters per stream: {ev['clusters_per_stream']}", ""]
-        segs = [s for s in ev["segments_scored"] if "#" not in s]
-        lines.append("| detector | FA held-out (max) | " + " | ".join(f"det {s}" for s in segs)
-                     + " | AUC room | AUC vs other rooms |")
-        lines.append("|---|---|" + "---|" * len(segs) + "---|---|")
-        top = max(d["horizon_s"] for d in ev["detectors"]) if ev["detectors"] else 0
-        for d in ev["detectors"]:
-            # Markdown keeps node/home rows at the longest horizon, plus the
-            # fused score at every horizon; the JSON report has everything.
-            if d["kind"] == "link" or (d["horizon_s"] != top and d["score"] != "fused"):
-                continue
-            det = " | ".join(str(d["detect"].get(s, "")) for s in segs)
-            lines.append(f"| {d['name']} | {d['fa_heldout']} ({d['fa_heldout_max']}) | {det} | "
-                         f"{d['auc_room']} | {d['auc_vs_other_rooms']} |")
-        if ev.get("localization"):
-            lines += ["", "Localization: the node with the largest excess over its own empty-home "
-                      "threshold names the room (two-room segments: the top two).", "",
-                      "| score | one room acc (windows) | two rooms acc (windows) | windows true -> predicted |",
-                      "|---|---|---|---|"]
-            for d in ev["localization"]:
-                if d["horizon_s"] != top and d["score"] != "fused":
-                    continue
-                conf = "; ".join(f"{t}: " + ", ".join(f"{p} {n}" for p, n in sorted(c.items()))
-                                 for t, c in sorted(d["confusion"].items()))
-                lines.append(f"| {d['name']} | {d['one_room_accuracy']} ({d['one_room_windows']}) | "
-                             f"{d['two_room_accuracy']} ({d['two_room_windows']}) | {conf} |")
+        if ev:
+            lines += _evaluation_md(title, ev, clus if title.endswith("separated)") else {})
     return "\n".join(lines) + "\n"
+
+
+def _evaluation_md(title: str, ev: dict[str, Any], clus: dict[tuple[str, int], dict]) -> list[str]:
+    lines = ["", f"## {title}", "",
+             f"Folds: {ev['folds']} held-out empty chunks; guard relaxed: {ev['guard_relaxed']}; "
+             f"clusters per stream: {ev['clusters_per_stream']}", ""]
+    roles = ev.get("segment_roles", {})
+    clean = [s for s in ev["segments_scored"] if roles.get(s) in ("occupied", "unknown")]
+    scored = [s for s in ev["segments_scored"] if roles.get(s) in ("occupied", "unknown", "confounded")]
+    chunks = ev.get("heldout_chunks", [])
+    dets = ev["detectors"]
+    top = max(d["horizon_s"] for d in dets) if dets else 0
+    agg = [d for d in dets if d["kind"] != "link"]
+    # Node/home rows at the longest horizon, plus `fused` at every horizon;
+    # the JSON report has everything.
+    main = [d for d in agg if d["horizon_s"] == top or d["score"] == "fused"]
+    lines += _table(["detector", "FA held-out (max)"] + [f"det {s}" for s in clean]
+                    + ["AUC room", "AUC vs other rooms"],
+                    [[d["name"], f"{d['fa_heldout']} ({d['fa_heldout_max']})"]
+                     + [d["detect"].get(s, "") for s in clean] + [d["auc_room"], d["auc_vs_other_rooms"]]
+                     for d in main])
+    at_top = [d for d in agg if d["horizon_s"] == top]
+    if chunks:
+        lines += ["", f"False alarms per held-out empty chunk (@{int(top)}s; a drift or a new "
+                  "transmitter shows up as one bad chunk, usually at an end):", ""]
+        lines += _table(["detector"] + chunks,
+                        [[d["name"]] + [d.get("fa_by_chunk", {}).get(c) for c in chunks] for d in at_top])
+    if scored:
+        lines += ["", f"Median excess over the empty-home threshold (@{int(top)}s, log10 units; > 0 "
+                  "= above the alarm line; tagged segments have a known confounder):", ""]
+        lines += _table(["detector", "(held-out empty)"] + scored,
+                        [[d["name"], d["median_excess"].get("(held-out empty)")]
+                         + [d["median_excess"].get(s) for s in scored] for d in at_top])
+    links = [d for d in dets if d["kind"] == "link" and d["horizon_s"] == top]
+    if links:
+        by = {}
+        for d in links:
+            by.setdefault(d["link"], {})[d["score"]] = d
+        lines += ["", f"Links (@{int(top)}s): held-out FA per score, then the fused score's median "
+                  "excess per segment. A link with high FA and excess everywhere is drifting; one "
+                  "that only rises in tagged segments carries that confounder.", ""]
+        rows = []
+        for link in sorted(by):
+            m = re.match(r"^(n\d+w\d+)c(\d+)", link)
+            p = clus.get((m.group(1), int(m.group(2)))) if m else None
+            f = by[link].get("fused", {})
+            rows.append([link, p["rssi_median"] if p else None, p["share"] if p else None,
+                         f.get("folds")]
+                        + [by[link].get(sc, {}).get("fa_heldout") for sc in ("fused",) + SCORES]
+                        + [f.get("median_excess", {}).get(s) for s in scored])
+        lines += _table(["link", "RSSI", "share", "folds", "FA fused", "FA static", "FA motion",
+                         "FA phase", "FA rssi"] + [f"ex {s}" for s in scored], rows)
+    if ev.get("localization"):
+        lines += ["", "Localization: the node with the largest excess over its own empty-home "
+                  "threshold names the room (two-room segments: the top two).", ""]
+        lines += _table(["score", "one room acc (windows)", "two rooms acc (windows)",
+                         "windows true -> predicted"],
+                        [[d["name"], f"{d['one_room_accuracy']} ({d['one_room_windows']})",
+                          f"{d['two_room_accuracy']} ({d['two_room_windows']})",
+                          "; ".join(f"{t}: " + ", ".join(f"{p} {n}" for p, n in sorted(c.items()))
+                                    for t, c in sorted(d["confusion"].items()))]
+                         for d in ev["localization"] if d["horizon_s"] == top or d["score"] == "fused"])
+    return lines
 
 
 def build_report(root: Path, labels: Labels, cfg: EvalConfig, compare: bool) -> dict[str, Any]:
@@ -987,17 +1096,19 @@ def build_report(root: Path, labels: Labels, cfg: EvalConfig, compare: bool) -> 
     streams, counts = load_streams(root, segments, labels.exclude)
     if not streams:
         raise LabError("no CSI frames in the labelled segments")
+    links = global_links(streams, segments, cfg.max_k)
     report: dict[str, Any] = {
         "tool": "csi_lab", "version": VERSION, "evidence": "MEASURED",
         "params": {k: getattr(cfg, k) for k in cfg.__dataclass_fields__},
         "rooms": {str(k): v for k, v in labels.rooms.items()},
         "segments": [{"name": s.name, "start": iso(s.start), "end": iso(s.end),
-                      "minutes": round((s.end - s.start) / 60, 1), "occupied": s.occupied}
+                      "minutes": round((s.end - s.start) / 60, 1), "occupied": s.occupied,
+                      "tags": list(s.tags)}
                      for s in labels.segments],
         "exclude": [{"start": iso(a), "end": iso(b), "why": w} for a, b, w in labels.exclude],
         "counts": counts,
-        "inventory": inventory(streams, segments, cfg.max_k),
-        "evaluation": evaluate(streams, labels, segments, cfg),
+        "inventory": inventory(streams, segments, cfg.max_k, links),
+        "evaluation": evaluate(streams, labels, segments, cfg, links),
     }
     if compare and cfg.max_k > 1:
         flat = EvalConfig(**{**report["params"], "max_k": 1})
