@@ -218,7 +218,13 @@ def parse_labels(obj: Any) -> Labels:
         if not 0 <= node <= 255 or not isinstance(room, str) or not _NAME_OK.match(room):
             raise LabError(f"bad room for node {key!r}")
         rooms[node] = room
-    known = set(rooms.values())
+    # Rooms without a node (dining, kitchen, bathroom): a segment may say
+    # everyone is there, which makes it a negative for every node's room.
+    other = obj.get("other_rooms") or []
+    if not isinstance(other, list) or len(other) > 12 or any(
+            not isinstance(r, str) or not _NAME_OK.match(r) or r in rooms.values() for r in other):
+        raise LabError('"other_rooms" must list up to 12 room names that have no node')
+    known = set(rooms.values()) | set(other)
     segs = []
     names = set()
     for raw in obj.get("segments") or []:

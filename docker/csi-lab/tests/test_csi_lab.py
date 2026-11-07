@@ -103,6 +103,12 @@ def test_labels_are_validated() -> None:
     with pytest.raises(L.LabError):
         L.parse_labels({"rooms": ROOMS, "segments": [
             {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": [], "tags": ["no spaces"]}]})
+    with pytest.raises(L.LabError):                     # a node room is not "other"
+        L.parse_labels({"rooms": ROOMS, "other_rooms": ["study"], "segments": [
+            {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": []}]})
+    dining = L.parse_labels({"rooms": ROOMS, "other_rooms": ["dining"], "segments": [
+        {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": ["dining"]}]})
+    assert dining.segments[0].role == "occupied"
     tagged = L.parse_labels({"rooms": ROOMS, "segments": [
         {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": [], "tags": ["vacuum:kitchen"]}]})
     assert tagged.segments[0].role == "confounded"      # never an empty-home reference
@@ -229,6 +235,14 @@ def test_at_least_labels_are_positives_only(recording: Path, capsys) -> None:
     assert detector(ev, "node 3 fused@60s")["auc_room"] >= 0.8
     loc = next(d for d in ev["localization"] if d["name"] == "fused@60s")
     assert set(loc["confusion"]) == {"study"}            # living_still not localized
+    # Everyone in a room without a node: a negative for every node's room.
+    lab = json.loads(json.dumps(LABELS))
+    lab["other_rooms"] = ["dining"]
+    lab["segments"][2]["occupied"] = ["dining"]
+    ev = run_json(recording, lab, capsys=capsys)["evaluation"]
+    assert detector(ev, "node 2 fused@60s")["auc_vs_other_rooms"] is not None
+    loc = next(d for d in ev["localization"] if d["name"] == "fused@60s")
+    assert set(loc["confusion"]) == {"study"}
 
 
 def test_separation_beats_mixed_links(recording: Path, capsys) -> None:
