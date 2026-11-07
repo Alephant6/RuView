@@ -74,6 +74,21 @@ def test_parse_frame_and_raw_reader(tmp_path: Path) -> None:
     assert L.parse_frame(two_ant) is None
 
 
+def test_ring_and_keep_copies_count_once(recording: Path, tmp_path: Path) -> None:
+    import shutil
+    src = next((recording / "ring").rglob("*.csi.raw.gz"))
+    (tmp_path / "ring").mkdir()
+    (tmp_path / "keep").mkdir()
+    shutil.copy(src, tmp_path / "ring" / src.name)
+    shutil.copy(src, tmp_path / "keep" / src.name.replace("Z.csi", "Z_empty_home.csi"))
+    lab = L.parse_labels(labels_for([("empty", 0, 8 * 60, [])]))
+    segs = L.chunk_empty(lab.segments, 240)
+    once, c1 = L.load_streams(recording, segs, [])
+    twice, c2 = L.load_streams(tmp_path, segs, [])
+    assert sum(len(s.t) for s in twice) == sum(len(s.t) for s in once)
+    assert c2["duplicates"] == c1["csi_frames"] and c1["duplicates"] == 0
+
+
 def test_labels_are_validated() -> None:
     with pytest.raises(L.LabError):
         L.parse_labels({"rooms": ROOMS, "segments": [

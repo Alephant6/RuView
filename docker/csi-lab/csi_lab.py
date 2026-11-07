@@ -377,8 +377,15 @@ def load_streams(root: Path, segments: list[Segment],
         except (OSError, LabError) as exc:
             print(f"warning: skipping {path.name}: {exc}", file=sys.stderr)
     streams = []
+    counts["duplicates"] = 0
     for (node, width), (t, seg, rssi, iq, nf) in sorted(acc.items()):
-        order = np.argsort(np.asarray(t), kind="stable")
+        # A kept clip is a copy of a ring range: the same datagram can appear
+        # in ring/ and keep/. Same node and same receive time = same datagram.
+        ta = np.asarray(t)
+        order = np.argsort(ta, kind="stable")
+        first = np.concatenate([[True], np.diff(ta[order]) != 0])
+        counts["duplicates"] += int((~first).sum())
+        order = order[first]
         stream = prepare(node, width, [t[k] for k in order], [seg[k] for k in order],
                          [rssi[k] for k in order], [iq[k] for k in order], [nf[k] for k in order])
         if stream is not None:
