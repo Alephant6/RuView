@@ -326,3 +326,104 @@ def test_markdown_and_errors(recording: Path, capsys, tmp_path: Path) -> None:
     rc = L.main(["evaluate", "--data", str(tmp_path), "--labels-json", json.dumps(one_empty)])
     assert rc == 2
     assert L.main(["evaluate", "--data", str(tmp_path / "missing"), "--labels-json", "{}"]) == 2
+
+
+@pytest.fixture(scope="module")
+def rooms4(tmp_path_factory) -> Path:
+    """50 min: the study node is three times as sensitive to people in every
+    room (like the real study node), a dining room has no node of its own,
+    and the neighbour sends in bursts five seconds apart with two frame
+    types alternating (a breathing-band periodicity from the traffic)."""
+    root = tmp_path_factory.mktemp("rooms4")
+    M = 60
+    acts = [synth.Activity(20 * M, 23 * M, "living", "moving"), synth.Activity(23 * M, 26 * M, "study", "still"),
+            synth.Activity(26 * M, 29 * M, "dining", "moving"), synth.Activity(29 * M, 32 * M, "bedroom", "still"),
+            synth.Activity(32 * M, 35 * M, "living", "still"), synth.Activity(35 * M, 38 * M, "study", "moving"),
+            synth.Activity(38 * M, 41 * M, "dining", "still"), synth.Activity(41 * M, 44 * M, "bedroom", "moving"),
+            synth.Activity(44 * M, 47 * M, "study", "moving"), synth.Activity(44 * M, 47 * M, "living", "still"),
+            synth.Activity(47 * M, 50 * M, "bedroom", "still"), synth.Activity(47 * M, 50 * M, "living", "moving")]
+    synth.generate(synth.ring_path(root), 50 * M, acts, body=0.2, seed=5, rx_gain={2: 8.0},
+                   room_coupling={"dining": {3: 0.6}}, burst=("neighbour", 0.2))
+    return root
+
+
+ROOMS4 = labels_for([("empty", 0, 20 * 60, []),
+                     ("living_m", 20 * 60, 23 * 60, ["living"]), ("study_s", 23 * 60, 26 * 60, ["study"]),
+                     ("dining_m", 26 * 60, 29 * 60, ["dining"]), ("bedroom_s", 29 * 60, 32 * 60, ["bedroom"]),
+                     ("living_s", 32 * 60, 35 * 60, ["living"]), ("study_m", 35 * 60, 38 * 60, ["study"]),
+                     ("dining_s", 38 * 60, 41 * 60, ["dining"]), ("bedroom_m", 41 * 60, 44 * 60, ["bedroom"]),
+                     ("study_living", 44 * 60, 47 * 60, ["living", "study"]),
+                     ("bedroom_living", 47 * 60, 50 * 60, ["bedroom", "living"])])
+ROOMS4["other_rooms"] = ["dining"]
+
+
+def test_room_patterns_and_breath_timing(rooms4: Path, capsys) -> None:
+    rep = run_json(rooms4, ROOMS4, "--breath", capsys=capsys)
+    ev = rep["evaluation"]
+    loc = {d["name"]: d for d in ev["localization"]}
+    # the fixture works: "the node with the largest excess" picks the
+    # oversensitive study node for other rooms
+    assert loc["fused_dr@60s"]["one_room_accuracy"] < 0.6
+    assert loc["fused@60s"]["confusion"]["living"].get("study", 0) >= 40
+    # the cone-model match is not fooled by one node's sensitivity ...
+    for name in ("pattern@60s", "pattern_gls@60s"):
+        conf = loc[name]["confusion"]
+        for room in ("study", "bedroom"):
+            assert conf[room].get(room, 0) >= 0.9 * sum(conf[room].values())
+        # ... and finds the room without a node, but here dining only
+        # couples to the living-room node, so its pattern points the same
+        # way as living's: told apart from the other rooms, not from living
+        both = sum(conf[r].get(p, 0) for r in ("living", "dining") for p in ("living", "dining"))
+        assert both >= 0.9 * sum(sum(conf[r].values()) for r in ("living", "dining"))
+        pat = ev["room_patterns"][name.split("@")[0]]
+        cos = {(a, b): pat["cos"][i][j] for i, a in enumerate(pat["rooms"]) for j, b in enumerate(pat["rooms"])}
+        assert cos[("dining", "living")] >= 0.9
+        assert max(v for (a, b), v in cos.items() if a < b and {a, b} != {"dining", "living"}) < 0.9
+    # breathing rate of the still people (synthetic wobble at 0.25 Hz = 15/min)
+    assert 13 <= ev["breath_rate_bpm"]["1"]["bedroom_s"]["median"] <= 17
+    # the neighbour's bursts every 5 s are flagged on node 1, and the
+    # flagged frequencies do not alarm in the empty home
+    assert ev["breath_timing_flag"]["n1w64c0"] >= 0.5
+    assert detector(ev, "link n1w64c0 breath@60s")["fa_heldout"] <= 0.1
+    text = L.markdown(rep)
+    assert "Room patterns (pattern, @60s)" in text and "Breathing rate" in text and "Frame timing" in text
+
+
+def _breath_stream(t: np.ndarray, nla: np.ndarray) -> L.Stream:
+    n = len(t)
+    return L.Stream(node=1, width=64, t=t, seg=np.zeros(n, np.int16), rssi=np.full(n, -60.0, np.float32),
+                    nla=nla.astype(np.float32), ph=np.zeros(nla.shape, np.float16),
+                    valid=np.arange(nla.shape[1]), nf=np.zeros(n, np.int8))
+
+
+def test_breath_ignores_periodic_frame_timing(monkeypatch) -> None:
+    """Two frame types alternating in bursts every 5 s make the amplitude
+    periodic at 0.2 Hz with nobody there; the spectral window of the frame
+    times shows it, so that frequency is not used. A real 0.25 Hz wobble on
+    irregular frame times is kept."""
+    rng = np.random.default_rng(11)
+    dur, k = 600.0, 8
+    t = np.sort(rng.uniform(0, dur, size=int(12 * dur)))
+    t = t[rng.uniform(size=len(t)) < (1 + 0.9 * np.cos(2 * np.pi * 0.2 * t)) / 2]
+    burst = np.cos(2 * np.pi * 0.2 * t) > 0
+    shape = rng.normal(size=k)
+    bursty = _breath_stream(t, 0.3 * burst[:, None] * shape + rng.normal(0, 0.1, size=(len(t), k)))
+    t2 = np.sort(rng.uniform(0, dur, size=int(6 * dur)))
+    breathing = _breath_stream(t2, 0.05 * np.sin(2 * np.pi * 0.25 * t2)[:, None] * shape
+                               + rng.normal(0, 0.1, size=(len(t2), k)))
+    seg = [L.Segment("x", 0.0, dur, [])]
+    w_start = np.arange(60.0, dur - 10.0, 10.0)
+    w_seg = np.zeros(len(w_start), np.int32)
+
+    def run(stream):
+        return L.breath_scores(stream, np.arange(len(stream.t)), w_start, w_seg, seg, 10.0, 60.0, [])
+
+    score, peak, flag = run(bursty)
+    assert np.nanmean(flag) >= 0.9 and np.nanmedian(score) < 1.0
+    monkeypatch.setattr(L, "WINDOW_FLAG", 1e12)          # without the check
+    raw, raw_peak, _ = run(bursty)
+    assert np.nanmedian(raw) > 2.0 and abs(np.nanmedian(raw_peak) - 0.2) < 0.02
+    monkeypatch.undo()
+    score, peak, flag = run(breathing)
+    assert np.nanmean(flag) <= 0.05 and np.nanmedian(score) > 1.5
+    assert abs(np.nanmedian(peak) - 0.25) < 0.02

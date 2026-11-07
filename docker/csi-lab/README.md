@@ -102,7 +102,37 @@ the segment list, and never as camera-grade or general accuracy.
      noise). A slow drift cannot raise it; a still, breathing person can,
      while a moving person mostly does not (that is `motion`'s job). Needs
      at least 1.5 frames/s on the link; it is not part of `fused`.
-8. `--compare` reruns everything without transmitter separation.
+     Wi-Fi frames come in bursts, and two frame types alternating in bursts
+     make the amplitude periodic with nobody there. So the spectral window
+     of the frame times, W(f) = |sum exp(-2 pi i f t_k)|^2 / N^2, is computed
+     for every span, and frequencies with N * W(f) > 10 (about 1 for
+     irregular arrivals), and their harmonics, are not used. The report
+     gives, per link, the share of windows whose best frequency was such a
+     frequency ("Frame timing"), and per node and segment the median
+     breathing rate of the windows above the empty-home line (breaths/min).
+8. **Room patterns** (`pattern`, `pattern_gls` in the localization table).
+   "The node with the largest excess" fails when one node reacts to every
+   room (the real study node does). The cone model instead: with someone
+   in room r the per-link `fused` excess moves along a fixed direction g_r
+   (which links rise, relative to each other), while its size depends on
+   posture and activity and is left free (alpha_r >= 0). Maximising over
+   the size gives, in whitened units, the matched-subspace (GLRT) statistic
+   max(0, g'e)^2 / g'g for one occupied room and the energy of a
+   two-variable non-negative least-squares fit for two rooms. The room
+   patterns are least-squares fits of the labelled segments' mean excess
+   on their occupied-room indicators (rooms without a node included), and
+   each labelled segment is classified with patterns fitted on the other
+   segments only (leave one segment out; a room seen in no other segment is
+   untestable). The number of occupied rooms comes from the label, as for
+   the node localization. `pattern` whitens the drift-removed excess
+   (`fused_dr`'s residual) by each link's empty-home spread; `pattern_gls`
+   whitens the plain excess with a low-rank-plus-diagonal empty-home
+   covariance (the `--drift-rank` drift directions with their variances
+   plus independent link noise), which weights the drift directions down
+   instead of removing them. The report also gives the cosine between the
+   whitened room patterns: near 1 means two rooms point the same way and
+   cannot be told apart whatever the size (merge them).
+9. `--compare` reruns everything without transmitter separation.
 
 ## Labels
 
@@ -163,4 +193,6 @@ python -m pytest -q
 
 The tests use synthetic recordings only (`tests/synth.py`: three nodes,
 an access point, a neighbour, AGC jitter, random per-frame phase, a body
-path that couples most strongly to the receiver in the occupied room).
+path that couples most strongly to the receiver in the occupied room;
+optionally a house-wide drift, an oversensitive node, a room without a
+node, and a transmitter sending in periodic bursts).

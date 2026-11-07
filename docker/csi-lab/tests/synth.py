@@ -63,7 +63,10 @@ def _response(gains: np.ndarray, delays: np.ndarray, f: np.ndarray) -> np.ndarra
     return (gains[None, :] * np.exp(-2j * np.pi * f[:, None] * DF_NS * delays[None, :])).sum(1)
 
 
-def _coupling(room: str, rx_room: str, tx_room: str | None) -> float:
+def _coupling(room: str, rx: int, rx_room: str, tx_room: str | None,
+              extra: dict[str, dict[int, float]] | None = None) -> float:
+    if extra and room in extra:          # a room without a node (dining)
+        return extra[room].get(rx, 0.12)
     if rx_room == room:
         return 1.0
     if tx_room == room:
@@ -72,14 +75,22 @@ def _coupling(room: str, rx_room: str, tx_room: str | None) -> float:
 
 
 def generate(path: Path, duration_s: float, activities: list[Activity], seed: int = 1,
-             body: float = 0.35, steps: list[Step] | None = None, shape_drift: float = 0.0) -> dict:
+             body: float = 0.35, steps: list[Step] | None = None, shape_drift: float = 0.0,
+             rx_gain: dict[int, float] | None = None,
+             room_coupling: dict[str, dict[int, float]] | None = None,
+             burst: tuple[str, float] | None = None) -> dict:
     """Write one .csi.raw.gz file; return frames per receiver<-transmitter link.
     The noise-floor byte carries -90 - transmitter index (ground truth for
     the clustering test; csi_lab does not use it). `shape_drift` adds a
     house-wide drift: every link gains its own extra path whose size grows
     linearly from 0 to `shape_drift` (relative to the link's mean amplitude)
     over the recording, all on the same clock, like a slow temperature
-    swing."""
+    swing. `rx_gain` makes a receiver more sensitive to people in every room
+    (the study node on the real deployment); `room_coupling` adds rooms
+    without a node, with their coupling per receiver. `burst = (tx, hz)`
+    makes that transmitter send in bursts `hz` times a second and switch to
+    a second channel shape inside each burst (two frame types alternating),
+    a periodic signal that comes from the traffic, not from a person."""
     rng = np.random.default_rng(seed)
     body_gain = body
     f = _freq_block()
@@ -99,6 +110,13 @@ def generate(path: Path, duration_s: float, activities: list[Activity], seed: in
             gains, delays = _channel(rng)
             n = rng.poisson(rate * duration_s)
             t = np.sort(rng.uniform(0, duration_s, size=n))
+            in_burst = None
+            if burst and burst[0] == tx:
+                t = np.sort(rng.uniform(0, duration_s, size=rng.poisson(2 * rate * duration_s)))
+                phase = np.cos(2 * np.pi * burst[1] * t)
+                t = t[rng.uniform(size=len(t)) < (1 + 0.9 * phase) / 2]
+                in_burst = np.cos(2 * np.pi * burst[1] * t) > 0
+                n = len(t)
             h0 = _response(gains, delays, f)
             drift = 1.0 + 0.01 * np.sin(2 * np.pi * t / 1800.0 + rng.uniform(0, 6.28))
             h = h0[None, :] * drift[:, None]
@@ -108,6 +126,10 @@ def generate(path: Path, duration_s: float, activities: list[Activity], seed: in
                 dh = _response(dg, dd, f)
                 ramp = shape_drift * t / duration_s
                 h = h + (ramp * np.abs(h0).mean() / max(np.abs(dh).mean(), 1e-9))[:, None] * dh[None, :]
+            if in_burst is not None:
+                bg2, bd2 = _channel(np.random.default_rng(zlib.crc32(f"burst:{seed}:{rx}".encode())), paths=2)
+                dh = _response(bg2, bd2, f)
+                h[in_burst] += (0.25 * np.abs(h0).mean() / max(np.abs(dh).mean(), 1e-9)) * dh[None, :]
             for st in steps or []:
                 if st.rx != rx or st.tx != tx:
                     continue
@@ -116,13 +138,14 @@ def generate(path: Path, duration_s: float, activities: list[Activity], seed: in
                 dh = _response(sg, sdl, f)
                 h[inside] += (st.size * np.abs(h0).mean() / max(np.abs(dh).mean(), 1e-9)) * dh[None, :]
             for act in activities:
-                c = _coupling(act.room, rx_room, tx_room)
+                c = _coupling(act.room, rx, rx_room, tx_room, room_coupling)
                 inside = (t >= act.start) & (t < act.end)
                 if not np.any(inside):
                     continue
                 bg, bd = _channel(np.random.default_rng(zlib.crc32(f"{seed}:{rx}:{tx}:{act.room}".encode())), paths=2)
                 body = _response(bg, bd + 5.0, f)
-                body *= body_gain * c * np.abs(h0).mean() / max(np.abs(body).mean(), 1e-9)
+                body *= body_gain * c * (rx_gain or {}).get(rx, 1.0) * np.abs(h0).mean() / max(
+                    np.abs(body).mean(), 1e-9)
                 if act.kind == "moving":
                     theta = rng.uniform(0, 2 * np.pi, size=inside.sum())
                     scale = rng.uniform(0.5, 1.5, size=inside.sum())

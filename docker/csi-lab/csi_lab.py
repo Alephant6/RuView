@@ -35,7 +35,14 @@ What it measures, for a set of labelled time segments:
    channel look alike on one link. `fused_dr` removes the directions in
    which all links drifted together during the empty-home reference and
    keeps what that pattern cannot explain; `breath` (with --breath) looks
-   for a 0.1-0.5 Hz periodicity, which a slow drift cannot produce.
+   for a 0.1-0.5 Hz periodicity, which a slow drift cannot produce, at
+   frequencies where the frame timing itself is not periodic.
+5. Rooms by pattern. `pattern` and `pattern_gls` match the direction of the
+   per-link excess (its size left free: cone model, GLRT) against room
+   patterns learned from the other labelled segments, so one node that
+   reacts to every room cannot win everywhere, and rooms without a node
+   can be named. The cosine between room patterns says which rooms cannot
+   be told apart.
 
 Every number this prints is MEASURED on the given segments only; a handful
 of segments from one evening is a screen, not a validation.
@@ -60,7 +67,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-VERSION = 3
+VERSION = 4
 NS = 1_000_000_000
 
 # --- csi-recorder container (docker/csi-recorder/csi_recorder/rawfile.py) ---
@@ -632,26 +639,43 @@ def fit_link(ws: WindowSummary, ref: np.ndarray, n_modes: int) -> LinkModel | No
 
 
 BREATH_BAND = (0.1, 0.5)     # Hz: 6 to 30 breaths a minute
+# A frequency is not used when the frame times alone are periodic there:
+# N * W(f) above this, W the spectral window of the span's frame times. For
+# irregular (Poisson-like) arrivals N * W(f) is about exponential with mean 1.
+WINDOW_FLAG = 10.0
 
 
 def breath_scores(stream: Stream, frames: np.ndarray, w_start: np.ndarray, w_seg: np.ndarray,
                   segments: list["Segment"], window_s: float, span_s: float,
-                  exclude: list[tuple[float, float, str]], min_rate: float = 1.5) -> np.ndarray:
+                  exclude: list[tuple[float, float, str]], min_rate: float = 1.5
+                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Breathing-band periodicity over the `span_s` seconds that end with each
-    window, one value per window.
+    window: (score, peak frequency in Hz, flag) per window.
 
     The span's amplitudes are detrended per subcarrier (so a slow drift
     cannot raise the score), reduced to their two main directions of change,
     and searched for the strongest sinusoid between 0.1 and 0.5 Hz with a
     least-squares (Lomb-Scargle) fit, which copes with the uneven frame
-    times. The value is log10(1 + F), F = (n - 3) / 2 * R^2 / (1 - R^2) for the
+    times. The score is log10(1 + F), F = (n - 3) / 2 * R^2 / (1 - R^2) for the
     best frequency: about 0.3 to 0.6 for noise, higher for a periodic
-    movement such as a still person breathing. NaN where the span leaves the
-    window's segment, touches an excluded range, or has fewer than `min_rate`
-    frames per second."""
+    movement such as a still person breathing.
+
+    Wi-Fi frames do not arrive at random: traffic can come in bursts, and if
+    the bursts repeat at a breathing-band rate (or two frame types alternate
+    at it), the amplitudes are periodic without anyone breathing. So the
+    spectral window of the frame times, W(f) = |sum_k exp(-2 pi i f t_k)|^2 / N^2,
+    is computed too, and frequencies where N * W(f) > WINDOW_FLAG, and their
+    harmonics in the band (a signal locked to the bursts shows there too),
+    are not used. flag = 1 where the best frequency before that exclusion was such a
+    frequency (the frame timing alone could have produced the peak).
+    NaN where the span leaves the window's segment, touches an excluded
+    range, or has fewer than `min_rate` frames per second."""
     t_all = stream.t[frames]
     out = np.full(len(w_start), np.nan)
-    freqs = np.arange(BREATH_BAND[0], BREATH_BAND[1] + 1e-9, 0.5 / span_s)
+    peak = np.full(len(w_start), np.nan)
+    flag = np.full(len(w_start), np.nan)
+    step = 0.5 / span_s
+    freqs = np.arange(BREATH_BAND[0], BREATH_BAND[1] + 1e-9, step)
     ends = w_start + window_s
     begins = ends - span_s
     lo = np.searchsorted(t_all, begins, side="left")
@@ -680,9 +704,22 @@ def breath_scores(stream: Stream, frames: np.ndarray, w_start: np.ndarray, w_seg
         det = np.maximum(cc * s2 - cs * cs, 1e-12)
         bc, bs = c @ s, sn @ s                          # (F, 2)
         energy = (s2[:, None] * bc ** 2 - 2 * cs[:, None] * bc * bs + cc[:, None] * bs ** 2) / det[:, None]
-        r2 = float(np.clip(np.max(energy / np.maximum(ss, 1e-12)), 0.0, 0.999999))
-        out[w] = math.log10(1.0 + (len(tt) - 3) / 2.0 * r2 / (1.0 - r2))
-    return out
+        r2f = np.max(energy / np.maximum(ss, 1e-12), axis=1)          # (F,)
+        n = len(tt)
+        bad = (c.sum(1) ** 2 + sn.sum(1) ** 2) / n > WINDOW_FLAG     # N * W(f)
+        if np.any(bad):
+            # a signal locked to the bursts also shows at their harmonics
+            harm = (freqs[bad][:, None] * np.arange(2, 6)[None, :]).ravel()
+            bad |= np.any(np.abs(freqs[:, None] - harm[None, :]) <= 1.5 * step, axis=1)
+        flag[w] = float(bad[int(np.argmax(r2f))])
+        if np.all(bad):
+            continue
+        r2f = np.where(bad, -1.0, r2f)
+        best = int(np.argmax(r2f))
+        r2 = float(np.clip(r2f[best], 0.0, 0.999999))
+        out[w] = math.log10(1.0 + (n - 3) / 2.0 * r2 / (1.0 - r2))
+        peak[w] = freqs[best]
+    return out, peak, flag
 
 
 def _drift_basis(rows: np.ndarray, cols: np.ndarray, rank: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -731,6 +768,167 @@ def drift_residual(rows: np.ndarray, w_seg: np.ndarray, ref_segs: list[int], ran
         if len(inner) > rank + 2 and len(own):
             res[:, own] = _project_out(rows, own, *_drift_basis(rows, inner, rank))
     return res
+
+
+# ------------------------------------------------------------ room patterns
+#
+# Cone model: with someone in room r the links' excess moves along a fixed
+# direction g_r (which links rise, and by how much relative to each other),
+# while the size alpha_r >= 0 depends on posture and activity and is unknown:
+#     e(t) = sum_r alpha_r(t) g_r [room r occupied] + noise,  alpha_r >= 0.
+# Maximising the likelihood over alpha gives, for one occupied room, the
+# matched-subspace (GLRT) statistic max(0, g'e)^2 / g'g in whitened units,
+# and for two rooms the energy explained by a two-variable non-negative least
+# squares fit. Size no longer matters, only direction, so a person who moves
+# more does not look like a different room. Rooms without a node (dining)
+# get a direction too. Two rooms are separable only if their whitened
+# directions differ: the cosine between them is reported.
+
+
+def _nnls2_energy(g1: np.ndarray, g2: np.ndarray, e: np.ndarray) -> np.ndarray:
+    """Energy of the columns of e (k, n) explained by a*g1 + b*g2 with
+    a, b >= 0 (closed form; for each window the best of the full and the
+    one-direction fits)."""
+    a11, a22, a12 = g1 @ g1, g2 @ g2, g1 @ g2
+    b1, b2 = g1 @ e, g2 @ e
+    single = np.maximum(np.where(b1 > 0, b1 * b1 / max(a11, 1e-12), 0.0),
+                        np.where(b2 > 0, b2 * b2 / max(a22, 1e-12), 0.0))
+    det = a11 * a22 - a12 * a12
+    if det <= 1e-12 * max(a11 * a22, 1e-12):
+        return single
+    a = (a22 * b1 - a12 * b2) / det
+    b = (a11 * b2 - a12 * b1) / det
+    both = np.where((a >= 0) & (b >= 0), a * b1 + b * b2, 0.0)
+    return np.maximum(single, both)
+
+
+class _Whitener:
+    """Whitening by the empty-home noise of the links: either the per-link
+    spread (diagonal) or a low-rank-plus-diagonal covariance (house-wide
+    drift directions with their variances plus independent link noise), a
+    soft version of projecting the drift out: drift directions are weighted
+    down by how much they varied, not removed."""
+
+    def __init__(self, ref: np.ndarray, rank: int) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            sd = np.nanstd(ref, axis=1)
+            nobs = np.sum(np.isfinite(ref), axis=1)
+        self.usable = np.isfinite(sd) & (nobs >= 8) & (sd > 1e-6)
+        sd = np.where(self.usable, sd, 1.0)
+        self.rank = rank
+        self.sd = sd
+        self.cov = None
+        self._chol: dict[bytes, np.ndarray] = {}
+        if rank > 0:
+            x = np.where(np.isfinite(ref), ref, 0.0)[self.usable]
+            x = x - x.mean(1, keepdims=True)
+            cov_full = (x @ x.T) / max(x.shape[1] - 1, 1)
+            lam, vec = np.linalg.eigh(cov_full)
+            lam, vec = lam[::-1][:rank], vec[:, ::-1][:, :rank]
+            low = (vec * np.maximum(lam, 0.0)) @ vec.T
+            diag = np.maximum(np.diag(cov_full) - np.diag(low), 0.05 * np.diag(cov_full) + 1e-9)
+            cov = np.zeros((len(sd), len(sd)))
+            idx = np.flatnonzero(self.usable)
+            cov[np.ix_(idx, idx)] = low + np.diag(diag)
+            self.cov = cov
+
+    def apply(self, obs: np.ndarray, *cols: np.ndarray) -> list[np.ndarray]:
+        """Whiten each array (links x anything) on the observed links."""
+        if self.cov is None:
+            return [c[obs] / self.sd[obs, None] if c.ndim == 2 else c[obs] / self.sd[obs] for c in cols]
+        key = obs.tobytes()
+        if key not in self._chol:
+            self._chol[key] = np.linalg.cholesky(self.cov[np.ix_(obs, obs)])
+        ch = self._chol[key]
+        return [np.linalg.solve(ch, c[obs]) for c in cols]
+
+
+def room_patterns(e: np.ndarray, w_seg: np.ndarray, segments: list["Segment"], ref_w: np.ndarray,
+                  rank: int) -> dict[str, Any]:
+    """Leave-one-segment-out room localization with the cone model.
+
+    e: links x windows excess (drift already removed, or not: `rank` > 0
+    whitens with a low-rank-plus-diagonal empty-home covariance instead).
+    Each labelled segment with one or two occupied rooms (not at-least) is
+    held out in turn; the room patterns G are least-squares fits of the
+    other segments' mean excess on their occupied-room indicators (one
+    column per room, rooms without a node included). The held-out
+    segment's windows are then classified among all single rooms (one-room
+    segments) or all room pairs (two-room segments) by the GLRT. The number
+    of occupied rooms is taken from the label, as for the node localization.
+    Returns per-segment counts and the confusion, plus the cosine between
+    the whitened patterns fitted on every segment."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        e = e - np.nanmean(e[:, ref_w], axis=1, keepdims=True)
+    wh = _Whitener(e[:, ref_w], rank)
+    elig = [i for i, sg in enumerate(segments) if sg.role == "occupied" and not sg.at_least
+            and 1 <= len(sg.occupied or []) <= 2 and np.any(w_seg == i)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        means = {i: np.nanmean(e[:, w_seg == i], axis=1) for i in elig}
+
+    def fit(train: list[int]) -> tuple[list[str], np.ndarray] | None:
+        rooms = sorted({r for i in train for r in segments[i].occupied})
+        if not rooms:
+            return None
+        z = np.array([[1.0 if r in segments[i].occupied else 0.0 for r in rooms] for i in train])
+        if np.linalg.matrix_rank(z) < len(rooms):
+            return None
+        m = np.vstack([means[i] for i in train])             # segments x links
+        g = np.full((e.shape[0], len(rooms)), np.nan)
+        ok = np.all(np.isfinite(m), axis=0) & wh.usable
+        if ok.sum() < 3:
+            return None
+        g[ok] = np.linalg.lstsq(z, m[:, ok], rcond=None)[0].T
+        return rooms, g
+
+    out: dict[str, Any] = {"one_room": [], "two_rooms": [], "confusion": {}, "untestable": []}
+    for i in elig:
+        occ = segments[i].occupied
+        fitted = fit([j for j in elig if j != i])
+        if fitted is None or any(r not in fitted[0] for r in occ):
+            out["untestable"].append(segments[i].name)
+            continue
+        rooms, g = fitted
+        cols = np.flatnonzero(w_seg == i)
+        ev = e[:, cols]
+        good = np.isfinite(g[:, 0])
+        masks = np.isfinite(ev) & good[:, None]
+        correct = total = 0
+        conf = out["confusion"].setdefault(occ[0], {}) if len(occ) == 1 else None
+        for key in {m.tobytes() for m in masks.T}:
+            obs = np.frombuffer(key, dtype=bool)
+            if obs.sum() < 3:
+                continue
+            sel = np.flatnonzero(np.all(masks == obs[:, None], axis=0))
+            gw, ew = wh.apply(obs, g, ev[:, sel])
+            if len(occ) == 1:
+                stat = np.vstack([np.where(gw[:, k] @ ew > 0, (gw[:, k] @ ew) ** 2, 0.0)
+                                  / max(float(gw[:, k] @ gw[:, k]), 1e-12) for k in range(len(rooms))])
+                pred = np.argmax(stat, axis=0)
+                correct += int(np.sum(np.array(rooms)[pred] == occ[0]))
+                for p in pred:
+                    conf[rooms[p]] = conf.get(rooms[p], 0) + 1
+            else:
+                pairs = [(a, b) for a in range(len(rooms)) for b in range(a + 1, len(rooms))]
+                stat = np.vstack([_nnls2_energy(gw[:, a], gw[:, b], ew) for a, b in pairs])
+                pred = np.argmax(stat, axis=0)
+                correct += int(sum({rooms[pairs[p][0]], rooms[pairs[p][1]]} == set(occ) for p in pred))
+            total += len(sel)
+        if total:
+            out["one_room" if len(occ) == 1 else "two_rooms"].append((correct, total))
+    fitted = fit(elig)
+    if fitted is not None:
+        rooms, g = fitted
+        obs = np.isfinite(g[:, 0])
+        if obs.sum() >= 3:
+            (gw,) = wh.apply(obs, g)
+            nrm = gw / np.maximum(np.linalg.norm(gw, axis=0), 1e-12)
+            out["rooms"] = rooms
+            out["cos"] = (nrm.T @ nrm).tolist()
+    return out
 
 
 def link_scores(ws: WindowSummary, lm: LinkModel) -> dict[str, np.ndarray]:
@@ -909,7 +1107,8 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
     names = links if links is not None else global_links(streams, segments, cfg.max_k)
     # Breathing-band scores do not depend on the reference, only on which
     # frames belong to a link, so they are computed once per all-empty link.
-    breath: dict[str, tuple[int, np.ndarray]] = {}
+    breath: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+    timing_flag: dict[str, float] = {}
     if cfg.breath:
         for stream in streams:
             if stream.key not in names:
@@ -918,9 +1117,14 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
             for g in range(c.k):
                 frames = np.flatnonzero(lab == g)
                 if len(frames) >= 50:
-                    breath[f"{stream.key}c{g}"] = (stream.node, breath_scores(
-                        stream, frames, w_start, w_seg, segments, cfg.window_s, cfg.breath_span_s,
-                        labels.exclude))
+                    vals, peak, flag = breath_scores(stream, frames, w_start, w_seg, segments, cfg.window_s,
+                                                     cfg.breath_span_s, labels.exclude)
+                    breath[f"{stream.key}c{g}"] = (stream.node, vals, peak)
+                    if np.any(np.isfinite(flag)):
+                        timing_flag[f"{stream.key}c{g}"] = float(np.nanmean(flag))
+    breath_bpm: dict[tuple[int, str], list[float]] = {}
+    pattern_cos: dict[str, list[tuple[list[str], list[list[float]]]]] = {}
+    pattern_untestable: dict[str, set[str]] = {}
 
     def accumulate(values: np.ndarray, h: float) -> np.ndarray:
         return rolling(values, w_seg, 1 + int(round((h - cfg.window_s) / cfg.hop_s)))
@@ -996,11 +1200,15 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
         held_w = np.flatnonzero(w_seg == held_seg)
         node_ex: dict[tuple[int, str], list[np.ndarray]] = {}
         link_fused: list[tuple[int, np.ndarray]] = []
-        for link, (node, vals) in sorted(breath.items()):
+        for link, (node, vals, peak) in sorted(breath.items()):
             tau = _quant(vals[ref_w], cfg.q)
             if math.isnan(tau):
                 continue
             node_ex.setdefault((node, "breath"), []).append(vals - tau)
+            # breathing rate where the link is above its empty-home line
+            for si in scored:
+                hit = (w_seg == si) & (vals > tau) & np.isfinite(peak)
+                breath_bpm.setdefault((node, segments[si].name), []).extend((60.0 * peak[hit]).tolist())
             add(f"link {link} breath", {"kind": "link", "node": node, "link": link, "score": "breath"},
                 vals, ref_w, held_w, held_name)
         for stream in streams:
@@ -1078,6 +1286,28 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
         for score, node_vals in by_score.items():
             # Each node relative to its own empty-home threshold at this horizon.
             localize(score, node_vals)
+        if link_fused:
+            rows = np.vstack([f for _, f in link_fused])
+            variants = [("pattern", rows, 0)]
+            if cfg.drift_rank > 0 and len(link_fused) >= cfg.drift_rank + 3:
+                variants = [("pattern", res, 0), ("pattern_gls", rows, cfg.drift_rank)]
+            for name, mat, rank in variants:
+                for h in horizons:
+                    pr = room_patterns(np.vstack([accumulate(r, h) for r in mat]), w_seg, segments,
+                                       ref_w, rank)
+                    rec = loc.setdefault(f"{name}@{int(h)}s", {"score": name, "horizon_s": h,
+                                                              "one_room": [], "two_rooms": [],
+                                                              "confusion": {}})
+                    rec["one_room"] += pr["one_room"]
+                    rec["two_rooms"] += pr["two_rooms"]
+                    for t, c in pr["confusion"].items():
+                        dst = rec["confusion"].setdefault(t, {})
+                        for p, n in c.items():
+                            dst[p] = dst.get(p, 0) + n
+                    if h == max(horizons):
+                        pattern_untestable.setdefault(name, set()).update(pr["untestable"])
+                        if "cos" in pr:
+                            pattern_cos.setdefault(name, []).append((pr["rooms"], pr["cos"]))
 
     detectors = []
     for key, rec in acc.items():
@@ -1109,6 +1339,20 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
                           for t, c in rec["confusion"].items()},
         })
     localization.sort(key=lambda d: d["name"])
+    patterns = {}
+    for name, fits in pattern_cos.items():
+        rooms = fits[0][0]
+        same = [np.asarray(c) for r, c in fits if r == rooms]
+        patterns[name] = {"rooms": rooms,
+                          "cos": [[_r(v, 2) for v in row] for row in np.mean(same, axis=0).tolist()],
+                          "untestable": sorted(pattern_untestable.get(name, ()))}
+    bpm = {}
+    for (node, seg), v in sorted(breath_bpm.items()):
+        if len(v) >= max(1, len(plans)):
+            q = np.quantile(v, [0.25, 0.5, 0.75])
+            bpm.setdefault(str(node), {})[seg] = {"median": _r(q[1], 1), "p25": _r(q[0], 1),
+                                                  "p75": _r(q[2], 1),
+                                                  "windows": int(round(len(v) / max(1, len(plans))))}
     return {
         "folds": len(plans),
         "guard_relaxed": relaxed,
@@ -1119,6 +1363,9 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
         "segments_scored": [sg.name for sg in segments],
         "segment_roles": {sg.name: sg.role for sg in segments},
         "heldout_chunks": [segments[i].name for i, _ in plans],
+        "room_patterns": patterns,
+        "breath_rate_bpm": bpm,
+        "breath_timing_flag": {k: _r(v) for k, v in sorted(timing_flag.items())},
     }
 
 
@@ -1247,7 +1494,12 @@ def _evaluation_md(title: str, ev: dict[str, Any], clus: dict[tuple[str, int], d
                         + [f"ex {s}" for s in scored], rows)
     if ev.get("localization"):
         lines += ["", "Localization: the node with the largest excess over its own empty-home "
-                  "threshold names the room (two-room segments: the top two).", ""]
+                  "threshold names the room (two-room segments: the top two). `pattern` instead "
+                  "matches the direction of the per-link excess (cone model, size free) against "
+                  "room patterns fitted on the other labelled segments (leave one segment out; "
+                  "rooms without a node included); `pattern` uses the drift-removed excess, "
+                  "`pattern_gls` weights the drift directions down instead of removing them. "
+                  "The number of occupied rooms comes from the label.", ""]
         lines += _table(["score", "one room acc (windows)", "two rooms acc (windows)",
                          "windows true -> predicted"],
                         [[d["name"], f"{d['one_room_accuracy']} ({d['one_room_windows']})",
@@ -1255,6 +1507,28 @@ def _evaluation_md(title: str, ev: dict[str, Any], clus: dict[tuple[str, int], d
                           "; ".join(f"{t}: " + ", ".join(f"{p} {n}" for p, n in sorted(c.items()))
                                     for t, c in sorted(d["confusion"].items()))]
                          for d in ev["localization"] if d["horizon_s"] == top or d["score"] == "fused"])
+    for name, pat in sorted(ev.get("room_patterns", {}).items()):
+        lines += ["", f"Room patterns ({name}, @{int(top)}s): cosine between the whitened link "
+                  "patterns of two rooms, fitted on every labelled segment. Near 1 = same "
+                  "direction, so the two rooms cannot be told apart whatever the size; "
+                  "untestable (room seen in no other segment): "
+                  + (", ".join(pat["untestable"]) or "none") + ".", ""]
+        lines += _table(["room"] + pat["rooms"],
+                        [[r] + row for r, row in zip(pat["rooms"], pat["cos"])])
+    if ev.get("breath_rate_bpm"):
+        segs = sorted({s for v in ev["breath_rate_bpm"].values() for s in v},
+                      key=lambda s: ev["segments_scored"].index(s) if s in ev["segments_scored"] else 0)
+        lines += ["", "Breathing rate: median peak frequency (breaths/min, p25-p75, windows) of the "
+                  "windows above each link's empty-home line, per node. Sleeping adults are "
+                  "usually 12-20.", ""]
+        lines += _table(["node"] + segs, [[n] + [
+            f"{v[s]['median']} ({v[s]['p25']}-{v[s]['p75']}, {v[s]['windows']})" if s in v else ""
+            for s in segs] for n, v in sorted(ev["breath_rate_bpm"].items())])
+    flagged = {k: v for k, v in ev.get("breath_timing_flag", {}).items() if v}
+    if ev.get("breath_timing_flag"):
+        lines += ["", "Frame timing: share of windows where a link's best breathing-band frequency "
+                  "was one where the frame times alone are periodic (excluded from `breath`): "
+                  + (", ".join(f"{k} {v}" for k, v in flagged.items()) or "none") + "."]
     return lines
 
 
