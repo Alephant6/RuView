@@ -101,6 +101,13 @@ the segment list, and never as camera-grade or general accuracy.
   for AUC or localization). Times are UTC ISO 8601 or epoch seconds.
 - `tags`: up to four short names of something else that moves or
   transmits in the segment (see Confounders above).
+- `at_least: true`: the listed rooms were occupied and the others are
+  unknown. Use it for event labels taken from devices fixed in a room (a
+  wall panel, a TV remote): a minute or two around a command sent from
+  the living-room panel is "at least living". Such a segment is a positive
+  for its rooms' AUCs, never a negative for the others, and is not used
+  for localization. Only the raw files that overlap a segment are read,
+  so short events spread over the 72 h ring are cheap.
 - At least two empty-home chunks are required (one 20-minute empty segment
   is enough with the default chunk length). At most 4 hours per run.
 - Keep anything that moves and is not a person (the robot vacuum, a fan)

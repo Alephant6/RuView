@@ -178,6 +178,8 @@ class Segment:
     note: str = ""
     parent: str = ""                # chunk of which labelled segment
     tags: tuple[str, ...] = ()      # confounders, e.g. "vacuum:kitchen"
+    at_least: bool = False          # occupied lists rooms known to be occupied;
+                                    # the other rooms are unknown (event labels)
 
     @property
     def role(self) -> str:
@@ -240,8 +242,11 @@ def parse_labels(obj: Any) -> Labels:
         if not isinstance(tags, list) or len(tags) > 4 or any(
                 not isinstance(t, str) or not _NAME_OK.match(t) for t in tags):
             raise LabError(f"segment {name}: tags must be up to 4 short names")
+        at_least = raw.get("at_least", False)
+        if not isinstance(at_least, bool) or (at_least and not occ):
+            raise LabError(f"segment {name}: at_least needs a non-empty occupied list")
         segs.append(Segment(name, start, end, occ, str(raw.get("note", ""))[:200],
-                            tags=tuple(tags)))
+                            tags=tuple(tags), at_least=at_least))
     if not segs:
         raise LabError("labels need at least one segment")
     segs.sort(key=lambda s: s.start)
@@ -362,10 +367,15 @@ def load_streams(root: Path, segments: list[Segment],
     starts = np.array([s.start for s in segments])
     ends = np.array([s.end for s in segments])
     lo, hi = float(starts.min()), float(ends.max())
+    spans = list(zip(starts.tolist(), ends.tolist()))
     acc: dict[tuple[int, int], tuple[list, list, list, list, list]] = {}
     counts = {"datagrams": 0, "csi_frames": 0, "excluded": 0, "multi_antenna_or_bad": 0}
     for created, mtime, path in list_raw(root):
         if created > hi + 10 or mtime + 10 < lo:
+            continue
+        # Short event segments spread over days: open only the files that
+        # overlap one of them.
+        if not any(created <= e + 10 and mtime + 10 >= a for a, e in spans):
             continue
         try:
             for ts_ns, data in iter_raw(path):
@@ -811,8 +821,11 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
                     rec["excess"].setdefault(segments[si].name, []).append(float(np.median(v) - tau))
             room = meta.get("room")
             if room:
+                # An at-least segment says nothing about the rooms it does not
+                # list: positive for its own rooms, never a negative.
                 pos = np.isin(w_seg, [i for i in known if room in segments[i].occupied])
-                other = np.isin(w_seg, [i for i in known if room not in segments[i].occupied])
+                other = np.isin(w_seg, [i for i in known if room not in segments[i].occupied
+                                        and not segments[i].at_least])
                 a1 = auc(acc_v[pos], acc_v[held_mask | other])
                 if a1 is not None:
                     rec["auc_room"].append(a1)
@@ -830,7 +843,7 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
                                                        "one_room": [], "two_rooms": [], "confusion": {}})
             for si in known:
                 occ = segments[si].occupied or []
-                if not 1 <= len(occ) <= 2 or any(r not in node_of_room for r in occ):
+                if segments[si].at_least or not 1 <= len(occ) <= 2 or any(r not in node_of_room for r in occ):
                     continue
                 cols = np.flatnonzero((w_seg == si) & ~np.any(np.isnan(mat), axis=0))
                 if not len(cols):
@@ -1004,7 +1017,8 @@ def markdown(report: dict[str, Any]) -> str:
     lines = [f"# csi_lab report (v{VERSION}, MEASURED on the segments below only)", ""]
     lines += _table(["segment", "start (UTC)", "min", "occupied", "tags"], [
         [s["name"], s["start"], s["minutes"],
-         "unknown" if s["occupied"] is None else (", ".join(s["occupied"]) or "empty"),
+         "unknown" if s["occupied"] is None else
+         (("at least " if s.get("at_least") else "") + ", ".join(s["occupied"]) or "empty"),
          ", ".join(s.get("tags") or [])] for s in report["segments"]])
     lines += ["", f"Frames: {report['counts']}", "", "## Streams", ""]
     lines += _table(["stream", "frames", "kept sc", "RSSI p10/p50/p90", "clusters", "cluster share / RSSI"], [
@@ -1104,7 +1118,7 @@ def build_report(root: Path, labels: Labels, cfg: EvalConfig, compare: bool) -> 
         "rooms": {str(k): v for k, v in labels.rooms.items()},
         "segments": [{"name": s.name, "start": iso(s.start), "end": iso(s.end),
                       "minutes": round((s.end - s.start) / 60, 1), "occupied": s.occupied,
-                      "tags": list(s.tags)}
+                      "at_least": s.at_least, "tags": list(s.tags)}
                      for s in labels.segments],
         "exclude": [{"start": iso(a), "end": iso(b), "why": w} for a, b, w in labels.exclude],
         "counts": counts,

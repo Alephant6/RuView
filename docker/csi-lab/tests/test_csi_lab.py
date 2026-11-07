@@ -215,6 +215,22 @@ def test_one_drifting_link_is_found_and_outvoted(stepped: Path, capsys) -> None:
     assert loc["one_room_windows"] == 35          # study_moving's windows only
 
 
+def test_at_least_labels_are_positives_only(recording: Path, capsys) -> None:
+    """An event label ("someone pressed the living-room panel") says the room
+    was occupied and nothing about the others."""
+    with pytest.raises(L.LabError):
+        L.parse_labels({"rooms": ROOMS, "segments": [
+            {"name": "a", "start": synth.iso(0), "end": synth.iso(60), "occupied": [], "at_least": True}]})
+    lab = json.loads(json.dumps(LABELS))
+    lab["segments"][2]["at_least"] = True              # living_still
+    ev = run_json(recording, lab, capsys=capsys)["evaluation"]
+    # study_moving has no full-knowledge negative left, living_still is still a positive
+    assert detector(ev, "node 2 fused@60s")["auc_vs_other_rooms"] is None
+    assert detector(ev, "node 3 fused@60s")["auc_room"] >= 0.8
+    loc = next(d for d in ev["localization"] if d["name"] == "fused@60s")
+    assert set(loc["confusion"]) == {"study"}            # living_still not localized
+
+
 def test_separation_beats_mixed_links(recording: Path, capsys) -> None:
     rep = run_json(recording, LABELS, "--compare", capsys=capsys)
     sep, mixed = rep["evaluation"], rep["no_separation"]
