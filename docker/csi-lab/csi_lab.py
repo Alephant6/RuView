@@ -151,9 +151,9 @@ def iter_raw(path: Path) -> Iterator[tuple[int, bytes]]:
             return
 
 
-def parse_frame(data: bytes) -> tuple[int, int, int, int, int, np.ndarray] | None:
-    """(node, n_sub, rssi, noise floor, flags, int8 I/Q pairs) of an ADR-018
-    single-antenna CSI frame, or None."""
+def parse_frame(data: bytes) -> tuple[int, int, int, int, int, bytes] | None:
+    """(node, n_sub, rssi, noise floor, flags, int8 I/Q pairs as bytes) of an
+    ADR-018 single-antenna CSI frame, or None."""
     if len(data) < _ADR018.size:
         return None
     magic, node, n_ant, n_sub, _freq, _seq, rssi, nf, _ppdu, flags = _ADR018.unpack_from(data)
@@ -162,8 +162,9 @@ def parse_frame(data: bytes) -> tuple[int, int, int, int, int, np.ndarray] | Non
     end = _ADR018.size + 2 * n_sub
     if len(data) < end:
         return None
-    iq = np.frombuffer(data, dtype=np.int8, count=2 * n_sub, offset=_ADR018.size)
-    return node, n_sub, rssi, nf, flags, iq
+    # A bytes copy of just the I/Q (not a view that keeps the whole datagram
+    # and an array object alive per frame): about half the memory per frame.
+    return node, n_sub, rssi, nf, flags, data[_ADR018.size:end]
 
 
 # ------------------------------------------------------------------ labels
@@ -310,11 +311,11 @@ def subcarrier_freq(width: int) -> list[np.ndarray]:
 
 
 def prepare(node: int, width: int, t: list[float], seg: list[int], rssi: list[int],
-            iq: list[np.ndarray], nf: list[int] | None = None) -> Stream | None:
+            iq: list[bytes], nf: list[int] | None = None) -> Stream | None:
     n = len(t)
     if n < 20:
         return None
-    raw = np.stack(iq).astype(np.float32).reshape(n, width, 2)
+    raw = np.frombuffer(b"".join(iq), dtype=np.int8).reshape(n, width, 2).astype(np.float32)
     # ESP-IDF stores (imaginary, real); amplitude does not care, and the
     # phase features only use shape changes, so the sign convention is moot.
     c = raw[:, :, 1] + 1j * raw[:, :, 0]
@@ -516,8 +517,8 @@ def assign(stream: Stream, c: Clusters) -> tuple[np.ndarray, np.ndarray]:
     is reported as a diagnostic only."""
     lab_out = np.empty(len(stream.t), dtype=np.int16)
     far_out = np.zeros(len(stream.t), dtype=bool)
-    for lo in range(0, len(stream.t), 20000):
-        idx = np.arange(lo, min(lo + 20000, len(stream.t)))
+    for lo in range(0, len(stream.t), 4000):
+        idx = np.arange(lo, min(lo + 4000, len(stream.t)))
         z = _signature(stream, idx, c)
         d = np.sqrt(((z[:, None] - c.cent[None]) ** 2).sum(-1))
         lab = d.argmin(1)
