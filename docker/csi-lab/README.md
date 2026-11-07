@@ -79,7 +79,30 @@ the segment list, and never as camera-grade or general accuracy.
    from every empty-home transmitter are reported per segment with their
    RSSI: a new transmitter (a phone, the vacuum's own Wi-Fi) has a level
    of its own.
-7. `--compare` reruns everything without transmitter separation.
+7. **Drift and stillness.** On one link a still person and a slow drift of
+   the empty channel look the same: both move the channel away from the
+   empty-home shape. Two scores attack that from different sides.
+   - `fused_dr` (always on; `--drift-rank`, default 2, 0 = off): the
+     per-link `fused` excess of all links, with the `rank` directions in
+     which the links moved together during the empty-home reference
+     projected out (learned without the window's own chunk for reference
+     windows). A swing in temperature or humidity moves every link at
+     once and is removed; one room's links rising more than the drift
+     pattern predicts is kept. Node = mean residual of its links (signed),
+     home = RMS over all links. It does not remove a drift that only one
+     link has (that looks exactly like a person near that link; the
+     median over links, `fused_med`, is the guard there), and it can only
+     remove what the reference showed.
+   - `breath` (`--breath`, slower; `--breath-span`, default 60 s): over
+     the span ending with each window, the amplitudes are detrended per
+     subcarrier, reduced to their two main directions of change, and
+     searched for the strongest sinusoid between 0.1 and 0.5 Hz with a
+     least-squares (Lomb-Scargle) fit that copes with uneven frame times.
+     Score = log10(1 + F), F the usual periodogram statistic (around 1 for
+     noise). A slow drift cannot raise it; a still, breathing person can,
+     while a moving person mostly does not (that is `motion`'s job). Needs
+     at least 1.5 frames/s on the link; it is not part of `fused`.
+8. `--compare` reruns everything without transmitter separation.
 
 ## Labels
 

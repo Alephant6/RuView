@@ -221,6 +221,47 @@ def test_one_drifting_link_is_found_and_outvoted(stepped: Path, capsys) -> None:
     assert loc["one_room_windows"] == 35          # study_moving's windows only
 
 
+@pytest.fixture(scope="module")
+def drifting(tmp_path_factory) -> Path:
+    """40 min with a house-wide shape drift that keeps growing: empty for
+    24 min, someone moving then still in the study, empty again at the end
+    (by then the drift is past anything the reference saw)."""
+    root = tmp_path_factory.mktemp("drift")
+    acts = [synth.Activity(24 * 60, 30 * 60, "study", "moving"),
+            synth.Activity(30 * 60, 36 * 60, "study", "still")]
+    synth.generate(synth.ring_path(root), 40 * 60, acts, body=0.2, shape_drift=0.3, seed=3)
+    return root
+
+
+DRIFT_LABELS = labels_for([("empty", 0, 24 * 60, []), ("study_moving", 24 * 60, 30 * 60, ["study"]),
+                           ("study_still", 30 * 60, 36 * 60, ["study"]), ("late", 36 * 60, 40 * 60, [])])
+
+
+def test_drift_subspace_and_breathing(drifting: Path, capsys) -> None:
+    rep = run_json(drifting, DRIFT_LABELS, "--breath", capsys=capsys)
+    ev = rep["evaluation"]
+    # the fixture works: shape scores alarm all through the late empty chunk
+    assert detector(ev, "home static@60s")["fa_by_chunk"]["late#0"] >= 0.9
+    for n in (1, 2):
+        assert detector(ev, f"node {n} fused@60s")["fa_by_chunk"]["late#0"] >= 0.9
+        # with the house-wide drift directions removed, these nodes stay quiet
+        assert detector(ev, f"node {n} fused_dr@60s")["fa_by_chunk"]["late#0"] <= 0.1
+    # and the person still shows, where the plain fused score drowns in the
+    # thresholds the drift pushed up
+    dr = detector(ev, "home fused_dr@60s")
+    assert dr["detect"]["study_moving"] >= 0.9 and dr["detect"]["study_still"] >= 0.9
+    assert detector(ev, "home fused@60s")["detect"]["study_moving"] < 0.5
+    loc = next(d for d in ev["localization"] if d["name"] == "fused_dr@60s")
+    assert loc["one_room_accuracy"] >= 0.9
+    # breathing band: blind to the drift, sees the still person, not the moving one
+    br = detector(ev, "home breath@60s")
+    assert br["fa_by_chunk"]["late#0"] <= 0.1
+    assert br["detect"]["study_still"] >= 0.9
+    assert br["detect"]["study_moving"] <= 0.3
+    text = L.markdown(rep)
+    assert "FA breath" in text and "home fused_dr@60s" in text
+
+
 def test_at_least_labels_are_positives_only(recording: Path, capsys) -> None:
     """An event label ("someone pressed the living-room panel") says the room
     was occupied and nothing about the others."""

@@ -31,6 +31,11 @@ What it measures, for a set of labelled time segments:
    on data the detector has never seen. Detection rates and per-room AUCs
    use the labelled occupied segments. Longer horizons average consecutive
    windows.
+4. Drift and stillness. A still person and a slow drift of the empty
+   channel look alike on one link. `fused_dr` removes the directions in
+   which all links drifted together during the empty-home reference and
+   keeps what that pattern cannot explain; `breath` (with --breath) looks
+   for a 0.1-0.5 Hz periodicity, which a slow drift cannot produce.
 
 Every number this prints is MEASURED on the given segments only; a handful
 of segments from one evening is a screen, not a validation.
@@ -55,7 +60,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-VERSION = 2
+VERSION = 3
 NS = 1_000_000_000
 
 # --- csi-recorder container (docker/csi-recorder/csi_recorder/rawfile.py) ---
@@ -626,6 +631,108 @@ def fit_link(ws: WindowSummary, ref: np.ndarray, n_modes: int) -> LinkModel | No
     return LinkModel(mu, sd, modes, nu, zmu, zsd2, float(r.mean()), float(r.std() + 0.5))
 
 
+BREATH_BAND = (0.1, 0.5)     # Hz: 6 to 30 breaths a minute
+
+
+def breath_scores(stream: Stream, frames: np.ndarray, w_start: np.ndarray, w_seg: np.ndarray,
+                  segments: list["Segment"], window_s: float, span_s: float,
+                  exclude: list[tuple[float, float, str]], min_rate: float = 1.5) -> np.ndarray:
+    """Breathing-band periodicity over the `span_s` seconds that end with each
+    window, one value per window.
+
+    The span's amplitudes are detrended per subcarrier (so a slow drift
+    cannot raise the score), reduced to their two main directions of change,
+    and searched for the strongest sinusoid between 0.1 and 0.5 Hz with a
+    least-squares (Lomb-Scargle) fit, which copes with the uneven frame
+    times. The value is log10(1 + F), F = (n - 3) / 2 * R^2 / (1 - R^2) for the
+    best frequency: about 0.3 to 0.6 for noise, higher for a periodic
+    movement such as a still person breathing. NaN where the span leaves the
+    window's segment, touches an excluded range, or has fewer than `min_rate`
+    frames per second."""
+    t_all = stream.t[frames]
+    out = np.full(len(w_start), np.nan)
+    freqs = np.arange(BREATH_BAND[0], BREATH_BAND[1] + 1e-9, 0.5 / span_s)
+    ends = w_start + window_s
+    begins = ends - span_s
+    lo = np.searchsorted(t_all, begins, side="left")
+    hi = np.searchsorted(t_all, ends, side="left")
+    need = max(12, int(min_rate * span_s))
+    for w in range(len(w_start)):
+        if begins[w] < segments[w_seg[w]].start - 1e-9 or hi[w] - lo[w] < need:
+            continue
+        if any(a < ends[w] and begins[w] < b for a, b, _ in exclude):
+            continue
+        tt = t_all[lo[w]:hi[w]] - begins[w]
+        y = stream.nla[frames[lo[w]:hi[w]]].astype(np.float64)
+        y -= y.mean(0)
+        tc = tt - tt.mean()
+        y -= np.outer(tc, (tc @ y) / max(float(tc @ tc), 1e-9))
+        q = np.stack([np.ones(y.shape[1]), np.where(np.arange(y.shape[1]) % 2, 1.0, -1.0)], axis=1)
+        for _ in range(6):
+            q = np.linalg.qr(y.T @ (y @ q))[0]
+        s = y @ q                                        # (n, 2) main directions
+        ss = (s * s).sum(0)
+        if not np.any(ss > 1e-12):
+            continue
+        arg = 2 * np.pi * freqs[:, None] * tt[None, :]
+        c, sn = np.cos(arg), np.sin(arg)
+        cc, s2, cs = (c * c).sum(1), (sn * sn).sum(1), (c * sn).sum(1)
+        det = np.maximum(cc * s2 - cs * cs, 1e-12)
+        bc, bs = c @ s, sn @ s                          # (F, 2)
+        energy = (s2[:, None] * bc ** 2 - 2 * cs[:, None] * bc * bs + cc[:, None] * bs ** 2) / det[:, None]
+        r2 = float(np.clip(np.max(energy / np.maximum(ss, 1e-12)), 0.0, 0.999999))
+        out[w] = math.log10(1.0 + (len(tt) - 3) / 2.0 * r2 / (1.0 - r2))
+    return out
+
+
+def _drift_basis(rows: np.ndarray, cols: np.ndarray, rank: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mu = np.nanmean(rows[:, cols], axis=1)
+    ok = np.isfinite(mu)
+    x = rows[:, cols] - mu[:, None]
+    x = np.where(np.isfinite(x), x, 0.0)
+    x[~ok] = 0.0
+    u = np.linalg.svd(x, full_matrices=False)[0][:, :rank] if x.shape[1] > rank else np.zeros((len(mu), 0))
+    return mu, u, ok
+
+
+def _project_out(rows: np.ndarray, cols: np.ndarray, mu: np.ndarray, u: np.ndarray,
+                 ok: np.ndarray) -> np.ndarray:
+    out = np.full((rows.shape[0], len(cols)), np.nan)
+    for j, w in enumerate(cols):
+        d = rows[:, w] - mu
+        obs = np.isfinite(d) & ok
+        if obs.sum() < u.shape[1] + 2:
+            continue
+        r = d[obs]
+        if u.shape[1]:
+            r = r - u[obs] @ np.linalg.lstsq(u[obs], r, rcond=None)[0]
+        out[obs, j] = r
+    return out
+
+
+def drift_residual(rows: np.ndarray, w_seg: np.ndarray, ref_segs: list[int], rank: int) -> np.ndarray:
+    """Per-link excess scores (links x windows) with the house-wide drift
+    removed. A temperature or humidity swing moves every link at once, so
+    during the empty-home reference the links move together along a few
+    directions; those `rank` directions are learned from the reference and
+    projected out of every window. What is left is change the drift pattern
+    cannot explain, such as one room's links rising while the rest do not.
+    Reference windows get out-of-sample residuals (directions learned
+    without their own chunk)."""
+    res = np.full(rows.shape, np.nan)
+    ref_w = np.flatnonzero(np.isin(w_seg, ref_segs))
+    other = np.setdiff1d(np.arange(rows.shape[1]), ref_w)
+    res[:, other] = _project_out(rows, other, *_drift_basis(rows, ref_w, rank))
+    for j in ref_segs:
+        own = np.flatnonzero(w_seg == j)
+        inner = np.flatnonzero(np.isin(w_seg, [k for k in ref_segs if k != j]))
+        if len(inner) > rank + 2 and len(own):
+            res[:, own] = _project_out(rows, own, *_drift_basis(rows, inner, rank))
+    return res
+
+
 def link_scores(ws: WindowSummary, lm: LinkModel) -> dict[str, np.ndarray]:
     """log10 scores per window (NaN where the window had too few frames)."""
     zs = (ws.m.astype(np.float64) - lm.mu) / lm.sd
@@ -728,6 +835,9 @@ class EvalConfig:
     q: float = 0.99
     guard: bool = True
     chunk_s: float = 600.0
+    drift_rank: int = 2
+    breath: bool = False
+    breath_span_s: float = 60.0
 
 
 def _oos_scores(ws: WindowSummary, ref_segs: list[int], w_seg: np.ndarray,
@@ -797,6 +907,20 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
     known = [i for i, sg in enumerate(segments) if sg.role == "occupied"]
     scored = [i for i, sg in enumerate(segments) if sg.role in ("occupied", "unknown", "confounded")]
     names = links if links is not None else global_links(streams, segments, cfg.max_k)
+    # Breathing-band scores do not depend on the reference, only on which
+    # frames belong to a link, so they are computed once per all-empty link.
+    breath: dict[str, tuple[int, np.ndarray]] = {}
+    if cfg.breath:
+        for stream in streams:
+            if stream.key not in names:
+                continue
+            c, lab, _far = names[stream.key]
+            for g in range(c.k):
+                frames = np.flatnonzero(lab == g)
+                if len(frames) >= 50:
+                    breath[f"{stream.key}c{g}"] = (stream.node, breath_scores(
+                        stream, frames, w_start, w_seg, segments, cfg.window_s, cfg.breath_span_s,
+                        labels.exclude))
 
     def accumulate(values: np.ndarray, h: float) -> np.ndarray:
         return rolling(values, w_seg, 1 + int(round((h - cfg.window_s) / cfg.hop_s)))
@@ -871,6 +995,14 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
         ref_w = np.flatnonzero(np.isin(w_seg, ref_segs))
         held_w = np.flatnonzero(w_seg == held_seg)
         node_ex: dict[tuple[int, str], list[np.ndarray]] = {}
+        link_fused: list[tuple[int, np.ndarray]] = []
+        for link, (node, vals) in sorted(breath.items()):
+            tau = _quant(vals[ref_w], cfg.q)
+            if math.isnan(tau):
+                continue
+            node_ex.setdefault((node, "breath"), []).append(vals - tau)
+            add(f"link {link} breath", {"kind": "link", "node": node, "link": link, "score": "breath"},
+                vals, ref_w, held_w, held_name)
         for stream in streams:
             ref_frames = np.flatnonzero(np.isin(stream.seg, ref_segs))
             if len(ref_frames) < 50:
@@ -906,6 +1038,7 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
                     add(f"link {link} {score}", {**meta, "score": score}, vals, ref_w, held_w, held_name)
                 if exs:
                     fused = _agg(list(exs.values()))
+                    link_fused.append((stream.node, fused))
                     node_ex.setdefault((stream.node, "fused"), []).append(fused)
                     add(f"link {link} fused", {**meta, "score": "fused"}, fused, ref_w, held_w, held_name)
                     mr = [exs[k] for k in ("motion", "rssi") if k in exs]
@@ -927,6 +1060,21 @@ def evaluate(streams: list[Stream], labels: Labels, segments: list[Segment],
             if score == "fused":
                 add("home fused_med", {"kind": "home", "score": "fused_med"}, _agg(exs, "median"),
                     ref_w, held_w, held_name)
+        if cfg.drift_rank > 0 and len(link_fused) >= cfg.drift_rank + 3:
+            # fused_dr: per-link fused excess with the house-wide drift
+            # directions removed. Node = mean residual of its links (signed:
+            # above what the drift explains); home = RMS over all links.
+            res = drift_residual(np.vstack([f for _, f in link_fused]), w_seg, ref_segs, cfg.drift_rank)
+            link_node = np.asarray([n for n, _ in link_fused])
+            for node in sorted(set(link_node.tolist())):
+                vals = _agg(list(res[link_node == node]))
+                by_score.setdefault("fused_dr", {})[node] = vals
+                add(f"node {node} fused_dr", {"kind": "node", "node": node, "room": room_of.get(node),
+                                              "score": "fused_dr"}, vals, ref_w, held_w, held_name)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                rms = np.sqrt(np.nanmean(res ** 2, axis=0))
+            add("home fused_dr", {"kind": "home", "score": "fused_dr"}, rms, ref_w, held_w, held_name)
         for score, node_vals in by_score.items():
             # Each node relative to its own empty-home threshold at this horizon.
             localize(score, node_vals)
@@ -1085,6 +1233,7 @@ def _evaluation_md(title: str, ev: dict[str, Any], clus: dict[tuple[str, int], d
         lines += ["", f"Links (@{int(top)}s): held-out FA per score, then the fused score's median "
                   "excess per segment. A link with high FA and excess everywhere is drifting; one "
                   "that only rises in tagged segments carries that confounder.", ""]
+        cols = ("fused",) + SCORES + (("breath",) if any("breath" in v for v in by.values()) else ())
         rows = []
         for link in sorted(by):
             m = re.match(r"^(n\d+w\d+)c(\d+)", link)
@@ -1092,10 +1241,10 @@ def _evaluation_md(title: str, ev: dict[str, Any], clus: dict[tuple[str, int], d
             f = by[link].get("fused", {})
             rows.append([link, p["rssi_median"] if p else None, p["share"] if p else None,
                          f.get("folds")]
-                        + [by[link].get(sc, {}).get("fa_heldout") for sc in ("fused",) + SCORES]
+                        + [by[link].get(sc, {}).get("fa_heldout") for sc in cols]
                         + [f.get("median_excess", {}).get(s) for s in scored])
-        lines += _table(["link", "RSSI", "share", "folds", "FA fused", "FA static", "FA motion",
-                         "FA phase", "FA rssi"] + [f"ex {s}" for s in scored], rows)
+        lines += _table(["link", "RSSI", "share", "folds"] + [f"FA {sc}" for sc in cols]
+                        + [f"ex {s}" for s in scored], rows)
     if ev.get("localization"):
         lines += ["", "Localization: the node with the largest excess over its own empty-home "
                   "threshold names the room (two-room segments: the top two).", ""]
@@ -1153,6 +1302,11 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--horizons", default="10,30,60")
     ev.add_argument("--no-guard", action="store_true", help="allow folds next to the held-out chunk")
     ev.add_argument("--compare", action="store_true", help="also run without transmitter separation")
+    ev.add_argument("--drift-rank", type=int, default=2,
+                    help="house-wide drift directions removed for fused_dr (0 = off)")
+    ev.add_argument("--breath", action="store_true",
+                    help="also score breathing-band periodicity per link (slower)")
+    ev.add_argument("--breath-span", type=float, default=60.0, help="seconds per breathing estimate")
     ev.add_argument("--json", action="store_true", help="print the JSON report instead of markdown")
     args = ap.parse_args(argv)
     root = Path(args.data)
@@ -1166,10 +1320,16 @@ def main(argv: list[str] | None = None) -> int:
             raise LabError("window must be 2-120 s and hop 0.5 s to the window")
         if not 1 <= args.max_k <= 6:
             raise LabError("max-k must be 1-6")
+        if not 0 <= args.drift_rank <= 3:
+            raise LabError("drift-rank must be 0-3")
+        if not 20 <= args.breath_span <= 180:
+            raise LabError("breath-span must be 20-180 s")
         cfg = EvalConfig(window_s=args.window, hop_s=args.hop, min_frames=args.min_frames,
                          max_k=args.max_k,
                          horizons=tuple(float(h) for h in args.horizons.split(",") if h.strip()),
-                         guard=not args.no_guard, chunk_s=max(60.0, args.chunk_min * 60.0))
+                         guard=not args.no_guard, chunk_s=max(60.0, args.chunk_min * 60.0),
+                         drift_rank=args.drift_rank, breath=args.breath,
+                         breath_span_s=args.breath_span)
         report = build_report(root, labels, cfg, args.compare)
     except (LabError, json.JSONDecodeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

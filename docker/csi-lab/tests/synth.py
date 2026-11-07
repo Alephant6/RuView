@@ -72,10 +72,14 @@ def _coupling(room: str, rx_room: str, tx_room: str | None) -> float:
 
 
 def generate(path: Path, duration_s: float, activities: list[Activity], seed: int = 1,
-             body: float = 0.35, steps: list[Step] | None = None) -> dict:
+             body: float = 0.35, steps: list[Step] | None = None, shape_drift: float = 0.0) -> dict:
     """Write one .csi.raw.gz file; return frames per receiver<-transmitter link.
     The noise-floor byte carries -90 - transmitter index (ground truth for
-    the clustering test; csi_lab does not use it)."""
+    the clustering test; csi_lab does not use it). `shape_drift` adds a
+    house-wide drift: every link gains its own extra path whose size grows
+    linearly from 0 to `shape_drift` (relative to the link's mean amplitude)
+    over the recording, all on the same clock, like a slow temperature
+    swing."""
     rng = np.random.default_rng(seed)
     body_gain = body
     f = _freq_block()
@@ -99,6 +103,11 @@ def generate(path: Path, duration_s: float, activities: list[Activity], seed: in
             drift = 1.0 + 0.01 * np.sin(2 * np.pi * t / 1800.0 + rng.uniform(0, 6.28))
             h = h0[None, :] * drift[:, None]
             rssi = rssi_level + rng.normal(0, 0.8, size=n)
+            if shape_drift:
+                dg, dd = _channel(np.random.default_rng(zlib.crc32(f"drift:{seed}:{rx}:{tx}".encode())), paths=2)
+                dh = _response(dg, dd, f)
+                ramp = shape_drift * t / duration_s
+                h = h + (ramp * np.abs(h0).mean() / max(np.abs(dh).mean(), 1e-9))[:, None] * dh[None, :]
             for st in steps or []:
                 if st.rx != rx or st.tx != tx:
                     continue
